@@ -18,7 +18,7 @@
 #   code     this script's directory -- helpers and prompt templates; nothing is written here
 #   data     KHMS_ROOT: journal/, memory/ (inbox, ledger, know)
 #   shared   KHMS_SHARED_STATE: KHMS_NIGHTLY_LOCK, KHMS_NIGHT_STAMP, KHMS_SWEEP_FAILED
-#   agent    KHMS_NIGHT_LOG; KHMS_CODE_LOCKS (this clone's code-use lock, held for a real run)
+#   agent    KHMS_NIGHT_LOG (this clone's code-use lock lives in the clone's gitdir, held for a real run)
 # SOURCES (each optional; an unconfigured one is said in the log, never replaced by a guess):
 #   KHMS_TRANSCRIPTS     space-separated directories of agent session transcripts (*.jsonl), filtered
 #                        to paths containing KHMS_PROJECT_SLUG when that is set
@@ -298,6 +298,16 @@ DIGEST=$STAGING/nightly-$NK-digest.txt
 # SOURCE: agent session transcripts (KHMS_TRANSCRIPTS, space-separated directories; only paths
 # containing KHMS_PROJECT_SLUG when it is set). Unconfigured = no transcript source tonight, said in
 # the log; the night never falls back to some other workspace's transcripts.
+#
+# OFF IS NOT FAILED. A source that is not configured is OFF and says so. A CONFIGURED source that cannot be
+# read tonight (a directory that is not there, a preprocessor that fails, a repository git cannot read) is
+# a FAILED source: its part of the window was not collected, so nothing may be extracted from this window
+# and nothing may be stamped -- otherwise the next night starts after data no night has read (#173 review
+# F2: an unreadable git repository advanced the stamp and its commits were never read again). Each failure
+# is one line in $SRC_FAILED; a failed source makes the sweep FAIL below (window kept, stamp untouched),
+# while the queue and the carry from earlier, fully collected windows still proceed.
+SRC_FAILED=$STAGING/nightly-$NK-source-failed.txt
+: > "$SRC_FAILED"
 read -r -a TRANSCRIPT_DIRS <<< "$(khms_get KHMS_TRANSCRIPTS)"
 SLUG=$(khms_get KHMS_PROJECT_SLUG)
 if [ ${#TRANSCRIPT_DIRS[@]} -eq 0 ]; then
@@ -305,14 +315,16 @@ if [ ${#TRANSCRIPT_DIRS[@]} -eq 0 ]; then
 fi
 for SRC in "${TRANSCRIPT_DIRS[@]}"; do
   if [ ! -d "$SRC" ]; then
-    echo "$(date -Is) source transcripts: $SRC is not a directory — skipped" >> "$LOG"
+    echo "transcripts: $SRC is not a directory" >> "$SRC_FAILED"
     continue
   fi
-  find "$SRC" -path "*${SLUG}*" -name "*.jsonl" -newermt "$SINCE" -type f 2>/dev/null
+  find "$SRC" -path "*${SLUG}*" -name "*.jsonl" -newermt "$SINCE" -type f \
+    || echo "transcripts: listing $SRC failed" >> "$SRC_FAILED"
 done | sort -u | while read -r f; do
   # --since gives a message-level cut, not just file mtime — a long-running session's
   # already-swept prefix is skipped on the next night
-  python3 "$CODE/preprocess_transcripts.py" --since "$SINCE" "$f" >> "$DIGEST" || true
+  python3 "$CODE/preprocess_transcripts.py" --since "$SINCE" "$f" >> "$DIGEST" \
+    || echo "transcripts: preprocessing $f failed" >> "$SRC_FAILED"
 done
 # Journal SOURCE = every journal file touched since the last successful run, concatenated.
 # Passing journal/$DATE.md as the source was an off-by-one: at 03:30 the day being
@@ -322,9 +334,10 @@ done
 JOURNAL=$ROOT/journal/$DATE.md
 JSRC=$STAGING/nightly-$NK-journals.md
 : > "$JSRC"
-find "$ROOT/journal" -name '2*.md' -newermt "$SINCE" -type f | sort | while read -r j; do
+{ find "$ROOT/journal" -name '2*.md' -newermt "$SINCE" -type f \
+    || echo "journal: listing $ROOT/journal failed" >> "$SRC_FAILED"; } | sort | while read -r j; do
   printf '\n===== %s =====\n' "${j##*/}" >> "$JSRC"
-  cat "$j" >> "$JSRC"
+  cat "$j" >> "$JSRC" || echo "journal: reading $j failed" >> "$SRC_FAILED"
 done
 # SOURCE: the commits of KHMS_GIT_REPOS since the stamp (`git log --since --stat`). One repository is
 # the log exactly as `git log` prints it; several are each headed `===== <repo> =====`.
@@ -340,8 +353,13 @@ _gsince=(--since="$SINCE"); [ "$SINCE" = "1970-01-01" ] && _gsince=()
 for _repo in "${GIT_REPOS[@]}"; do
   if [ ${#GIT_REPOS[@]} -gt 1 ]; then printf '===== %s =====\n' "$_repo" >> "$GITLOG"; fi
   git -C "$_repo" log "${_gsince[@]}" --stat --date=iso >> "$GITLOG" 2>/dev/null \
-    || echo "$(date -Is) source git: FAILED for $_repo — its commits are missing tonight" >> "$LOG"
+    || echo "git: $_repo cannot be read" >> "$SRC_FAILED"
 done
+SOURCE_FAILED=""
+if [ -s "$SRC_FAILED" ]; then
+  SOURCE_FAILED=$(grep -c . "$SRC_FAILED")
+  while read -r _l; do echo "$(date -Is) source FAILED: $_l" >> "$LOG"; done < "$SRC_FAILED"
+fi
 GITLOG_WHAT="\`git log --since --stat\` over ${GIT_REPOS[*]:-no repository}"
 
 # 1a) THE COVERAGE LEDGER (board #209). Derive every tracked MARK's state (journal + cards +
@@ -422,7 +440,7 @@ done
 SIZE=$(stat -c%s "$DIGEST")
 NO_WINDOW=0
 if [ "$SIZE" -lt 200 ] && [ ! -s "$GITLOG" ] && [ ! -s "$JSRC" ]; then
-  if [ "$QUEUE_N" -eq 0 ] && [ "$CARRY_N" -eq 0 ]; then
+  if [ "$QUEUE_N" -eq 0 ] && [ "$CARRY_N" -eq 0 ] && [ -z "$SOURCE_FAILED" ]; then
     echo "$(date -Is) nothing new (digest ${SIZE}B), queue empty, carry empty, exit" >> "$LOG"
     [ "$DRYRUN" = "1" ] || date -Is > "$STAMP"
     exit 0
@@ -692,6 +710,12 @@ if [ -z "$AGENT_BIN" ]; then
   SWEEP_OK=0
   FAILED_STAGES="$FAILED_STAGES agent-unavailable"
   echo "$(date -Is) AGENT UNAVAILABLE: '$AGENT' (KHMS_AGENT) is not an executable command — every model stage of this night FAILS; nothing is stamped" >> "$LOG"
+elif [ -n "$SOURCE_FAILED" ]; then
+  # A configured source could not be read (step 1 above): the window is incomplete, so it is not
+  # swept and not committed; the stamp stays where it was and the next night collects it again.
+  SWEEP_OK=0
+  FAILED_STAGES="$FAILED_STAGES source"
+  echo "$(date -Is) sweep NOT RUN — $SOURCE_FAILED configured source(s) FAILED ($SRC_FAILED); the window since $SINCE stays open and nothing is stamped" >> "$LOG"
 elif [ "$NO_WINDOW" = "1" ]; then
   # Nothing new since the stamp: no sweep, an empty candidate file, and the night goes to the
   # queue and the carry (step 1a decided there is something in one of them).
@@ -752,7 +776,7 @@ fi
 if [ "$SWEEP_OK" -ne 1 ]; then
   FAILED_STAGES="$FAILED_STAGES sweep"
   # One line per failed sweep; read aloud by a morning review ping, removed on success.
-  echo "$RUN_START night=$NK window-since=$SINCE parts=${#SWEEP_GROUP_FILES[@]} digest=${SIZE}B" >> "$SWEEP_FAILED_FILE"
+  echo "$RUN_START night=$NK window-since=$SINCE parts=${#SWEEP_GROUP_FILES[@]} digest=${SIZE}B${SOURCE_FAILED:+ sources-failed=$SOURCE_FAILED}" >> "$SWEEP_FAILED_FILE"
   _nfail=$(grep -c . "$SWEEP_FAILED_FILE" 2>/dev/null || echo 1)
   if [ "$_nfail" -ge 2 ]; then
     echo "$(date -Is) SWEEP FAILED ${_nfail} NIGHTS IN A ROW (first: $(head -1 "$SWEEP_FAILED_FILE" | cut -d' ' -f1)) — the window since $SINCE keeps growing; a part that fails every night needs a human, see $SWEEP_FAILED_FILE" >> "$LOG"

@@ -70,14 +70,18 @@ class Quotes(unittest.TestCase):
     def test_a_retypeset_quote_passes_as_wrapped(self):
         r = self.run_vq("journal", "**humidity gaps were log rotation**, not the sensor")
         self.assertEqual(r.returncode, 0, r.stdout)
-        self.assertIn("WRAPPED", r.stdout)
+        # a wrapped match is silent in the findings (the consolidate stage acts on every printed
+        # finding) and counted in the class line
+        self.assertIn("1 wrapped", r.stdout)
+        self.assertNotIn("C1:", r.stdout)
 
     def test_a_marked_elision_passes_and_says_so(self):
         r = self.run_vq("journal",
                         "humidity gaps were log rotation ... the summary job "
                         "re-reads the rotated file")
         self.assertEqual(r.returncode, 0, r.stdout)
-        self.assertIn("ELIDED", r.stdout)
+        self.assertIn("NOTE quote OK in journal — marked elision", r.stdout)
+        self.assertIn("1 elided", r.stdout)
         self.assertIn("max gap", r.stdout)
 
     def test_the_same_quote_without_the_mark_is_a_splice(self):

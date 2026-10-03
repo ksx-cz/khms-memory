@@ -229,7 +229,8 @@ def test_an_update_holding_the_code_lock_stops_the_night_and_a_running_night_sto
     env = env_for(tmp_path, root, fake)
     lockf = subprocess.run([sys.executable, os.path.join(TOOLS, "khms_paths.py"), "--code-lock-file"],
                            env=env, capture_output=True, text=True, check=True).stdout.strip()
-    assert lockf.startswith(str(root / "state" / "code-locks"))
+    assert lockf == os.path.join(os.path.dirname(TOOLS), ".git", "khms-code.lock") or not os.path.isdir(
+        os.path.join(os.path.dirname(TOOLS), ".git")), lockf
     os.makedirs(os.path.dirname(lockf), exist_ok=True)
     holder = subprocess.Popen(["flock", "-x", lockf, "sleep", "30"], start_new_session=True)
     try:
@@ -386,3 +387,77 @@ def test_the_weekly_waits_for_a_running_night_and_holds_the_code_lock(tmp_path):
     log = log_of(root)
     assert r.returncode == 1 and "weekly waits for the nightly" in log and "half-published" in log, log
     assert not (root / "memory/inbox/2099-01-04-weekly.md").exists()
+
+
+# --- review F1 (#173 step 3a): ONE code-use lock per clone, whatever base or agent state is selected -------
+def _lock_path(env, shell=False):
+    if shell:
+        cmd = ["bash", "-c", '. "%s/khms_paths.sh" && khms_load && khms_code_lock_file' % TOOLS]
+    else:
+        cmd = [sys.executable, os.path.join(TOOLS, "khms_paths.py"), "--code-lock-file"]
+    return subprocess.run(cmd, env=env, capture_output=True, text=True, check=True).stdout.strip()
+
+
+@pytest.mark.parametrize("key", ["KHMS_ROOT", "KHMS_STATE"])
+def test_the_same_clone_with_another_base_or_state_cannot_update_while_in_use(tmp_path, key):
+    import fcntl
+    root, fake = make_base(tmp_path / "one", 2)
+    env = env_for(tmp_path, root, fake)
+    other = tmp_path / "other"
+    (other / "memory" / "know").mkdir(parents=True)
+    one = _lock_path(env)
+    two = _lock_path(dict(env, **{key: str(other)}))
+    assert one == two == _lock_path(env, shell=True), (one, two)
+    os.makedirs(os.path.dirname(one), exist_ok=True)
+    with open(one, "a") as held, open(two, "a") as update:
+        fcntl.flock(held, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        with pytest.raises(BlockingIOError):
+            fcntl.flock(update, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def test_the_code_lock_lives_with_the_clone_not_in_any_data_or_state_root(tmp_path):
+    root, fake = make_base(tmp_path, 2)
+    env = env_for(tmp_path, root, fake)
+    lockf = _lock_path(env)
+    clone = os.path.realpath(os.path.dirname(TOOLS))
+    assert os.path.realpath(lockf).startswith(clone + os.sep), lockf
+    assert not os.path.realpath(lockf).startswith(os.path.realpath(str(tmp_path)) + os.sep), lockf
+
+
+# --- review F2 (#173 step 3a): a configured source that fails keeps its window ----------------------------
+def test_a_failed_git_source_keeps_its_window_until_the_source_is_back(tmp_path):
+    root, fake = make_base(tmp_path, 2)
+    repo = tmp_path / "repo"
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    (repo / "a").write_text("fixture\n")
+    subprocess.run(["git", "-C", str(repo), "add", "a"], check=True)
+    e = dict(os.environ, GIT_AUTHOR_DATE="2026-01-01T12:00:00Z", GIT_COMMITTER_DATE="2026-01-01T12:00:00Z")
+    subprocess.run(["git", "-C", str(repo), "-c", "user.name=fixture", "-c", "user.email=fixture",
+                    "commit", "-qm", "UNREAD_SOURCE_SENTINEL"], env=e, check=True)
+    offline = tmp_path / "offline-repo"
+    repo.rename(offline)
+    first = run_night(tmp_path, root, fake, KHMS_GIT_REPOS=repo)
+    log = log_of(root)
+    assert first.returncode != 0 and "source FAILED: git:" in log and "nightly INCOMPLETE" in log, log
+    assert not (root / "state" / "shared" / "last-nightly").exists(), "a failed source advanced the stamp"
+    assert "sources-failed=1" in (root / "state" / "shared" / "sweep-failed").read_text()
+    offline.rename(repo)
+    second = run_night(tmp_path, root, fake, KHMS_GIT_REPOS=repo, NIGHTLY_DATE="2099-01-03")
+    gitinput = (root / "memory" / "inbox" / ".staging" / "nightly-2099-01-03-git.txt").read_text()
+    assert second.returncode == 0 and "UNREAD_SOURCE_SENTINEL" in gitinput, (second.returncode, gitinput)
+    assert (root / "state" / "shared" / "last-nightly").exists()
+
+
+def test_a_missing_configured_transcript_directory_is_not_checkpointed(tmp_path):
+    root, fake = make_base(tmp_path, 2)
+    r = run_night(tmp_path, root, fake, KHMS_TRANSCRIPTS=tmp_path / "not-mounted")
+    log = log_of(root)
+    assert r.returncode != 0 and not (root / "state" / "shared" / "last-nightly").exists(), (r.returncode, log)
+    assert "source FAILED: transcripts:" in log, log
+
+
+def test_an_unconfigured_source_is_off_not_failed(tmp_path):
+    root, fake = make_base(tmp_path, 2)
+    r = run_night(tmp_path, root, fake)
+    log = log_of(root)
+    assert r.returncode == 0 and "source FAILED" not in log and "source git: OFF" in log, log

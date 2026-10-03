@@ -88,7 +88,6 @@ DEFAULTS = [
     ("KHMS_WEEK_STAMP", "${KHMS_SHARED_STATE}/last-weekly"),      # completion of the last weekly
     ("KHMS_SWEEP_FAILED", "${KHMS_SHARED_STATE}/sweep-failed"),   # one line per failed sweep, cleared on success
     ("KHMS_NIGHT_LOG", "${KHMS_STATE}/nightly.log"),              # night AND week log
-    ("KHMS_CODE_LOCKS", "${KHMS_STATE}/code-locks"),              # per-clone code-use locks (khms_code_lock)
     ("KHMS_AGENT", "claude"),                                     # headless agent CLI (argv[0])
     ("KHMS_AGENT_TRANSCRIPTS", "${HOME}/.claude/projects"),       # where that CLI writes session transcripts
     ("KHMS_SWEEP_MODEL", "sonnet"),
@@ -105,6 +104,14 @@ DEFAULTS = [
     ("KHMS_PRINCIPAL", "the principal"),   # who the base serves, as the prompts name them
     ("KHMS_PROMPT_EXT", "${KHMS_CONFIG_DIR}/prompts"),            # private prompt extensions (optional)
     ("KHMS_ACCOUNT_DIR", ""),              # token accounting: the project's transcript directory ("" = derive)
+    # --- morning review ping (khms_review_ping.sh) -----------------------------------------------------
+    ("KHMS_PING_SEND", ""),                # argv: delivers the ping text read on stdin ("" = print only)
+    ("KHMS_PING_EXTRA", ""),               # argv: project lines to add to the ping, one per stdout line ("" = none)
+    # --- standing-base triage (nightly_triage.sh, khms_contradict.py) -----------------------------------
+    ("KHMS_JUDGE", "sonnet"),              # pair judge of record: qwen (local KHMS_LLM_URL) | a KHMS_AGENT model
+    ("KHMS_JUDGE_MAX_USD", ""),            # estimated per-night bound of a paid judge ("" = no bound)
+    ("KHMS_LLM_URL", ""),                  # local model endpoint (Ollama /api/generate; "" = no local model)
+    ("KHMS_LLM_MODEL", "qwen3-coder-next:latest"),               # the local model's name
     ("KHMS_REPORT_TOOL", ""),                               # regex of the report tool ("" = built-in default)
     ("KHMS_REPORT_CHANNEL", ""),                            # regex: prompts that open a report turn ("" = all)
     ("KHMS_REPORT_SERVER", ""),                             # channel server name part ("" = built-in default)
@@ -347,10 +354,26 @@ EXIT_CODE_BUSY = 5
 
 
 def code_lock_file():
-    """The code-use lock file of THIS clone (khms_paths.sh computes the same name)."""
-    import hashlib
-    cid = hashlib.sha256(CODE.encode("utf-8")).hexdigest()[:16]
-    return os.path.join(get("KHMS_CODE_LOCKS"), cid + ".lock")
+    """The code-use lock file of THIS clone (khms_paths.sh computes the same path).
+
+    ONE place per clone, derived from the clone alone and never from the configuration: a lock whose path
+    followed the selected base or agent state let two configurations of the same clone take the shared (user)
+    and the exclusive (updater) lock at once -- each locked its own file. So the lock lives in the clone's own
+    git directory (`<gitdir>/khms-code.lock`; a linked worktree has its own gitdir, and its own code), found
+    from the real path of this file (a symlinked tool or clone resolves to the same lock). A tree that is not a
+    git checkout uses `<clone>/.khms-code.lock`. No setting can move it, so no two users of one clone can
+    disagree about it."""
+    repo = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+    dotgit = os.path.join(repo, ".git")
+    if os.path.isdir(dotgit):
+        return os.path.join(dotgit, "khms-code.lock")
+    if os.path.isfile(dotgit):
+        with open(dotgit, encoding="utf-8") as fh:
+            first = fh.readline().strip()
+        if first.startswith("gitdir:"):
+            gd = first[len("gitdir:"):].strip()
+            return os.path.join(os.path.realpath(os.path.join(repo, gd)), "khms-code.lock")
+    return os.path.join(repo, ".khms-code.lock")
 
 
 def hold_code_lock():

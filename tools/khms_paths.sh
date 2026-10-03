@@ -20,9 +20,10 @@ _KHMS_KEYS=(KHMS_ROOT KHMS_CONFIG_FILE KHMS_CONFIG_DIR KHMS_STATE KHMS_SHARED_ST
   KHMS_HOOKS_OFF_FILE KHMS_LEN_CACHE KHMS_EXPERIMENT KHMS_GLOSSARY KHMS_DIRECTIVE KHMS_EMBED_DIR
   KHMS_EMBED_PY KHMS_DENSE_SOCKET KHMS_HF_HOME KHMS_SNAPSHOT_ROOT KHMS_TRANSCRIPTS KHMS_MESSAGES KHMS_PATTERNS
   KHMS_NIGHTLY_LOCK KHMS_WEEKLY_LOCK KHMS_NIGHT_STAMP KHMS_WEEK_STAMP KHMS_SWEEP_FAILED KHMS_NIGHT_LOG
-  KHMS_CODE_LOCKS KHMS_AGENT KHMS_AGENT_TRANSCRIPTS KHMS_SWEEP_MODEL KHMS_MARK_MODEL KHMS_CONS_MODEL
+  KHMS_AGENT KHMS_AGENT_TRANSCRIPTS KHMS_SWEEP_MODEL KHMS_MARK_MODEL KHMS_CONS_MODEL
   KHMS_WEEK_PART_MODEL KHMS_WEEK_MODEL KHMS_PROJECT_SLUG KHMS_GIT_REPOS KHMS_CHAT_FETCH KHMS_CHAT_VERIFY
   KHMS_NIGHT_TRIAGE KHMS_SPEC KHMS_PRINCIPAL KHMS_PROMPT_EXT KHMS_ACCOUNT_DIR
+  KHMS_PING_SEND KHMS_PING_EXTRA KHMS_JUDGE KHMS_JUDGE_MAX_USD KHMS_LLM_URL KHMS_LLM_MODEL
   KHMS_REPORT_TOOL KHMS_REPORT_CHANNEL KHMS_REPORT_SERVER)
 declare -gA _KHMS_DEFAULT=(
   [KHMS_CONFIG_FILE]="" [KHMS_CONFIG_DIR]='${KHMS_ROOT}/config' [KHMS_STATE]='${KHMS_ROOT}/state'
@@ -40,11 +41,13 @@ declare -gA _KHMS_DEFAULT=(
   [KHMS_NIGHTLY_LOCK]='${KHMS_SHARED_STATE}/nightly.lock' [KHMS_WEEKLY_LOCK]='${KHMS_SHARED_STATE}/weekly.lock'
   [KHMS_NIGHT_STAMP]='${KHMS_SHARED_STATE}/last-nightly' [KHMS_WEEK_STAMP]='${KHMS_SHARED_STATE}/last-weekly'
   [KHMS_SWEEP_FAILED]='${KHMS_SHARED_STATE}/sweep-failed' [KHMS_NIGHT_LOG]='${KHMS_STATE}/nightly.log'
-  [KHMS_CODE_LOCKS]='${KHMS_STATE}/code-locks' [KHMS_AGENT]="claude"
+  [KHMS_AGENT]="claude"
   [KHMS_AGENT_TRANSCRIPTS]='${HOME}/.claude/projects' [KHMS_SWEEP_MODEL]="sonnet" [KHMS_MARK_MODEL]="sonnet"
   [KHMS_CONS_MODEL]="sonnet" [KHMS_WEEK_PART_MODEL]="sonnet" [KHMS_WEEK_MODEL]="opus"
   [KHMS_PROJECT_SLUG]="" [KHMS_GIT_REPOS]="" [KHMS_CHAT_FETCH]="" [KHMS_CHAT_VERIFY]="" [KHMS_NIGHT_TRIAGE]=""
   [KHMS_SPEC]="" [KHMS_PRINCIPAL]="the principal" [KHMS_PROMPT_EXT]='${KHMS_CONFIG_DIR}/prompts' [KHMS_ACCOUNT_DIR]=""
+  [KHMS_PING_SEND]="" [KHMS_PING_EXTRA]="" [KHMS_JUDGE]="sonnet" [KHMS_JUDGE_MAX_USD]=""
+  [KHMS_LLM_URL]="" [KHMS_LLM_MODEL]="qwen3-coder-next:latest"
   [KHMS_REPORT_TOOL]="" [KHMS_REPORT_CHANNEL]=""
   [KHMS_REPORT_SERVER]="")
 declare -gA _KHMS_RAW=()
@@ -170,10 +173,18 @@ khms_may_write() {   # khms_may_write PATH -> rc 0 when this deployment may appe
   return 0
 }
 
-khms_code_lock_file() {   # the code-use lock file of THIS clone (one per clone, in the agent's state)
-  local dir id; dir="$(khms_get KHMS_CODE_LOCKS)" || return 3
-  id="$(printf '%s' "$KHMS_CODE" | sha256sum | cut -c1-16)"
-  printf '%s/%s.lock\n' "$dir" "$id"
+khms_code_lock_file() {   # the code-use lock file of THIS clone -- from the clone alone, never from config
+  # (the same rule as khms_paths.code_lock_file: <gitdir>/khms-code.lock, else <clone>/.khms-code.lock)
+  local repo gd
+  repo="$(dirname "$KHMS_CODE")"
+  if [ -d "$repo/.git" ]; then
+    printf '%s/khms-code.lock\n' "$repo/.git"
+  elif [ -f "$repo/.git" ] && gd="$(sed -n '1s/^gitdir:[[:space:]]*//p' "$repo/.git")" && [ -n "$gd" ]; then
+    case "$gd" in /*) ;; *) gd="$repo/$gd" ;; esac
+    printf '%s/khms-code.lock\n' "$(readlink -f "$gd")"
+  else
+    printf '%s/.khms-code.lock\n' "$repo"
+  fi
 }
 
 # khms_code_lock: hold a SHARED lock on this clone's code for the rest of the caller's life.

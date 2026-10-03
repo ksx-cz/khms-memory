@@ -30,6 +30,38 @@ DEFAULTS = {
     "REPORT_DIRECTIVE_FOUND": "see the cards above",
     # mark_ledger.status_line: the coverage ledger's one-line state ({suggested} and {age} are the two
     # optional parts below, already formatted, or empty)
+    # khms_review_ping.sh: the morning ping. {pending} is the list of what waits; the rest are its parts.
+    "PING_REVIEW": ("[AUTO-PING] Morning KHMS review: memory/inbox/ holds unreviewed proposals -- {pending}. "
+                    "Check whether they are already reviewed (cards in know/); if not, review each unit on its "
+                    "own: (1) tools/convert_inbox2.py memory/inbox/<unit> writes <unit>.approve.md and a report; "
+                    "(2) resolve what the report and the inbox's ## Flagged section flag; (3) tools/approve_inbox.py "
+                    "on the corrected .approve.md (it writes the unit's review marker); (4) tools/build_views.py. "
+                    "A unit that yields no card is closed with tools/mark_ledger.py mark-reviewed memory/inbox/<unit> "
+                    "--reason '...'; anything appended after a review reopens the unit. A contradiction triage "
+                    "(DATE-triage.md) is a review of its own: add a '## REVIEW VERDICT' section with lines "
+                    "'ROW n: APPLY refute|challenge|contradicts / REJECT reason', run tools/apply_triage.py "
+                    "memory/inbox/DATE-triage.md --dry-run and only after checking it --apply. No hand edits of "
+                    "frontmatter. Then report to {principal}.{zero_note}"),
+    "PING_ZERO_NOTE": (" !!! WARNING: the sweep wrote a triage file but JUDGED NOT ONE PAIR (0 judged). That file "
+                       "is not a result, it is the record of a night that did not happen -- 'no contradictions' in "
+                       "it does not mean there are none. FIRST run the sweep again (tools/nightly_triage.sh) and "
+                       "check that the judge answers at all; only then review the triage."),
+    "PING_NIGHT_RUNNING": ("THE NIGHT IS STILL RUNNING (since {hm}, night {nk}) -- review only finished units; in "
+                           "progress: {wip}; the rest after the 'nightly done' / 'nightly INCOMPLETE' line of the "
+                           "night log"),
+    "PING_NONE": "none",
+    "PING_NIGHT_UNKNOWN": ("NIGHT STATE UNKNOWN ({line}) -- before reviewing, check in the night log that the last "
+                           "'nightly start' has its 'nightly done'"),
+    "PING_NEVER": "never",
+    "PING_NIGHT_MISSED": "THE NIGHT RUN DID NOT FINISH (last: {last})",
+    "PING_SWEEP_FAILED": ("THE NIGHT SWEEP FAILED {n} TIMES IN A ROW (since {first}; last: {last}) -- the window "
+                          "grows every night and the same failure will repeat; find the cause in the night log "
+                          "('sweep part' / 'FAILED' lines)"),
+    "PING_WEEK_MISSED": "THE WEEKLY RUN DID NOT FINISH (last: {last})",
+    "PING_EXTRA_ONLY": "[AUTO-PING] Project check: {extra}. Then report to {principal}.",
+    "PING_EXTRA_FAILED": "PROJECT CHECK DID NOT ANSWER (rc={rc}, {cmd}): {out}",
+    "PING_EXTRA_CLEAN": "clean (nothing to report)",
+    "PING_INBOX_CLEAN": "(inbox clean)",
     "LEDGER_NO_STATE": "MARK LEDGER: no state -- run mark_ledger.py sync",
     "LEDGER_STATUS": ("MARK LEDGER (since {floor}): OPEN {open} (queued {queued}, proposed in an unreviewed "
                       "inbox/carry {proposed}{suggested}) · CARDED {carded} · DISMISSED {dismissed} · carry "
@@ -154,6 +186,13 @@ def job_markers():
 
 
 if __name__ == "__main__":
+    if sys.argv[1:2] == ["get"] and len(sys.argv) >= 3:
+        # `khms_messages.py get KEY [name=value ...]` -- one message for a shell caller, placeholders filled
+        try:
+            print(msg(sys.argv[2], **dict(a.split("=", 1) for a in sys.argv[3:])))
+        except (KeyError, ValueError, IndexError) as e:
+            sys.exit(f"khms_messages: cannot render {sys.argv[2]}: {e!r}")
+        sys.exit(0)
     if sys.argv[1:2] == ["--check"]:
         path = P.get("KHMS_MESSAGES")
         given = {}
