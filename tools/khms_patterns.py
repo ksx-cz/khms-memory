@@ -17,6 +17,11 @@ are NOT expanded). Absent file = English only. Keys:
                                   HOOK_CLAIM_KEYWORD, HOOK_CLAIM_HONEST, HOOK_DOMAIN, HOOK_PROPOSAL_MARKER,
                                   HOOK_PROPOSAL_REF, HOOK_PROPOSAL_CHOICE, HOOK_PROPOSAL_SKIP,
                                   HOOK_PROPOSAL_META, HOOK_PROPOSAL_STOPWORDS, HOOK_PROPOSAL_GENERIC
+  OWNERQ_<NAME>=<value>           verify_owner_quotes.py: the principal's name forms and wording, self-test
+                                  sentences (its docstring names each key)
+  CONVERT_TAG_HINT_<n>=<tag>::<regex>  convert_inbox2.py: an extra surface form of a registry tag, in file order
+  CONVERT_SCOPE_DEFAULT, CONVERT_SCOPE_AGENT, CONVERT_AGENT_TAGS  convert_inbox2.py: the base's scope names
+                                  and the tags that mean "the agent's own machinery"
   The hook's input is normalised before matching (lower-case, diacritics stripped) where its docstring says so.
 """
 import os
@@ -59,6 +64,12 @@ def labelled(prefix):
             label, rx = v.split("::", 1)
             out.append((label, re.compile(rx)))
     return out
+
+
+def raw_labelled(prefix):
+    """[(label, raw value)] for every `<prefix><n>=<label>::<value>` line, in file order, NOT compiled --
+    for callers that interpret their own flag markers (convert_inbox2.py's leading "(?-i)")."""
+    return [tuple(v.split("::", 1)) for k, v in _load() if k.startswith(prefix) and "::" in v]
 
 
 def value(key, default):
