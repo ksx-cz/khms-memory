@@ -337,7 +337,7 @@ def build_injection(cands, cards, injected, t, p, skips):
                 umb = u
                 break
         if umb and umb["id"] not in used and _fresh(umb["id"], injected, t, p):
-            lines.append(card_line(umb, prefix="- princip: "))
+            lines.append(card_line(umb, prefix=M.msg("SELECT_UMBRELLA_PREFIX")))
             used.append(umb["id"])
         lines.append(card_line(c, score))
         used.append(c["id"])
@@ -348,7 +348,7 @@ def build_injection(cands, cards, injected, t, p, skips):
             # marked injected, because a refuted card without it is useless.
             for cor in correctors[:1]:
                 if cor["id"] not in used:
-                    lines.append(card_line(cor, prefix="  ↳ opravuje: "))
+                    lines.append(card_line(cor, prefix=M.msg("SELECT_CORRECTED_BY_PREFIX")))
                     used.append(cor["id"])
                     correctors = [x for x in correctors if x["id"] != cor["id"]]
         # An ACTIVE card that something corrects gets a POINTER, not a card:
@@ -384,7 +384,7 @@ WARN_CHARS = 110      # of the corrector's first line
 
 def warn_line(cor):
     """The reverse edge, one line: who corrects the card just served."""
-    return f"  ⚠ OPRAVENO KARTOU {cor['id']}: {cor['first'][:WARN_CHARS]}"
+    return M.msg("SELECT_CORRECTOR_POINTER", id=cor["id"], first=cor["first"][:WARN_CHARS])
 
 
 def card_line(c, score=None, prefix="- "):

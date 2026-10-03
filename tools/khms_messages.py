@@ -22,6 +22,11 @@ DEFAULTS = {
     "NOT_IN_BASE": "(not in the base)",
     "SELECT_HEADER": "KHMS (auto-recall -- cards relevant to what is being worked on):",
     "SELECT_FOOTER": "If a card is relevant: open it whole (memory/know/<id>.md) and follow its links.",
+    # card-line prefixes of an injection: the principle umbrella served beside a card, the corrector served
+    # in full beside a refuted/superseded card, and the one-line pointer to a corrector of an active card
+    "SELECT_UMBRELLA_PREFIX": "- principle: ",
+    "SELECT_CORRECTED_BY_PREFIX": "  -> corrected by: ",
+    "SELECT_CORRECTOR_POINTER": "  ! CORRECTED BY {id}: {first}",
     "REPORT_DIRECTIVE_FOUND": "see the cards above",
     "NOTHING_ABOVE_BAR_CAPPED": "nothing above the bar (rate cap) -- the base is silent on this",
     "NOTHING_ABOVE_BAR": "nothing above the bar -- the base is silent on this",

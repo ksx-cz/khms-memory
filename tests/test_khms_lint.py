@@ -16,7 +16,6 @@ corrects:
 
 Nothing here touches a real base: everything runs in a temporary KHMS_ROOT.
 """
-import importlib.util
 import os
 import subprocess
 import sys
@@ -151,14 +150,6 @@ class ApproveRefuses(unittest.TestCase):
         self.assertIn("contradicts: [K-90042]", open(written).read())
 
 
-def load_hook():
-    spec = importlib.util.spec_from_file_location(
-        "khms_hook_under_test", os.path.join(TOOLS, "khms_hook.py"))
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
-
-
 def card(cid, first, status="active", links=None, tags=("sensor",)):
     links = dict({"derived_from": [], "supports": [], "contradicts": [],
                   "refuted_by": [], "supersedes": None}, **(links or {}))
@@ -174,11 +165,17 @@ NEW = card("K-90300", "Real culprit corrected — the branch is healthy, the new
 
 
 class ReverseInjection(unittest.TestCase):
-    def setUp(self):
-        self.hook = load_hook()
+    """The injection itself lives in khms_select (the hook only calls it); tested there, with the V2 params
+    the hook serves and the shipped English wording (the conftest strips every KHMS_* variable, so no
+    deployment's messages file can be in force)."""
 
-    def build(self, cards, served):
-        text, used = self.hook.build_injection([(40.0, [], served)], cards, {}, 1000.0, [])
+    def setUp(self):
+        import khms_select
+        self.sel = khms_select
+
+    def build(self, cards, served, params=None):
+        text, used = self.sel.build_injection([(40.0, [], served)], cards, {}, 1000.0,
+                                              params or self.sel.V2, [])
         return text or "", used
 
     def test_active_card_carries_its_corrector(self):
@@ -205,20 +202,17 @@ class ReverseInjection(unittest.TestCase):
         self.assertEqual(text.count("K-90300"), 1)   # not repeated as a pointer
 
     def test_pointer_survives_a_full_budget(self):
+        import dataclasses
         big = card("K-90042", "x" * 800)
-        old_cap, self.hook.CHAR_CAP = self.hook.CHAR_CAP, 200
-        try:
-            text, _ = self.build([big, NEW], big)
-        finally:
-            self.hook.CHAR_CAP = old_cap
+        text, _ = self.build([big, NEW], big, dataclasses.replace(self.sel.V2, char_cap=200))
         self.assertIn("! CORRECTED BY K-90300", text)
-        self.assertLess(len(text), 200 + 2 * self.hook.WARN_CHARS + 80)
+        self.assertLess(len(text), 200 + 2 * self.sel.WARN_CHARS + 80)
 
     def test_at_most_two_pointers(self):
         cors = [card(f"K-0030{i}", f"corrector {i}", links={"contradicts": ["K-90042"]})
                 for i in range(4)]
         text, _ = self.build([OLD] + cors, OLD)
-        self.assertEqual(text.count("! CORRECTED BY"), self.hook.MAX_WARN)
+        self.assertEqual(text.count("! CORRECTED BY"), self.sel.MAX_WARN)
 
     def test_malformed_links_do_not_raise(self):
         broken = card("K-90042", "Old claim")
