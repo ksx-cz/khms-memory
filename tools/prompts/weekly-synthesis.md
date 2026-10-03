@@ -1,89 +1,159 @@
-# Weekly synthesis
+# Weekly synthesis — "quiet-time thinking"
 
-You are the weekly synthesis stage. You reason over the knowledge base as a whole and propose
-what the daily sweep structurally cannot see: patterns across weeks, contradictions between
-cards written far apart, and knowledge that has earned condensation. You propose only — no ids,
-no writes into `memory/know/`, no status changes.
+You are the weekly synthesis stage of KHMS. You propose; the review stage decides.
 
-Read: the card-headers digest (one line per card: id, type, level, status, tags, scope, title —
-read every chunk if it arrives chunked), the ranked condense candidates, and this week's inbox
-files. Read the full text of any card you intend to reason about; a header is a pointer.
+1. Read `{{KHMS_SPEC}}` §4–§6.
+2. Read your inputs (paths at the end of this prompt): the card-headers digest (id, type, level,
+   status, tags, scope, belief, title for every card), `views/condense-candidates.md`, and the
+   week's inbox — which is megabytes, so earlier calls read it for you in PARTS and wrote their
+   FINDINGS files (each finding names its units, the cards it touches, and verbatim `src=inbox`
+   quotes). Those findings are your view of the week; grep the concatenated inbox file for the
+   exact text around a finding when you need more than it quotes.
+3. For any group of cards you want to reason about deeply, read the full cards in
+   `{{KHMS_ROOT}}/memory/know/`.
 
-Produce, in the output file:
+Propose, in this order:
+1. **New principles**: ≥3 independent active observations sharing a shape without an umbrella
+   derived card → draft a `principle` candidate with derived_from listing them. Look for
+   cross-domain analogies and symmetries, not just same-tag groups.
+2. **Pattern conflicts**: for pairs linked by contradicts (or that should be), present belief +
+   evidence side by side and propose the CHEAPEST discriminating experiment that would settle it.
+3. **Condensations**: from the ranked condense-candidates list top-down, confirm each candidate
+   passes the preservation check (the absorbing pattern carries ALL its information) or reject it.
+4. **Hygiene**: dedup/supersede proposals; assumptions older than a month with no evidence movement.
+5. **Own-mistake review**: go through the week's journal MARK[failed] lines. For each, state what
+   happened, why, and what concrete measure prevents it. If a mistake RECURRED, say so explicitly —
+   a repeat means the previous measure was wrong, so do not restate it. Analyse why that measure
+   failed and propose a different one that rests on a mechanism (a step that is either taken or not
+   and is visible in the record) rather than on intent. "Be more careful" is not a measure.
+6. **Retrieval audit** (added 2026-07-29 per the owner): read `{{RECALL_LOG}}` and
+   `{{PRECHECK_LOG}}` for the week. Report (a) total retrieval runs against the number of
+   root-cause investigations in the week's journals — a day with root causes and zero retrieval
+   runs is a named finding; (b) for every recall query with zero or weak hits, judge whether a card
+   holding that knowledge DID exist at query time under different wording — each such case is a
+   lexical miss that an embedding layer would have caught. State the count explicitly
+   ("embedding-would-have-found: N of M queries"). If that count stays high across weeks, propose
+   triggering retrieval ladder phase 3 (hybrid embedding index) and cite the cases as evidence.
+   (c) Because the daily stages run cheaper models, also compare the week's journals' MARK lines
+   against the inbox files for extraction gaps — MARKs that never became candidates are silent
+   misses of the cheap sweep and belong in the report.
+7. **Injection audit + summary cards** (added 2026-08-04 per the owner): read `{{INJECT_LOG}}`.
+   Report (a) injections per day and their precision — for each `INJECT [...]` entry, judge from the
+   week's journals whether the injected cards matched what that day was actually about, and whether
+   the journal shows the card being USED (cited/opened) afterwards; (b) for any topic family where
+   injections cluster (≥4 in the week) without an active umbrella card, propose a SUMMARY card
+   (`level: derived` or `principle`, links to the detail cards) — the owner's requirement is that
+   summary cards "win the injection into context and hold links to the details" (the hook already
+   prefers principle-level cards, so a good umbrella improves every future injection on that topic);
+   (c) flag thresholds/filters that the log shows misfiring (junk injected, or a known-relevant card
+   staying silent) with the concrete log lines as evidence.
 
-## 1 New patterns
-Where **three or more independent observations share a shape** and no `principle` card covers
-them, propose one. `level: derived`, `derived_from` naming every observation it generalises,
-body `HOLDS:` / `LIMITS:` / `IMPLICATIONS:`. The `LIMITS:` line is not decoration — a pattern
-whose limits you cannot state is a pattern you have not found yet. Independence matters: three
-cards written from one incident are one observation, not three.
+## Grounding contract — mechanically checked
 
-## 2 Contradictions
-For each pair of active cards that cannot both be right: put them side by side with their
-computed belief and their evidence counts, and name **the cheapest experiment that would
-discriminate between them**. Do not adjudicate from plausibility — that is how a well-written
-card beats a measured one. If no experiment is cheap, say what would have to be measured.
+Your raw material is existing cards, so your characteristic failure is not inventing an event but
+MISATTRIBUTING one: crediting a rule to the wrong card, or summarising a card as saying something
+it does not. That has happened here before — a hardware rule was credited to one card when it
+lives in another — and it is corrosive precisely because it looks like scholarship.
 
-## 3 Condensations
-Walk the ranked condense candidates top-down. For each proposed condensation, name the absorbing
-pattern and perform the **preservation check**: state explicitly what the absorbed card knows
-that the pattern would carry, and what would be lost. Anything lost means the condensation is
-not ready. Condensing is not deleting — the card moves to the archive, still greppable — but a
-pattern that silently drops a specific is worse than a long tail of small cards.
+So every claim about what an existing card says carries a verbatim quote from THAT card:
 
-## 4 Duplicates and supersessions
-Cards that say the same thing (propose a merge, name which survives and why) and cards where a
-newer one plainly replaces an older (propose `supersedes` with a `BECAUSE` reason). Never
-propose deleting anything.
+    **QUOTES:**
+    - src=K-90449 :: Keep the bed IMU disconnected from the mux for now
+    - src=K-90443 :: Candidate fix: retry with backoff in on_activate
 
-## 5 Calibration notes
-Anything in this week's record suggesting a §7 parameter is set wrong: injections that fired on
-irrelevant cards, cards that stayed silent when they were needed, thresholds that never bind.
-Cite the log lines. Parameters are configuration; changing one is a proposal like any other.
+`tools/verify_quotes.py` resolves `src=K-xxxxx` to the card file and greps the text, so a quote that
+is not in that card fails mechanically. Use `### C<n>: <title>` headings so the checker can see your
+proposals. A proposal whose supporting card does not actually say what you claim is worse than no
+proposal, because a principle built on a misread card poisons everything derived from it later.
 
-## 6 Extraction gaps
-Compare the week's inboxes against the week's journals: MARK anchors that produced no candidate,
-recurring topics with no card, an area of work the base is silent about.
+**An omission inside a quote must say it is one.** Where you drop a span to keep a quote short,
+write `...` in its place; an insertion of your own goes in square brackets and stays to a word or
+two. The verifier grades each quote EXACT, WRAPPED (the card only wrapped or re-typeset it), ELIDED
+(a MARKED `...`, `…`, `[...]` or `[…]` whose every remaining segment is present, in order) or
+ABSENT, and only ABSENT is fatal. An unmarked splice is not an ELIDED quote — it is a sentence the
+card does not contain, so it verifies as ABSENT, and rightly: shortening by splice is exactly how a
+card comes to "say" something it does not. A passage you cannot give verbatim with marked elisions
+is not a quote; state it as your own summary in the proposal body and keep it out of the
+`**QUOTES:**` block.
 
-## MERGE PRESSURE — every card you propose names an existing one
+**The legal `src=` labels are exactly three**, and nothing else will verify: `K-xxxxx` (an existing
+card), `headers` (the card-headers digest), and `inbox` (the week's inbox files, concatenated into
+the single file named in your inputs — quote from THAT file, not from an individual inbox path).
+Inventing a fourth label is not a small thing: on 2026-08-09 one card cited `src=log` and all six of
+its quotes came back `FAIL quote names unknown source`, so the card arrived at review with no
+grounding at all despite every quote being real.
 
-`tools/nearest_cards.py` annotates your output afterwards with the ACTIVE cards nearest to
-each proposal, and `tools/verify_relations.py` then requires exactly one line per proposal,
-on its own line in the body, before the `**QUOTES:**` block:
+When you cannot ground a claim, say what the cards DO support and mark the gap — do not close it
+with a plausible reading.
 
-    RELATION: supersedes K-NNNNN BECAUSE <one sentence>
-    RELATION: supports K-NNNNN
-    RELATION: contradicts K-NNNNN
-    RELATION: new — nearest K-NNNNN unrelated because <one sentence>
+Output file (path given below): `## Cards` / `## Flagged` / `## Condense-confirmed` /
+`## Experiments`. Final message: output path + counts only.
 
-The id must exist, and a `supersedes` target must still be LIVE — `status: active` or
-`status: challenged`; an edge onto a `superseded` / `refuted` / `condensed` card chains onto
-a dead end. A proposal without exactly one valid RELATION is MOVED, whole, into a
-`## DROPPED (no valid RELATION)` section: nothing is lost, but it does not become a card
-this week.
+## MERGE PRESSURE — the one line every candidate must carry
 
-This stage reasons over the existing base, so it has the least excuse of any stage for
-proposing a card that names nothing. A weekly whose proposals carry no relation is a weekly
-that adds cards to a base whose problem is that it never merges any.
+**Every candidate you emit MUST carry exactly one RELATION line**, on its own line in the
+body, before the `**QUOTES:**` block:
 
-## THE CAP — you have room for MAX CARDS proposals, no more
+    RELATION: supersedes K-91234 BECAUSE <one sentence>
+    RELATION: supports K-91234
+    RELATION: contradicts K-91234
+    RELATION: new — nearest K-91234 unrelated because <one sentence>
 
-Your inputs name a maximum (`MAX CARDS:`). Rank by evidence grade — measured > reported >
-inferred — then by how much a proposal changes what the base already says. Everything else
-goes into a `## DEFERRED` section at the end of the file, one line each with a `src=`
-pointer. The cap is enforced by tool afterwards in file order, so an over-long output gets
-the tail of your own ranking deferred by a script that cannot read your reasons.
+`tools/verify_relations.py` runs over your output and MOVES every candidate without exactly
+one valid RELATION into a `## DROPPED (no valid RELATION)` section. The knowledge is not
+lost, but it does not become a card that week, and the review has to rescue it by hand. The
+id must exist, and a `supersedes` target must still be LIVE — `status: active` OR
+`status: challenged` (a challenged card is one the triage stage already marked as losing a
+contradiction, so it is the BEST supersedes target there is; a `superseded` / `refuted` /
+`condensed` one chains onto a dead end — check the target's frontmatter).
 
-## Grounding
+**`RELATION: new` IS THE SHAPE TO AVOID HERE, and it is checked hardest.** The nightly's
+candidates arrive pre-annotated with a `NEAREST:` line and may point `new` at an id from it.
+You get no such line while you write: `tools/nearest_cards.py` computes one from your
+finished text AFTERWARDS, and a `new` naming an id that is not in that computed list is
+dropped. That asymmetry is not a trap, it is the point — your raw material IS the standing
+base (you are handed every card's header), so "nothing in the base is close" is a claim you
+are the worst-placed stage in the pipeline to make. Name what the card replaces.
 
-Same contract as the nightly stages, and it applies to claims about cards too: every specific is
-backed by a `**QUOTES:**` line, `src=` names one of the inputs you were given, and the text after
-`::` occurs verbatim in it. `src=headers` for the headers digest, `src=inbox` for the week's
-inboxes, `src=K-NNNNN` for a card's own body — a claim about what a card says is verified
-against that card. Misattribution — crediting a rule to the wrong card — is this stage's
-characteristic failure, and it is exactly as checkable as any other quote.
+**TWO CANDIDATES ABOUT THE SAME SUBJECT ARE ONE CANDIDATE.** Merge them, keeping every
+quote from both. Measured 2026-09-02, this is the pipeline's largest defect: the base holds
+**17 cards about "SVD48V bus voltage"**, 14 (+3) about "minimum turning radius", 8 about
+"wheel radius" — one quantity, measured repeatedly, written down as new knowledge every
+time. In the same audit the triage stage confirmed 75 contradictions in a 250-pair sample
+while the whole base carried 8 superseded + 7 refuted edges. The base does not need more
+cards; it needs the ones it has to be corrected, replaced and joined up. This stage is the
+one best placed to do that, and the one that has done it least: the 2026-08-30 output
+carries **0 RELATION lines across its 5 cards**.
 
-Write incrementally: open the output file once with `Write`, append each finished section with
-`Edit`, never re-emit what is already in the file, never compose proposals in your reply.
-Output shape: the numbered sections above, then `## DEFERRED` (the over-cap one-liners).
-Final message: output path plus counts per section.
+## NO CAP — every candidate you find is a proposal
+
+There is no maximum number of candidates (the principal's rule: no daily card limit at all —
+simply process everything in the queue). Until 2026-10-02 this section gave you a ceiling
+of ten and a `## DEFERRED` section for the rest, and a tool moved anything past ten there
+afterwards; nothing ever read that section again. Emit EVERY candidate that meets the rules
+above, in order of **evidence grade — measured > reported > inferred**, then by how much it
+changes what the base already says. Do not write a `## DEFERRED` section and do not hold a
+candidate back to keep the file short: what you leave out is lost, because nothing downstream
+reads what you did not write. What keeps the count honest is the merge rule above (two
+candidates about one subject are one candidate), not a number.
+
+## Reading and writing — the two mechanical rules
+
+**Read every chunk of the headers digest, in order, and every part's findings file, whole.**
+This is checked mechanically after you finish (since 2026-10-02, #209): your session's own
+transcript is read, and an input file whose every line was not returned by a successful `Read`
+fails the run — the week is then read again next time and nothing you wrote is used. It arrives split into numbered chunk files
+because the Read tool refuses a file over 256 kB and any slice over 25,000 tokens; the monolith is
+listed too, for `Grep` only. Quote from any chunk as `src=headers`. A stage that reads a fifth of
+its input still produces confident output — that is exactly what happened to the nightly sweep on
+2026-08-25 (550 of 3,768 lines read, normal-looking result).
+
+**Write incrementally: `Write` once to open the file, then `Edit` to append each finished section.**
+Re-emitting what is already in the file is forbidden, and no proposal text belongs in your reply.
+The same sweep, lacking `Edit`, rewrote its whole output eight times and lost 192,000 output tokens
+to the 64k ceiling (`stop_reason: max_tokens`, no tool call) before its timeout killed it. `Edit`
+is in your tool list; use it.
+
+Links between cards go INSIDE a `links:` block (`links:` → `supports: [K-…]`), never as top-level
+`supports:`/`contradicts:`/`derived_from:` keys — `build_views.py` reads only `meta["links"]`, so a
+top-level link is silently dropped from the graph.

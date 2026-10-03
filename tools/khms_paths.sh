@@ -3,7 +3,8 @@
 #
 # Usage (sourced):   . "$(dirname "$(readlink -f "$0")")/khms_paths.sh"; khms_load || exit $?
 #                    root="$(khms_get KHMS_ROOT)"; khms_require_writable "allocate ids" || exit $?
-# Usage (executed):  khms_paths.sh KEY | --all | --root      (same output and exit codes as khms_paths.py)
+# Usage (executed):  khms_paths.sh KEY | --all | --root | --code-lock-file   (same output and exit codes as
+#                    khms_paths.py)
 #
 # Both readers implement ONE contract, documented in khms_paths.py: root discovery ($KHMS_ROOT, then
 # KHMS_ROOT in $KHMS_CONFIG_FILE, then ~/.config/khms/root, else an error), settings file selection,
@@ -18,7 +19,11 @@ _KHMS_KEYS=(KHMS_ROOT KHMS_CONFIG_FILE KHMS_CONFIG_DIR KHMS_STATE KHMS_SHARED_ST
   KHMS_RECALL_INTENT KHMS_HOOK_STATE
   KHMS_HOOKS_OFF_FILE KHMS_LEN_CACHE KHMS_EXPERIMENT KHMS_GLOSSARY KHMS_DIRECTIVE KHMS_EMBED_DIR
   KHMS_EMBED_PY KHMS_DENSE_SOCKET KHMS_HF_HOME KHMS_SNAPSHOT_ROOT KHMS_TRANSCRIPTS KHMS_MESSAGES KHMS_PATTERNS
-  KHMS_NIGHTLY_LOCK KHMS_REPORT_TOOL KHMS_REPORT_CHANNEL KHMS_REPORT_SERVER)
+  KHMS_NIGHTLY_LOCK KHMS_WEEKLY_LOCK KHMS_NIGHT_STAMP KHMS_WEEK_STAMP KHMS_SWEEP_FAILED KHMS_NIGHT_LOG
+  KHMS_CODE_LOCKS KHMS_AGENT KHMS_AGENT_TRANSCRIPTS KHMS_SWEEP_MODEL KHMS_MARK_MODEL KHMS_CONS_MODEL
+  KHMS_WEEK_PART_MODEL KHMS_WEEK_MODEL KHMS_PROJECT_SLUG KHMS_GIT_REPOS KHMS_CHAT_FETCH KHMS_CHAT_VERIFY
+  KHMS_NIGHT_TRIAGE KHMS_SPEC KHMS_PRINCIPAL KHMS_PROMPT_EXT KHMS_ACCOUNT_DIR
+  KHMS_REPORT_TOOL KHMS_REPORT_CHANNEL KHMS_REPORT_SERVER)
 declare -gA _KHMS_DEFAULT=(
   [KHMS_CONFIG_FILE]="" [KHMS_CONFIG_DIR]='${KHMS_ROOT}/config' [KHMS_STATE]='${KHMS_ROOT}/state'
   [KHMS_SHARED_STATE]='${KHMS_ROOT}/state/shared' [KHMS_READ_ONLY]="0"
@@ -32,7 +37,15 @@ declare -gA _KHMS_DEFAULT=(
   [KHMS_EMBED_DIR]='${KHMS_SHARED_STATE}/embed' [KHMS_EMBED_PY]="" [KHMS_DENSE_SOCKET]=""
   [KHMS_HF_HOME]="" [KHMS_SNAPSHOT_ROOT]="" [KHMS_TRANSCRIPTS]=""
   [KHMS_MESSAGES]='${KHMS_CONFIG_DIR}/messages.env' [KHMS_PATTERNS]='${KHMS_CONFIG_DIR}/patterns.env'
-  [KHMS_NIGHTLY_LOCK]='${KHMS_SHARED_STATE}/nightly.lock' [KHMS_REPORT_TOOL]="" [KHMS_REPORT_CHANNEL]=""
+  [KHMS_NIGHTLY_LOCK]='${KHMS_SHARED_STATE}/nightly.lock' [KHMS_WEEKLY_LOCK]='${KHMS_SHARED_STATE}/weekly.lock'
+  [KHMS_NIGHT_STAMP]='${KHMS_SHARED_STATE}/last-nightly' [KHMS_WEEK_STAMP]='${KHMS_SHARED_STATE}/last-weekly'
+  [KHMS_SWEEP_FAILED]='${KHMS_SHARED_STATE}/sweep-failed' [KHMS_NIGHT_LOG]='${KHMS_STATE}/nightly.log'
+  [KHMS_CODE_LOCKS]='${KHMS_STATE}/code-locks' [KHMS_AGENT]="claude"
+  [KHMS_AGENT_TRANSCRIPTS]='${HOME}/.claude/projects' [KHMS_SWEEP_MODEL]="sonnet" [KHMS_MARK_MODEL]="sonnet"
+  [KHMS_CONS_MODEL]="sonnet" [KHMS_WEEK_PART_MODEL]="sonnet" [KHMS_WEEK_MODEL]="opus"
+  [KHMS_PROJECT_SLUG]="" [KHMS_GIT_REPOS]="" [KHMS_CHAT_FETCH]="" [KHMS_CHAT_VERIFY]="" [KHMS_NIGHT_TRIAGE]=""
+  [KHMS_SPEC]="" [KHMS_PRINCIPAL]="the principal" [KHMS_PROMPT_EXT]='${KHMS_CONFIG_DIR}/prompts' [KHMS_ACCOUNT_DIR]=""
+  [KHMS_REPORT_TOOL]="" [KHMS_REPORT_CHANNEL]=""
   [KHMS_REPORT_SERVER]="")
 declare -gA _KHMS_RAW=()
 _KHMS_ROOT_RESOLVED=""
@@ -157,6 +170,29 @@ khms_may_write() {   # khms_may_write PATH -> rc 0 when this deployment may appe
   return 0
 }
 
+khms_code_lock_file() {   # the code-use lock file of THIS clone (one per clone, in the agent's state)
+  local dir id; dir="$(khms_get KHMS_CODE_LOCKS)" || return 3
+  id="$(printf '%s' "$KHMS_CODE" | sha256sum | cut -c1-16)"
+  printf '%s/%s.lock\n' "$dir" "$id"
+}
+
+# khms_code_lock: hold a SHARED lock on this clone's code for the rest of the caller's life.
+# Every long-running entrypoint (night, week, export, the embedding daemon) takes it first; an updater takes
+# the same file EXCLUSIVELY (flock -x -n) and therefore refuses while any of them runs, without killing it.
+# Shared locks never conflict with each other, and a child inherits the open descriptor, so a nested call
+# (the night running a helper that takes the lock again) cannot deadlock. rc 5 when an update holds it.
+khms_code_lock() {
+  local f; f="$(khms_code_lock_file)" || return 3
+  mkdir -p "${f%/*}" || { _khms_err "cannot create ${f%/*} for the code-use lock"; return 3; }
+  [ -s "$f" ] || printf 'code=%s\n' "$KHMS_CODE" >> "$f"
+  exec {KHMS_CODE_LOCK_FD}>>"$f"
+  flock -s -n "$KHMS_CODE_LOCK_FD" || {
+    echo "khms: the code clone $KHMS_CODE is being updated (exclusive lock $f is held) -- refusing to start" >&2
+    exec {KHMS_CODE_LOCK_FD}>&-
+    return 5
+  }
+}
+
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
   case "${1:-}" in
     ""|-h|--help) sed -n '2,6p' "${BASH_SOURCE[0]}"; [ -n "${1:-}" ]; exit $? ;;
@@ -165,6 +201,7 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
   case "$1" in
     --all) for k in "${_KHMS_KEYS[@]}"; do v="$(khms_get "$k")" || exit 3; printf '%s=%s\n' "$k" "$v"; done ;;
     --root) printf '%s\n' "$_KHMS_ROOT_RESOLVED" ;;
+    --code-lock-file) khms_code_lock_file || exit 3 ;;
     KHMS_*) v="$(khms_get "$1")" || exit 3; printf '%s\n' "$v" ;;
     *) echo "khms_paths: unknown name $1" >&2; exit 2 ;;
   esac

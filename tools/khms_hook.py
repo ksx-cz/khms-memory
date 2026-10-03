@@ -296,7 +296,7 @@ def unreviewed_inbox(inbox):
     try:
         import mark_ledger as _ml
         _mp = _ml.Paths(BRAIN)
-        _mp.tools = rdir
+        _mp.reviewed = rdir
         card_units = {os.path.basename(f) for f, ok in _ml.review_units(_mp) if not ok}
     except Exception as exc:                                       # noqa: BLE001
         log("SessionStart", "inbox-check", action="unit check unavailable (%s)" % exc.__class__.__name__)

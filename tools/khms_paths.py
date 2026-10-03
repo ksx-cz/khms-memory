@@ -6,6 +6,8 @@ Usage:
   python3 khms_paths.py KEY       print one resolved value (rc 3 and a reason on stderr when it cannot)
   python3 khms_paths.py --all     KEY=value for every documented key
   python3 khms_paths.py --root    the resolved data root (same as `KHMS_ROOT`)
+  python3 khms_paths.py --code-lock-file   this clone's code-use lock (held shared by night, week, export and
+                                  the embedding daemon; an updater takes it exclusively)
 
 Five kinds of location, never derived from one another by accident:
   code          the directory of this file -- a clone of the KHMS repository. Nothing is written here.
@@ -80,6 +82,29 @@ DEFAULTS = [
     ("KHMS_MESSAGES", "${KHMS_CONFIG_DIR}/messages.env"),
     ("KHMS_PATTERNS", "${KHMS_CONFIG_DIR}/patterns.env"),
     ("KHMS_NIGHTLY_LOCK", "${KHMS_SHARED_STATE}/nightly.lock"),
+    # --- night / week pipeline (nightly_distill.sh, weekly_synthesis.sh) ---------------------------------
+    ("KHMS_WEEKLY_LOCK", "${KHMS_SHARED_STATE}/weekly.lock"),     # one weekly at a time
+    ("KHMS_NIGHT_STAMP", "${KHMS_SHARED_STATE}/last-nightly"),    # start of the last stamped night window
+    ("KHMS_WEEK_STAMP", "${KHMS_SHARED_STATE}/last-weekly"),      # completion of the last weekly
+    ("KHMS_SWEEP_FAILED", "${KHMS_SHARED_STATE}/sweep-failed"),   # one line per failed sweep, cleared on success
+    ("KHMS_NIGHT_LOG", "${KHMS_STATE}/nightly.log"),              # night AND week log
+    ("KHMS_CODE_LOCKS", "${KHMS_STATE}/code-locks"),              # per-clone code-use locks (khms_code_lock)
+    ("KHMS_AGENT", "claude"),                                     # headless agent CLI (argv[0])
+    ("KHMS_AGENT_TRANSCRIPTS", "${HOME}/.claude/projects"),       # where that CLI writes session transcripts
+    ("KHMS_SWEEP_MODEL", "sonnet"),
+    ("KHMS_MARK_MODEL", "sonnet"),
+    ("KHMS_CONS_MODEL", "sonnet"),
+    ("KHMS_WEEK_PART_MODEL", "sonnet"),
+    ("KHMS_WEEK_MODEL", "opus"),
+    ("KHMS_PROJECT_SLUG", ""),             # only transcript paths containing this text ("" = every transcript)
+    ("KHMS_GIT_REPOS", ""),                # space-separated repositories whose commits are a night source
+    ("KHMS_CHAT_FETCH", ""),               # argv: refresh the chat archive before the night ("" = off)
+    ("KHMS_CHAT_VERIFY", ""),              # argv: verify principal quotes in the journal ("" = off)
+    ("KHMS_NIGHT_TRIAGE", ""),             # argv: the standing-base triage stage ("" = off, said in the log)
+    ("KHMS_SPEC", ""),                     # card schema the prompts cite ("" = spec/khms-spec.md of this clone)
+    ("KHMS_PRINCIPAL", "the principal"),   # who the base serves, as the prompts name them
+    ("KHMS_PROMPT_EXT", "${KHMS_CONFIG_DIR}/prompts"),            # private prompt extensions (optional)
+    ("KHMS_ACCOUNT_DIR", ""),              # token accounting: the project's transcript directory ("" = derive)
     ("KHMS_REPORT_TOOL", ""),                               # regex of the report tool ("" = built-in default)
     ("KHMS_REPORT_CHANNEL", ""),                            # regex: prompts that open a report turn ("" = all)
     ("KHMS_REPORT_SERVER", ""),                             # channel server name part ("" = built-in default)
@@ -318,6 +343,35 @@ _DERIVED = {
 }
 
 
+EXIT_CODE_BUSY = 5
+
+
+def code_lock_file():
+    """The code-use lock file of THIS clone (khms_paths.sh computes the same name)."""
+    import hashlib
+    cid = hashlib.sha256(CODE.encode("utf-8")).hexdigest()[:16]
+    return os.path.join(get("KHMS_CODE_LOCKS"), cid + ".lock")
+
+
+def hold_code_lock():
+    """Hold a SHARED lock on this clone's code for the life of the returned file object (see
+    khms_code_lock in khms_paths.sh). Raises KhmsPathError when an updater holds it exclusively."""
+    import fcntl
+    path = code_lock_file()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fh = open(path, "a", encoding="utf-8")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except BlockingIOError:
+        fh.close()
+        raise KhmsPathError(f"khms: the code clone {CODE} is being updated (exclusive lock {path} is held) "
+                            "-- refusing to start")
+    if fh.tell() == 0:
+        fh.write(f"code={CODE}\n")
+        fh.flush()
+    return fh
+
+
 def _excepthook(etype, value, tb, _orig=sys.excepthook):
     """An unresolvable location is a configuration answer, not a crash: one line and rc 3."""
     if issubclass(etype, KhmsPathError):
@@ -356,6 +410,9 @@ def main(argv):
         if argv[0] == "--all":
             for k in KEYS:
                 print(f"{k}={r.get(k)}")
+            return 0
+        if argv[0] == "--code-lock-file":
+            print(code_lock_file())
             return 0
         if argv[0] == "--root":
             print(r.get("KHMS_ROOT"))

@@ -28,6 +28,18 @@ DEFAULTS = {
     "SELECT_CORRECTED_BY_PREFIX": "  -> corrected by: ",
     "SELECT_CORRECTOR_POINTER": "  ! CORRECTED BY {id}: {first}",
     "REPORT_DIRECTIVE_FOUND": "see the cards above",
+    # mark_ledger.status_line: the coverage ledger's one-line state ({suggested} and {age} are the two
+    # optional parts below, already formatted, or empty)
+    "LEDGER_NO_STATE": "MARK LEDGER: no state -- run mark_ledger.py sync",
+    "LEDGER_STATUS": ("MARK LEDGER (since {floor}): OPEN {open} (queued {queued}, proposed in an unreviewed "
+                      "inbox/carry {proposed}{suggested}) · CARDED {carded} · DISMISSED {dismissed} · carry "
+                      "{carry} batch(es) · {oldest}{age} · state of {generated} · scope: only MARKs of "
+                      "{nkinds} kinds since {floor} -- not covered: status MARKs, journals before the floor, "
+                      "knowledge without a MARK line"),
+    "LEDGER_SUGGESTED": ", with a card suggestion {n}",
+    "LEDGER_AGE": " (age {days} d)",
+    "LEDGER_OLDEST": "oldest OPEN {id} {date} {time} [{kind}] {text}",
+    "LEDGER_NONE_OPEN": "none OPEN",
     "NOTHING_ABOVE_BAR_CAPPED": "nothing above the bar (rate cap) -- the base is silent on this",
     "NOTHING_ABOVE_BAR": "nothing above the bar -- the base is silent on this",
     "NOTHING_NEW": "nothing new (the relevant cards were already shown in this session)",

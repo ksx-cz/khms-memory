@@ -61,7 +61,9 @@ class FreshHome(unittest.TestCase):
         shutil.copy(FIXTURE, inbox)
         r = self.ok([sys.executable, os.path.join(TOOLS, "approve_inbox.py"), inbox])
         self.assertIn("C1 -> K-90007", r.stdout)
-        self.assertIn("not installed (optional", r.stdout)
+        # the coverage ledger ships with the night pipeline: the approve path re-derives it in the fresh base
+        self.assertIn("MARK LEDGER (since 1970-01-01): OPEN 0", r.stdout)
+        self.assertTrue(os.path.exists(os.path.join(self.root, "memory", "ledger", "summary.json")))
         r = self.ok([sys.executable, os.path.join(TOOLS, "build_views.py")])
         self.assertIn("dense index: not configured (optional", r.stdout)
         r = self.ok([os.path.join(TOOLS, "recall.sh"), "anemometer", "bearing"])

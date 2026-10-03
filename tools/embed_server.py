@@ -219,6 +219,9 @@ def main():
     ap.add_argument("--model", default="qwen", choices=sorted(ei.MODELS))
     ap.add_argument("--socket", default=None)
     a = ap.parse_args()
+    # The daemon runs this clone's code for days: it holds the clone's code-use lock (shared) for its whole
+    # life, so an update of the clone refuses until the daemon is stopped in a planned window.
+    code_lock = P.hold_code_lock()  # noqa: F841  (kept open for the process lifetime)
     sock = a.socket or ei.socket_path(a.model)
     t = time.time()
     index = DenseIndex(a.model)
