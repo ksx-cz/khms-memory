@@ -8,6 +8,8 @@ never enters this repository. A key the file does not set keeps its English defa
 file is ignored, and `khms_messages.py --check` lists both directions.
 
 JOB_MARKERS is a `|`-separated list of prompt prefixes that identify the memory pipeline's own prompts.
+A value may contain `\n` for a line break (the file grammar is one line per key). A value that must keep a
+leading or trailing space is written in quotes. Placeholders are `{name}` (str.format).
 """
 import os
 import sys
@@ -26,6 +28,84 @@ DEFAULTS = {
     "NOTHING_NEW": "nothing new (the relevant cards were already shown in this session)",
     "JOB_MARKERS": ("# Nightly sweep|# Weekly synthesis|# KHMS consolidation instructions"
                     "|# KHMS history-extraction instructions|[AUTO-PING] KHMS review"),
+    # --- khms_hook.py -------------------------------------------------------------------------------
+    "HOOK_DIRECTIVE_LINE": ("REQUIRED: base: <what I searched for -> the cards, or 'did not search - why'>"
+                            " \u00b7 verified: <the command or file:line whose output I read | unverified>"
+                            " \u00b7 if I were wrong: <how that output would have looked different>"
+                            "  (definition: tools/prompts/report_directive.md)"),
+    "HOOK_LEDGER_NONE": "MARK LEDGER: no state ({exc}) -- run tools/mark_ledger.py sync",
+    "HOOK_LEDGER_OLDEST": "oldest OPEN {id} {date} {time} [{kind}] {text}",
+    "HOOK_LEDGER_NO_OPEN": "no OPEN",
+    "HOOK_LEDGER_SUGGESTED": ", with a card proposal {n} -- a proposal is not coverage, `mark_ledger.py suggest`",
+    "HOOK_LEDGER_LINE": ("MARK LEDGER (since {floor}): OPEN {open} (queued {queued}, in the unreviewed inbox/carry "
+                         "{proposed}{suggested}) \u00b7 CARDED {carded} \u00b7 DISMISSED {dismissed} \u00b7 carry "
+                         "{carry} batches \u00b7 {oldest} \u00b7 state of {generated} \u00b7 scope: only the "
+                         "tracked MARK kinds since {floor}; outside it: status MARKs, journals before the floor, "
+                         "findings without a MARK line -- OPEN 0 does not mean \"nothing was lost\""),
+    "HOOK_LEDGER_ERROR": "MARK LEDGER: report failed ({exc}) -- run tools/mark_ledger.py status",
+    "HOOK_INBOX_UNREVIEWED": ("KHMS: UNREVIEWED INBOX: {files} -- do the review (approve_inbox.py, "
+                              "build_views.py, report) BEFORE other work."),
+    "HOOK_INBOX_NIGHT_UNKNOWN": (" (Night pipeline state unknown: {exc} -- before you start, check in "
+                                 "logs/nightly.log that the last `nightly start` has its `nightly done`.)"),
+    "HOOK_NIGHT_RUNNING": ("KHMS: THE NIGHT PIPELINE IS RUNNING (since {start}{night}; it holds the night lock)"
+                           " -- the inbox is not complete yet."),
+    "HOOK_NIGHT_KEY": ", night {nk}",
+    "HOOK_NIGHT_READY": " Ready for review now: {files} -- review them BEFORE other work.",
+    "HOOK_NIGHT_NOTHING_READY": (" Nothing is ready for review yet; the review waits for the `nightly done` (or "
+                                 "`nightly INCOMPLETE`) line in logs/nightly.log."),
+    "HOOK_NIGHT_WIP": " Written by the running night (review them after it ends): {files}.",
+    "HOOK_PRECHECK_HEAD": "KHMS precheck (risky command: {tags}) -- active policies, gotchas and refuted dead ends:",
+    "HOOK_PRECHECK_FOOT": "If any of it applies, open the card whole before running the command.",
+    "HOOK_CLAIM_DENY_CITE": ("base: cites cards without a recall in this turn -- run `tools/recall.sh "
+                             "'<query>'` and send again, or write `base: did not search - <why>`. (reason: {why};"
+                             " checked: the src=cli lines of the recall log since this report turn began)"),
+    "HOOK_CLAIM_DENY_MISSING": ("The report lacks the required `base:` line ({why}). Write `base: <query of "
+                                "tools/recall.sh> -> <cards>`, or honestly `base: did not search - <why>`; both "
+                                "are valid, silence is not. Definition: tools/prompts/report_directive.md"),
+    "HOOK_WHY_NO_LINE": "no claim line ({n} chars)",
+    "HOOK_WHY_SHORT": "short reply",
+    "HOOK_WHY_NOT_A_TURN": "outside a report turn",
+    "HOOK_WHY_HONEST": "honest form ({form})",
+    "HOOK_WHY_NO_IDS": "line without card ids",
+    "HOOK_WHY_NO_TURN": "no report turn in this session",
+    "HOOK_WHY_NO_DISPATCH_TURN": "no turn in this session",
+    "HOOK_WHY_NO_RECALL": "no src=cli recall in this turn",
+    "HOOK_WHY_NO_QUERY": "no query, but a recall ran in this turn",
+    "HOOK_WHY_MATCH": "{pct}% match with a recall of this turn",
+    "HOOK_WHY_LOW_MATCH": "best match with a recall of this turn only {pct}%",
+    "HOOK_WHY_NO_PROPOSAL": "no proposal",
+    "HOOK_WHY_UNCOVERED": ("{n} of {total} proposals without a bound recall on their subject (bound recalls "
+                           "in this turn: {bound})"),
+    "HOOK_WHY_COVERED": "{n} proposals: recall evidenced (bound to this session: {how}), relevance heuristic",
+    "HOOK_WHY_DISPATCH_UNCOVERED": "{n} proposals without a bound recall on their subject",
+    "HOOK_WHY_RELATIVE": "relative path without cwd",
+    "HOOK_WHY_BRIEF_UNREADABLE": "{what}: brief unreadable ({err}, fail-open)",
+    "HOOK_HOW_OWN": "own",
+    "HOOK_HOW_SUBAGENT": "subagent {agent}, result cited",
+    "HOOK_PROPOSAL_DENY": ("The report carries a proposal the base was not asked about in this report turn "
+                           "({why}). A recall on the symptom alone is not enough -- the base may know the answer "
+                           "to the proposal itself. For each proposal run a recall with its own words, read the "
+                           "result and send again:\n{items}\n(counted: only recall.sh calls of THIS session and "
+                           "turn that finished without an error, per the session transcript; a subagent's recall "
+                           "only through its own transcript and only when the report cites a card that call "
+                           "returned; the recall must share at least two words of the proposal, one of them a "
+                           "word the rest of the report does not use)"),
+    "HOOK_DISPATCH_DENY": ("The brief carries a proposal the base was not asked about in this turn ({why}; "
+                           "where: {where}). The agent will carry the proposal out as a settled decision, and the "
+                           "base may know the answer to the proposal itself. For each proposal run a recall with "
+                           "its own words, read the result and send the brief again:\n{items}\n(counted: only "
+                           "recall.sh calls of THIS session since this turn began that finished without an error, "
+                           "per the session transcript; a subagent's recall only through its own transcript and "
+                           "only when the brief cites a card that call returned; the recall must share at least "
+                           "two words of the proposal, one of them a word the rest of the brief does not use)"),
+    "HOOK_PROPOSAL_ITEM": "- proposal \"{label}...\" -> `tools/recall.sh \"{query}\"`",
+    "HOOK_GATE_PROPOSALS": "proposals",
+    "HOOK_GATE_STOP": "Stop",
+    "HOOK_FAILOPEN": ("GATES FAILED OPEN: {n} ERROR->ALLOW record(s) ({gates}) -- a gate that failed looks idle. "
+                      "Last at {hhmm}, gate {gate}: {why} ({path}). Investigate and fix at the source."),
+    "HOOK_STOP_REASON": ("REPORT OWED: the principal's last message came over the report channel (chat_id="
+                         "{chat_id}, message_id={message_id}) and no successful report-tool call ({tool}) "
+                         "followed it in this turn -- answer there; the principal does not see the terminal."),
 }
 
 _LOADED = None
@@ -48,7 +128,7 @@ def _load():
 
 
 def msg(key, **kw):
-    text = _load()[key]
+    text = _load()[key].replace("\\n", "\n")
     return text.format(**kw) if kw else text
 
 

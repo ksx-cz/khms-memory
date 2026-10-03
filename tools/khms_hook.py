@@ -1,613 +1,389 @@
 #!/usr/bin/env python3
-"""KHMS harness hook — the RETRIEVAL FLOOR.
+"""KHMS harness hook -- the retrieval floor and the reply gates of the memory system.
 
-One executable, wired to a handful of harness events (see claude-code/README.md):
+Usage: a Claude Code command hook; it reads the event JSON on stdin and prints at most one JSON answer.
+Wire it (see claude-code/README.md) to:
 
-  SessionStart        report an unreviewed inbox, and put the reply directive into
-                      the session ONCE
-  UserPromptSubmit    score the operator's message, inject matching cards, open a
-                      gated turn for the retrieval-claim gate
-  PreToolUse:Bash     run precheck.sh automatically for a named risky-command class
-  PreToolUse:Edit|Write   score the file path and the edited text
-  PreToolUse:<report tool>  the retrieval-claim gate: DENY a report whose `base:`
-                      line cites cards that no recall of this turn backs
-  PostToolUse:Bash / PostToolUseFailure   score the command and its error lines.
-                      MEASURED AND SWITCHED OFF in the reference deployment — see
-                      docs/measuring-injection.md before wiring them.
+  SessionStart                 the unreviewed-inbox / night-in-progress line, the mark-ledger line, the
+                               gates' fail-open records, and the reply directive -- ONCE per session
+  UserPromptSubmit             open a turn, score the prompt, inject matching cards, one directive line
+  PreToolUse  Bash             record recall intents; run precheck.sh for a risky-command class; score
+  PreToolUse  Edit|Write       score the file path and the edited text (only text matching HOOK_DOMAIN)
+  PreToolUse  Agent|Task       the dispatch gate: a proposal inside a brief needs a bound recall
+  PreToolUse  <report tool>    the retrieval-claim gate and the proposal gate on a report to the principal
+  Stop                         the reply-owed gate: the principal's last channel message gets an answer
+  PostToolUse / ...Failure     score the command and its error lines (switched off by the experiment file
+                               in the reference deployment; measure before wiring them)
 
-Why a floor at all: a rule that says "consult the base first" fails by never
-firing, not by being wrong, and the moments it fails in are exactly the moments
-the actor is too deep in a problem to remember it exists. So the cheap part is
-automated, on a budget. It does NOT discharge the duty to search explicitly
-before a hypothesis or a proposal — the hook cannot fire on a sentence that has
-not been said yet.
+Project-specific context (boards, queues, cost shares) is NOT this file's business: a deployment adds its
+own hook command beside this one; neither depends on the other's ordering or output.
 
-Design rules this file obeys:
-  * FAIL OPEN. Any exception is logged and swallowed; a broken memory system must
-    never break the session it is trying to help.
-  * EVERY DECISION IS LOGGED, including the silent ones, with the reason a card
-    above the bar was not injected (dedup / cap / threshold). A hook that stops
-    firing otherwise looks exactly like a quiet day.
-  * BOUNDED. Thresholds, at most two cards, a character cap, a rate cap per
-    window, a per-card dedup TTL — all of them §7 configuration, listed together
-    at the top and meant to be recalibrated against your own .inject.log.
-  * THE BUDGET IS SPENT BEFORE THE BASE IS LOADED. Every gate that needs no
-    search result — the kill switch, the domain filter, the query cooldown, the
-    rate cap, the per-event switch — runs before load_cards(). Measured in the
-    reference deployment: 2324 hook calls in one day paid ~172 ms each for a
-    card base they then threw away on a gate, and each of them also wrote a
-    "nothing found" line into the retrieval log, which is how 87 % of that log
-    came to be a record of non-retrievals.
-  * WHAT IT INJECTS IS AN EXPERIMENT, NOT A CONSTANT. tools/khms_experiment.json
-    switches injection off per event so the value of each one can be measured
-    rather than assumed; deleting the file rolls everything back.
+Design rules:
+  * FAIL OPEN. Any exception is logged and swallowed; a gate that cannot measure never refuses.
+    A gate's own error is written as `ERROR->ALLOW` and shown at the next SessionStart / prompt,
+    because a broken gate otherwise looks exactly like an idle one.
+  * THE BUDGET IS SPENT BEFORE THE BASE IS LOADED (khms_select.pregate): kill switch, cooldowns,
+    rate cap and the per-event experiment switch run before load_cards().
+  * EVERY DECISION IS LOGGED, including the silent ones and the reason a card above the bar stayed out.
+  * WORDING AND INPUT VOCABULARY ARE CONFIGURATION. Every message has an English default in
+    khms_messages.py and can be overridden by the private KHMS_MESSAGES file; every language-specific
+    matcher (claim keyword, honest forms, proposal markers, stop words, domain words) is a key of the
+    private KHMS_PATTERNS file. A public deployment works with neither.
 
-Kill switch: touch $KHMS_ROOT/tools/.hooks-off   (or export KHMS_HOOKS_OFF=1)
+Locations come from khms_paths. The legacy per-file overrides KHMS_STATE_DIR, KHMS_LOG, KHMS_BAZE_LOG,
+KHMS_PROPOSAL_LOG, KHMS_STOP_LOG, KHMS_RECALL_INTENT and KHMS_NIGHTLY_LOCK are honoured from the
+environment, so existing tests and wrappers keep working.
+Kill switch: touch the file named by KHMS_HOOKS_OFF_FILE (default ${KHMS_STATE}/hooks-off) or export
+KHMS_HOOKS_OFF=1.
 """
+import collections
 import datetime
 import hashlib
 import json
-import math
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import khms_paths as P      # noqa: E402
-import khms_search as ks    # noqa: E402
+import khms_paths as P          # noqa: E402
+import khms_messages as M       # noqa: E402
+import khms_patterns as PAT     # noqa: E402
+import khms_search as ks        # noqa: E402
+import khms_select as sel       # noqa: E402
 
-# --------------------------------------------------------------- parameters
-# Spec §7: calibrate these against your own logs; do not treat them as rules.
-THRESHOLD = {                  # minimum score for the top card, per event
-    "UserPromptSubmit": 18.0,
-    "PostToolUse": 16.0,
-    "PostToolUseFailure": 15.0,
-    "PreToolUse": 16.0,
-}
-SECOND_CARD_MIN = 14.0         # a second card rides along only above this
-MAX_PRIMARY = 2                # cards per injection, before correctors/umbrella
-CHAR_CAP = 900                 # hard cap on injected characters
-RATE_MAX = 3                   # injections per RATE_WINDOW …
-RATE_WINDOW = 600.0            # … seconds
-BYPASS_MIN = 18.0              # a top hit this good buys ONE extra ride per window
-BYPASS_PER_WINDOW = 1
-QUERY_COOLDOWN = 900.0         # do not re-answer the same query text for 15 min
-DEDUP_TTL = 12 * 3600.0        # a card may be re-injected after this long
-DAMP_ALPHA = 0.5               # length damping exponent (0 disables)
-DAMP_PIVOT = 85                # ≈ median distinct-token count of a card body
+# Resolve locations from THIS process's environment: a test that sets an override and reloads this module
+# must not see a resolution cached by an earlier import.
+P.reset()
+CODE = P.CODE
+# BRAIN is the data root; tests may point it at a temporary directory. TOOLS is the code directory
+# (scripts such as precheck.sh live beside this file).
+BRAIN = P.soft("ROOT")
+TOOLS = CODE
+
+
+def _loc(legacy_env, key, default=None):
+    """A location: the legacy per-file environment override, else the resolved key, else `default`."""
+    return os.environ.get(legacy_env) or P.soft(key, default)
+
+
+STATE_DIR = _loc("KHMS_STATE_DIR", "HOOK_STATE")
+LOG = _loc("KHMS_LOG", "INJECT_LOG")
+HOOKS_OFF_FILE = P.soft("HOOKS_OFF")
+# KHMS_PARAMS=live runs the LIVE selection policy: a runtime rollback that needs no file swap.
+PARAMS = sel.LIVE if os.environ.get("KHMS_PARAMS") == "live" else sel.V2
+
 MIN_PROMPT_LEN = 12
-# The dense channel, if you have one (see khms_recall_hybrid.py for the daemon
-# protocol and the fall-back). Consulted only on operator messages: the agent's own
-# tool traffic is the cheap side of the budget, and buying it extra searches spends
-# the budget where it is worth least. With no daemon these are inert.
-DENSE_EVENTS = frozenset({"UserPromptSubmit"})
-DENSE_TIMEOUT_MS = float(os.environ.get("KHMS_DENSE_TIMEOUT_MS", "150"))
-DENSE_MIN_COS = 0.55           # calibrate: 0.50 doubles the rescues and visibly
-DENSE_RESCUE_N = 5             #   lowers precision
-RESCUE_MIN_FIRST_LEN = 40      # a card whose first line is a bare field says nothing
-DENSE_RESERVED_SLOT = False    # see the block in main(); OFF by default
-PRECHECK_COOLDOWN = 1800.0     # per session, per tag set
-PRECHECK_CAP = 800             # chars
-PRECHECK_TIMEOUT = 8           # seconds
-LOG_Q = 200                    # chars of the query kept in the audit log
+PRECHECK_COOLDOWN = 1800      # per session, per tag set
+PRECHECK_CAP = 800            # chars
+PRECHECK_TIMEOUT = 8          # s
+LOG_Q = 200                   # chars of the query kept in the inject log
 
-# Length damping (why it exists): the score is a SUM of per-token idf, so it grows
-# with the number of distinct tokens a card happens to contain, and long grab-bag
-# cards win queries they have nothing to do with. Pivoted sqrt normalisation, with
-# the pivot set to the base's own median, leaves a typical card untouched.
+EXPERIMENT = P.soft("EXPERIMENT")
+CLAIM_LOG = _loc("KHMS_BAZE_LOG", "CLAIM_LOG")
+BAZE_LOG = CLAIM_LOG          # legacy name
+DIRECTIVE_FILE = P.soft("DIRECTIVE_FILE", os.path.join(CODE, "prompts", "report_directive.md"))
+INJECT_EVENTS = ("UserPromptSubmit", "PreToolUse", "PostToolUse", "PostToolUseFailure")
+SHORT_EVENT = {"UserPromptSubmit": "ups", "PreToolUse": "pre",
+               "PostToolUse": "ptu", "PostToolUseFailure": "ptuf"}
+EXP_TAG = ""                  # set once per run in main(); stamped into the log
 
-# Which tool events are worth scoring at all. Text that matches neither of these
-# is not searched, so the hook stays quiet on routine `ls` and `git status`.
+# The tool through which the agent reports to its principal, and the channel whose prompts open a
+# "report turn". Both are regular expressions; see khms_paths for the defaults.
+REPORT_TOOL_RE = re.compile(P.soft("KHMS_REPORT_TOOL") or r"(?i)discord.*reply|reply.*discord")
+_CHANNEL = P.soft("KHMS_REPORT_CHANNEL") or ""
+REPORT_CHANNEL_RE = re.compile(_CHANNEL) if _CHANNEL else None
+REPORT_SERVER = P.soft("KHMS_REPORT_SERVER") or "discord"
+
+# --- the retrieval-claim gate (the mandatory `<keyword>:` line of a report) -------------------------------
+CLAIM_MIN_CHARS = 200         # below this a reply need not carry the line
+CLAIM_SHARE = 0.5             # token overlap with a recall of THIS turn
+CLAIM_SLACK = 3.0             # s; the recall log stores whole seconds
+CLAIM_TAIL = 262144           # bytes of the recall log read backwards
+BAZE_TAIL = CLAIM_TAIL        # legacy name
+CLAIM_KEYWORD = PAT.value("HOOK_CLAIM_KEYWORD", "base")
+# The honest forms: a claim line that says it did not search is always allowed -- the gate stops
+# unbacked CITATIONS, and "found nothing" is a valid answer. Matched on the normalised line.
+CLAIM_HONEST = PAT.words("HOOK_CLAIM_HONEST", (
+    "did not search", "not searched", "without search", "from memory", "found nothing",
+    "nothing above the bar", "nothing on record", "base is silent"), sep="|")
+
+# Which tool events are worth scoring. Text matching neither is not searched, so the hook stays quiet
+# on routine commands. HOOK_DOMAIN is the deployment's own vocabulary; without it only error lines count.
+DOMAIN_RE = PAT.regex("HOOK_DOMAIN", r"(?!x)x", flags=re.I)
 ERROR_RE = re.compile(
     r"error|fail|traceback|exception|denied|timeout|refused|no such|not found"
     r"|segfault|abort|cannot|unable|invalid|dead|inactive", re.I)
-# DOMAIN_RE is the one thing you MUST edit for your own work: it is the list of
-# words that mean "this is about the domain the base knows something about".
-# Too broad and every keystroke searches; too narrow and the floor never fires.
-DOMAIN_RE = re.compile(
-    r"deploy|config|service|daemon|sensor|driver|firmware|schema|migration"
-    r"|pipeline|calibrat|threshold|timeout|latency|checksum", re.I)
 
-# Risky-command class: these run precheck.sh by themselves, because "run precheck
-# before dangerous things" is a duty that fails exactly when it is needed. Tags
-# must be tags your base actually uses.
-RISKY = [
-    (re.compile(r"rsync\b[^\n|;]*--delete"), ("deployment",)),
-    (re.compile(r"\bgit\s+(push\s+(-f|--force)|tag\s+(-f|--force))"), ("git",)),
-    (re.compile(r"\brm\s+-[a-zA-Z]*r[a-zA-Z]*f|\brm\s+-[a-zA-Z]*f[a-zA-Z]*r"), ("filesystem",)),
-    (re.compile(r"\bsystemctl\b|\bservice\s+\w+\s+(stop|restart)"), ("service", "deployment")),
-    (re.compile(r"\b(docker|podman)\s+(system\s+prune|rm|rmi)\b"), ("containers",)),
-    (re.compile(r"\bkubectl\s+delete\b"), ("containers", "deployment")),
-    (re.compile(r"\bterraform\s+(apply|destroy)\b"), ("deployment",)),
-    (re.compile(r"\bdrop\s+(table|database)\b", re.I), ("database",)),
-    (re.compile(r"\bdd\s+if="), ("filesystem",)),
-    (re.compile(r"(^|[\s;&|'\"])[\w./-]*deploy/"), ("deployment",)),
-]
 
-# ------------------------------------------------------------- the directive
-# The three mandatory reply lines. This was a 1813-character constant appended to
-# EVERY operator prompt until it was measured: 46 firings on one audited day, the
-# same paragraph re-sent each time, restating a rule the agent's own instructions
-# already carried. The text now lives in ONE file, enters the session ONCE at
-# SessionStart, and every prompt carries the pointer line below instead.
-DIRECTIVE_LINE = (
-    "REQUIRED: base: <what I searched for -> the cards, or 'did not search - why'>"
-    " \u00b7 verified: <the command or file:line whose output I read | unverified>"
-    " \u00b7 if I were wrong: <how that output would have looked different>"
-    "  (definition: tools/prompts/report_directive.md)"
-)
-COMMENT_RE = re.compile(r"<!--.*?-->", re.S)
+def directive_line():
+    return M.msg("HOOK_DIRECTIVE_LINE")
 
 
 def directive_text():
-    """The full directive, from its single source. A missing or unreadable file
-    degrades to the one-liner: the session start must never fail on it."""
+    """The full directive from its single source. A missing or unreadable file degrades to the one-liner;
+    it must never take the session start with it."""
     try:
-        with open(P.DIRECTIVE_FILE, encoding="utf-8") as f:
-            body = COMMENT_RE.sub("", f.read())
-    except OSError:
-        return DIRECTIVE_LINE
-    return body.strip() or DIRECTIVE_LINE
-
-
-# --------------------------------------------------------------- experiment
-# tools/khms_experiment.json — the per-event injection switch and the flag of the
-# retrieval-claim gate. FAIL-OPEN IN BOTH DIRECTIONS: a missing, empty or broken
-# file means "behave exactly as before the experiment", so deleting the file is a
-# complete rollback without touching a line of code. See docs/measuring-injection.md
-# for how to run one and what to compare afterwards; an example config ships as
-# tools/khms_experiment.example.json.
-INJECT_EVENTS = ("UserPromptSubmit", "PreToolUse", "PostToolUse",
-                 "PostToolUseFailure")
-SHORT_EVENT = {"UserPromptSubmit": "ups", "PreToolUse": "pre",
-               "PostToolUse": "ptu", "PostToolUseFailure": "ptuf"}
-EXP_TAG = ""                   # set once per run in main(); stamped into the log
-
-
-def load_experiment():
-    try:
-        with open(P.EXPERIMENT, encoding="utf-8") as f:
-            cfg = json.load(f)
-    except (OSError, ValueError):
-        return {}
-    return cfg if isinstance(cfg, dict) else {}
-
-
-def inject_on(exp, event):
-    return bool((exp.get("inject") or {}).get(event, True))
-
-
-def exp_tag(exp):
-    """What goes into the audit log, so a day's records say which regime produced
-    them. Without it a before/after comparison has to be reconstructed from file
-    mtimes, which is not evidence."""
-    if not exp:
-        return ""
-    name = exp.get("name")
-    if not name:
-        off = [SHORT_EVENT[e] for e in INJECT_EVENTS if not inject_on(exp, e)]
-        name = ("no-" + "+".join(off)) if off else "on"
-    return f"exp:{name}"
-
-
-# ------------------------------------------------- the retrieval-claim gate
-# The `base:` line of the directive above is a CHECK, and until this gate existed
-# it was a check whose passing condition held whether or not a retrieval had
-# happened: the hook's own injection could satisfy it. That is the shape of the
-# failure the base has a card about, applied to the compliance line itself.
-#
-# So: a report to the principal that CITES CARD IDS in its `base:` line, while no
-# explicit recall of this turn matches the query it claims to have run, is DENIED.
-# The gate is deliberately narrow. It denies exactly two things:
-#   (i)  a substantial report with no `base:` line at all;
-#   (ii) a `base:` line that cites card ids with no matching recall in this turn.
-# A line that cites no card claims nothing about the base and is allowed; so is
-# every honest form ("did not search", "nothing on record"). The thing being
-# checked is a CITATION, not the wording of the line.
-#
-# REPORT_TOOL_RE is the tool through which the agent reports to its principal —
-# the one action it cannot skip, because the principal only ever learns anything
-# through it. Set KHMS_REPORT_TOOL to your own (a chat tool, a mail tool, a ticket
-# tool); an empty value disables the gate entirely.
-REPORT_TOOL_RE = re.compile(
-    os.environ.get("KHMS_REPORT_TOOL") or r"(?i)discord.*reply|reply.*discord")
-# When set, ONLY prompts matching this pattern open a gated turn (in the reference
-# deployment: the ones that arrived through the reporting channel, since replies in
-# the terminal are not reports). Unset, every operator prompt opens one.
-REPORT_CHANNEL_RE = (re.compile(os.environ["KHMS_REPORT_CHANNEL"])
-                     if os.environ.get("KHMS_REPORT_CHANNEL") else None)
-CLAIM_MIN_CHARS = 200          # below this a report need not carry the line
-CLAIM_SHARE = 0.5              # token overlap with a recall of THIS turn
-CLAIM_SLACK = 3.0              # s; the recall log stores whole seconds
-CLAIM_TAIL = 262144            # bytes of the recall log read backwards
-# The honest forms. A `base:` line that says it did not search is ALWAYS allowed:
-# the gate exists to stop unbacked CITATIONS, and "nothing on record" is a valid
-# and useful answer.
-CLAIM_HONEST = ("did not search", "didn't search", "no search", "from memory",
-                "nothing on record", "nothing found", "found nothing",
-                "nothing above the bar", "base is silent")
-
-CLAIM_DENY_CITE = (
-    "Your `base:` line cites cards but no explicit recall ran in this turn - run "
-    "`tools/recall.sh '<query>'` and send again, or write `base: did not search - "
-    "<why>`. (reason: %s; the check reads src=cli lines of tools/.recall.log since "
-    "this turn began)")
-CLAIM_DENY_MISSING = (
-    "This report to your principal is missing the mandatory `base:` line (%s). "
-    "Write `base: <query from tools/recall.sh> -> <cards>`, or honestly `base: did "
-    "not search - <why>`; both are valid, silence is not. "
-    "Definition: tools/prompts/report_directive.md")
-
-
-def _report_text(payload):
-    ti = payload.get("tool_input") or {}
-    for k in ("text", "content", "message", "body"):
-        v = ti.get(k)
-        if isinstance(v, str) and v:
-            return v
-    return " ".join(str(v) for v in ti.values() if isinstance(v, str))
-
-
-def _claim_line(text):
-    """The `base:` line, raw and normalised, tolerant of bullets and bold."""
-    for ln in (text or "").splitlines():
-        n = ks.norm(ln).strip().lstrip("-*_>+ \t")
-        if n.startswith("base:") or n.startswith("base :"):
-            return ln.strip(), n
-    return None, None
-
-
-def _claim_query_tokens(nline):
-    """Tokens of the QUERY part: after `base:`, before the arrow, card ids out."""
-    q = nline.split(":", 1)[1] if ":" in nline else nline
-    q = re.split(r"\u2192|->|=>", q)[0]
-    q = re.sub(r"k-\d+", " ", q)
-    return set(ks.tokens(q))
-
-
-def recall_cli_since(since_t):
-    """Token sets of the src=cli lines of the recall log at or after since_t.
-
-    Reads the TAIL only: the log grows without bound and a hook may not read a
-    whole log on a tool call. ONLY src=cli counts - the hook's own lines are what
-    made the claim fakeable in the first place."""
-    try:
-        with open(ks.recall_log_path(), "rb") as f:
-            f.seek(0, 2)
-            size = f.tell()
-            f.seek(max(0, size - CLAIM_TAIL))
-            data = f.read().decode("utf-8", "replace")
-    except OSError:
-        return []
-    lines = data.splitlines()
-    if size > CLAIM_TAIL and lines:
-        lines = lines[1:]                      # the seek cut one line in half
-    out = []
-    for ln in lines:
-        parts = ln.split(" | ")
-        if len(parts) < 5 or not parts[-1].startswith("src=cli"):
-            continue
-        try:
-            ts = datetime.datetime.fromisoformat(parts[0]).timestamp()
-        except ValueError:
-            continue
-        if ts + CLAIM_SLACK < since_t:
-            continue
-        out.append(set(ks.tokens(" | ".join(parts[1:-3]))))
-    return out
-
-
-def claim_verdict(text, st):
-    """(ALLOW|DENY|EXEMPT, reason, query-part). Never raises."""
-    turn_start = st.get("turn_start")
-    pending = bool(st.get("claim_pending")) and turn_start is not None
-    line, nline = _claim_line(text)
-    if line is None:
-        if pending and len(text or "") >= CLAIM_MIN_CHARS:
-            return "DENY", "no base: line (%d chars)" % len(text), ""
-        return ("EXEMPT",
-                "short report" if pending else "no gated turn open", "")
-    qpart = nline[:120]
-    for h in CLAIM_HONEST:
-        if h in nline:
-            return "ALLOW", "honest form (%s)" % h, qpart
-    if not re.search(r"k-\d{4,6}", nline):
-        return "ALLOW", "line cites no card", qpart
-    if turn_start is None:
-        return "EXEMPT", "no gated turn in this session", qpart
-    recalls = recall_cli_since(turn_start)
-    if not recalls:
-        return "DENY", "no src=cli recall in this turn", qpart
-    qtok = _claim_query_tokens(nline)
-    if not qtok:
-        return "ALLOW", "no query given, but a recall did run in this turn", qpart
-    best = max(len(qtok & r) / float(len(qtok)) for r in recalls)
-    if best >= CLAIM_SHARE:
-        return "ALLOW", "%.0f%% overlap with a recall in this turn" % (100 * best), qpart
-    return "DENY", "best overlap with a recall in this turn only %.0f%%" % (100 * best), qpart
-
-
-def claim_log(session, verdict, why, qpart):
-    try:
-        with open(P.CLAIM_LOG, "a", encoding="utf-8") as f:
-            f.write("%s | %s | %s | %s | %s\n" % (
-                datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
-                session or "-", verdict, why, (qpart or "")[:120]))
-    except OSError:
-        pass
-
-
-def run_claim_gate(payload, event, exp):
-    """True == the report was DENIED (and the denial has been printed)."""
-    if not exp.get("claim_gate", True):
-        return False
-    session = payload.get("session_id", "")
-    path, st = load_state(session)
-    verdict, why, qpart = claim_verdict(_report_text(payload), st)
-    claim_log(session, verdict, why, qpart)
-    if verdict == "DENY":
-        reason = (CLAIM_DENY_MISSING % why) if why.startswith("no base:") \
-            else (CLAIM_DENY_CITE % why)
-        print(json.dumps({"hookSpecificOutput": {
-            "hookEventName": event,
-            "permissionDecision": "deny",
-            "permissionDecisionReason": reason}}))
-        log(event, "report-tool", "DENY (claim: %s)" % why)
-        return True
-    if verdict == "ALLOW" and st.get("claim_pending"):
-        st["claim_pending"] = False
-        save_state(path, st)
-    return False
+        with open(DIRECTIVE_FILE, encoding="utf-8") as f:
+            body = f.read()
+    except (OSError, TypeError):
+        return directive_line()
+    body = "\n".join(ln for ln in body.splitlines() if not ln.lstrip().startswith("<!--"))
+    return body.strip() or directive_line()
 
 
 def now():
     return time.time()
 
 
-def log(event, query, action, results=None, skips=None, qh=""):
-    results = results or []
-    top = f"{results[0][2]['id']}:{results[0][0]:.1f}" if results else "-"
-    if skips:
-        action += " skipped=" + ",".join(f"{k}:{w}" for k, w in skips[:3])
-    q = re.sub(r"\s+", " ", query or "")[:LOG_Q]
+def _stamp():
+    return datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _append(path, line):
+    """Append one line to an agent-state log; never raises, never writes where a reader may not."""
+    if not path:
+        return
     try:
-        with open(P.INJECT_LOG, "a", encoding="utf-8") as f:
-            f.write(f"{datetime.datetime.now().astimezone().isoformat(timespec='seconds')}"
-                    f" | {event} | q={q} | nhits={len(results)} | top={top} | {action}"
-                    f"{(' qh=' + qh) if qh else ''}"
-                    f"{(' ' + EXP_TAG) if EXP_TAG else ''}\n")
+        if not P.may_write(path):
+            return
+    except P.KhmsPathError:
+        return
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(line)
     except OSError:
         pass
 
 
+def log(event, query, decision=None, action=None, qh=""):
+    results = decision.results if decision else []
+    top = f"{results[0][2]['id']}:{results[0][0]:.1f}" if results else "-"
+    act = action if action is not None else decision.action
+    if decision is not None:
+        if decision.text and decision.action.startswith("INJECT"):
+            act += f" chars={len(decision.text)}"
+        if decision.skips:
+            act += " skipped=" + ",".join(f"{k}:{w}" for k, w in decision.skips[:3])
+        if decision.mode != "lexical":
+            act += f" mode={decision.mode}"
+    q = re.sub(r"\s+", " ", query or "")[:LOG_Q]
+    _append(LOG, f"{_stamp()} | {event} | q={q} | nhits={len(results)} | top={top} | {act}"
+                 f"{(' qh=' + qh) if qh else ''}{(' mode=' + EXP_TAG) if EXP_TAG else ''}\n")
+
+
 def load_state(session_id):
-    os.makedirs(P.HOOK_STATE, exist_ok=True)
-    path = os.path.join(
-        P.HOOK_STATE,
-        re.sub(r"[^A-Za-z0-9_.-]", "_", session_id or "nosession") + ".json")
+    path = f"{STATE_DIR}/{re.sub(r'[^A-Za-z0-9_.-]', '_', session_id or 'nosession')}.json"
     try:
         with open(path, encoding="utf-8") as f:
             st = json.load(f)
     except (OSError, ValueError):
         st = {}
-    for k, v in (("injected", {}), ("recent", []), ("queries", {}),
-                 ("bypass", []), ("precheck", {})):
-        st.setdefault(k, v)
+    st.setdefault("injected", {})
+    st.setdefault("recent", [])
+    st.setdefault("queries", {})
+    st.setdefault("bypass", [])
+    st.setdefault("precheck", {})
     return path, st
 
 
 def save_state(path, st):
     try:
+        if not P.may_write(path):
+            return
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             json.dump(st, f)
-    except OSError:
+    except (OSError, P.KhmsPathError):
         pass
 
 
 def emit(event, text):
+    print(json.dumps({"hookSpecificOutput": {"hookEventName": event, "additionalContext": text}}))
+
+
+def deny(event, reason):
     print(json.dumps({"hookSpecificOutput": {
-        "hookEventName": event, "additionalContext": text}}))
+        "hookEventName": event, "permissionDecision": "deny",
+        "permissionDecisionReason": reason}}, ensure_ascii=False))
 
 
-# ------------------------------------------------------------------ scoring
-def prepare_cards(cards):
-    """Attach the distinct-token count used for length damping, memoised per
-    (card id, body length). Cards are immutable once approved and a body that
-    does change changes its length, so the key is sound; a corrupt cache only
-    costs the recomputation."""
-    cache = {}
+# --- SessionStart --------------------------------------------------------------------------------------
+def mark_ledger_line():
+    """The journal-MARK coverage ledger: OPEN count and the oldest OPEN mark. Reads only
+    memory/ledger/summary.json (written by the night, approve_inbox.py and `mark_ledger.py sync`), so the
+    hook scans nothing. A missing summary is SAID, never skipped: silence would read as "nothing OPEN"."""
+    path = f"{BRAIN}/memory/ledger/summary.json"
     try:
-        with open(P.LEN_CACHE, encoding="utf-8") as f:
-            cache = json.load(f)
-    except (OSError, ValueError):
-        cache = {}
-    dirty = False
-    for c in cards:
-        key = f"{c['id']}:{len(c['nbody'])}"
-        n = cache.get(key)
-        if n is None:
-            n = max(1, len(set(ks.tokens(c["nbody"]))))
-            cache[key] = n
-            dirty = True
-        c["_ntok"] = n
-    if dirty:
-        try:
-            tmp = P.LEN_CACHE + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(cache, f)
-            os.replace(tmp, P.LEN_CACHE)
-        except OSError:
-            pass
-    return cards
+        with open(path, encoding="utf-8") as fh:
+            s = json.load(fh)
+    except (OSError, ValueError) as exc:
+        return M.msg("HOOK_LEDGER_NONE", exc=exc.__class__.__name__)
+    o = s.get("oldest_open")
+    old = (M.msg("HOOK_LEDGER_OLDEST", id=o.get("id"), date=o.get("date"), time=o.get("time"),
+                 kind=o.get("kind"), text=(o.get("text") or "")[:90])
+           if o else M.msg("HOOK_LEDGER_NO_OPEN"))
+    sug = s.get("open_suggested")
+    return M.msg("HOOK_LEDGER_LINE", floor=s.get("floor"), open=s.get("open"),
+                 queued=s.get("open_queued"), proposed=s.get("open_proposed"),
+                 suggested=M.msg("HOOK_LEDGER_SUGGESTED", n=sug) if sug else "",
+                 carded=s.get("carded"), dismissed=s.get("dismissed"), carry=s.get("carry", "?"),
+                 oldest=old, generated=s.get("generated"))
 
 
-def damp(score, ntok):
-    if DAMP_ALPHA <= 0:
-        return score
-    return score * min(1.0, math.pow(DAMP_PIVOT / float(ntok), DAMP_ALPHA))
+# Is the night pipeline running? Without per-stage caps the night publishes its inbox units one batch at a
+# time, so "unreviewed" in the middle of the night is a half-written night, not the morning's review.
+# nightly_state.py owns the answer (shared with the review ping): it READS the night's flock out of
+# /proc/locks (never takes it) and takes the start from the line the holder writes into the lock file.
+PROC_LOCKS = "/proc/locks"
 
 
-MAX_WARN = 2                   # correction pointers per served card
-WARN_CHARS = 110               # of the corrector's first line
+def nightly_lock_path():
+    return _loc("KHMS_NIGHTLY_LOCK", "KHMS_NIGHTLY_LOCK")
 
 
-def warn_line(cor):
-    """The reverse edge, one line: who corrects the card just served."""
-    return f"  ! CORRECTED BY {cor['id']}: {cor['first'][:WARN_CHARS]}"
+def nightly_in_progress():
+    """{"kind", "start", "nk"} while the night holds its flock; None when nobody holds it. Raises OSError
+    when the lock table cannot be read -- the caller says so instead of guessing."""
+    import nightly_state as _ns
+    return _ns.night_running(BRAIN, nightly_lock_path(), os.environ.get("KHMS_PROC_LOCKS", PROC_LOCKS))
 
 
-def card_line(c, score=None, prefix="- "):
-    flags = []
-    if c["status"] in ("refuted", "challenged", "superseded"):
-        flags.append("!" + c["status"].upper())
-    if "gotcha" in c["tags"]:
-        flags.append("gotcha")
-    flag = ("[" + ",".join(flags) + "] ") if flags else ""
-    sc = f" ({score:.0f})" if score is not None else ""
-    return f"{prefix}{c['id']}{sc} {flag}{c['first'][:100]}"
+def _hhmm(t):
+    return datetime.datetime.fromtimestamp(t).strftime("%H:%M")
 
 
-def correctors_of(c, by_id, rev):
-    """Cards that correct c: the reverse edges (someone's contradicts/supersedes
-    points AT c) plus c's own forward refuted_by. Never raises — a base with one
-    malformed link must degrade to "no correctors", not cost the injection."""
-    out, seen = [], set()
+def inbox_reminder_line(unreviewed, inbox):
+    """The inbox line of SessionStart, or None. While the night runs, files it wrote since its start are
+    named as in progress, never offered as the review."""
     try:
-        for cor in ([by_id[k] for k in (c["links"].get("refuted_by") or []) if k in by_id]
-                    + list(rev.get(c["id"], []))):
-            if cor["id"] != c["id"] and cor["id"] not in seen:
-                seen.add(cor["id"])
-                out.append(cor)
-    except Exception:
-        return []
-    return out
-
-
-def build_injection(cands, cards, injected, t, skips):
-    """At most MAX_PRIMARY fresh cards, each optionally preceded by the principle
-    it supports and followed by whatever corrects it. A refuted card is never
-    served alone: the correction is the useful half.
-
-    Every served card carries its correctors, WHATEVER ITS STATUS. This used to
-    happen only for cards already marked challenged/refuted/superseded — but a
-    correction arrives before anyone re-statuses the old card, and `active` is
-    exactly the state in which a stale card is believed. In the source deployment
-    that gap cost four days: a card corrected in August kept its `active` July
-    predecessors, and they were served to the operator as the current state of
-    the machine, correctly, by the rules as they then stood."""
-    by_id = {c["id"]: c for c in cards}
-    rev = ks.reverse_correctors(cards)
-    lines, used, primaries = [], [], 0
-    warn_chars = 0
-
-    def fresh(cid):
-        ts = injected.get(cid)
-        return ts is None or (t - ts) >= DEDUP_TTL
-
-    for score, _matched, c in cands:
-        if primaries >= MAX_PRIMARY:
-            skips.append((c["id"], "slots-full"))
-            continue
-        if not fresh(c["id"]):
-            skips.append((c["id"], "dedup"))
-            continue
-        if c["id"] in used:
-            continue
-        umbrella = None
-        for pid in c["links"]["supports"]:
-            u = by_id.get(pid)
-            if u and u["level"] == "derived" and u["status"] == "active":
-                umbrella = u
-                break
-        if umbrella and umbrella["id"] not in used and fresh(umbrella["id"]):
-            lines.append(card_line(umbrella, prefix="- principle: "))
-            used.append(umbrella["id"])
-        lines.append(card_line(c, score))
-        used.append(c["id"])
-        primaries += 1
-        correctors = correctors_of(c, by_id, rev)
-        if c["status"] in ("challenged", "refuted", "superseded"):
-            # unchanged: the refuter is served as a full card line and marked
-            # injected, because a refuted card without it is worse than nothing.
-            for cor in correctors[:1]:
-                if cor["id"] not in used:
-                    lines.append(card_line(cor, prefix="  -> corrected by: "))
-                    used.append(cor["id"])
-                    correctors = [x for x in correctors if x["id"] != cor["id"]]
-        # An ACTIVE card that something corrects gets a POINTER, not a card: it
-        # consumes no primary slot and is not marked injected, so it can repeat
-        # as often as its subject comes up and the card behind it can still be
-        # served in full later.
-        try:
-            for cor in correctors[:MAX_WARN]:
-                if cor["id"] in used:
-                    continue
-                line = warn_line(cor)
-                lines.append(line)
-                warn_chars += len(line) + 1
-        except Exception:
-            pass        # a pointer that cannot be built is dropped, never raised
-    if not lines:
-        return None, []
-    text = ("KHMS (auto-recall — cards that may bear on what is happening):\n"
-            + "\n".join(lines)
-            + "\nIf one is relevant, open it whole (memory/know/<id>.md) and follow its links.")
-    # BUDGET: the correction pointers are EXEMPT from CHAR_CAP — the cap on
-    # everything else is unchanged (cap plus exactly the characters the pointers
-    # added). They are not extra retrieval: they correct content that is being
-    # injected anyway, and a truncated correction is the failure this exists to
-    # prevent. Bounded by construction: at most MAX_WARN per card, WARN_CHARS
-    # each, i.e. ~280 characters against a 900-character cap.
-    return text[:CHAR_CAP + warn_chars], used
-
-
-# ------------------------------------------------------------------- events
-def handle_session_start():
-    """The morning review is the first duty of the day, so an unreviewed inbox is
-    the one thing worth saying before any work starts."""
-    unreviewed = []
-    try:
-        for f in sorted(os.listdir(P.INBOX)):
-            m = re.match(r"^(\d{4}-\d{2}-\d{2})(-weekly)?\.md$", f)
-            stem = f[:-3]
-            # A review is recorded per unit by approve_inbox.py (`.reviewed-<unit>-cards`); the plain
-            # `.reviewed-<date>` marker is still honoured.
-            if m and not any(os.path.exists(os.path.join(P.REVIEW_MARKERS, n))
-                             for n in (f".reviewed-{m.group(1)}", f".reviewed-{stem}-cards")):
-                unreviewed.append(f)
-    except OSError:
-        unreviewed = []      # no inbox yet; the directive below still goes in
-    parts = []
-    if unreviewed:
-        parts.append(
-            "KHMS: UNREVIEWED INBOX: " + ", ".join(unreviewed)
-            + " — review it (approve_inbox.py, build_views.py, report to the operator) "
-              "BEFORE other work. Mark it done with: touch the review marker .reviewed-<date> in the shared state")
-        log("SessionStart", "inbox-check", f"inject inbox={','.join(unreviewed)}")
+        night = nightly_in_progress()
+    except OSError as exc:
+        if not unreviewed:
+            return None
+        return (M.msg("HOOK_INBOX_UNREVIEWED", files=", ".join(unreviewed))
+                + M.msg("HOOK_INBOX_NIGHT_UNKNOWN", exc=exc.__class__.__name__))
+    if night is None:
+        if not unreviewed:
+            return None
+        return M.msg("HOOK_INBOX_UNREVIEWED", files=", ".join(unreviewed))
+    import nightly_state as _ns
+    ready, wip = _ns.split_ready_wip(unreviewed, inbox, night)
+    head = M.msg("HOOK_NIGHT_RUNNING", start=_hhmm(night["start"]),
+                 night=M.msg("HOOK_NIGHT_KEY", nk=night["nk"]) if night["nk"] else "")
+    if ready:
+        head += M.msg("HOOK_NIGHT_READY", files=", ".join(ready))
     else:
-        log("SessionStart", "inbox-check", "silent (inbox clean)")
-
-    # The full directive enters the session HERE, once, instead of being appended
-    # to every one of the day's operator prompts.
-    parts.append(directive_text())
-    emit("SessionStart", "\n\n".join(parts))
+        head += M.msg("HOOK_NIGHT_NOTHING_READY")
+    if wip:
+        head += M.msg("HOOK_NIGHT_WIP", files=", ".join(wip))
+    return head
 
 
-def risky_tags(cmd):
+def review_dir():
+    return P.soft("REVIEW_MARKERS") or os.path.join(BRAIN or "", "state", "shared", "reviewed")
+
+
+def unreviewed_inbox(inbox):
+    """Inbox files whose review does not hold. mark_ledger.py owns the per-unit rule when it is installed
+    (a review holds only while its marker still describes the file); without it the marker files decide:
+    `.reviewed-<date>[-cards]` for a card batch, `.reviewed-<date>[-triage]` for a contradiction triage."""
+    rdir = review_dir()
+    card_units = None
+    try:
+        import mark_ledger as _ml
+        _mp = _ml.Paths(BRAIN)
+        _mp.tools = rdir
+        card_units = {os.path.basename(f) for f, ok in _ml.review_units(_mp) if not ok}
+    except Exception as exc:                                       # noqa: BLE001
+        log("SessionStart", "inbox-check", action="unit check unavailable (%s)" % exc.__class__.__name__)
     out = []
-    for rx, tags in RISKY:
-        if rx.search(cmd or ""):
-            for t in tags:
-                if t not in out:
-                    out.append(t)
+    for f in sorted(os.listdir(inbox)):
+        m = re.match(r"^(\d{4}-\d{2}-\d{2})(-weekly)?\.md$", f)
+        if card_units is not None:
+            if f in card_units:
+                out.append(f)
+        elif m and not any(os.path.exists(f"{rdir}/.reviewed-{m.group(1)}{s}")
+                           for s in ("", f"{m.group(2) or ''}-cards")):
+            out.append(f)
+        t = re.match(r"^(\d{4}-\d{2}-\d{2})-triage\.md$", f)
+        if t and not any(os.path.exists(f"{rdir}/.reviewed-{t.group(1)}{s}") for s in ("", "-triage")):
+            out.append(f)
     return out
+
+
+def handle_session_start(payload):
+    parts = []
+    inbox = f"{BRAIN}/memory/inbox"
+    try:
+        unreviewed = unreviewed_inbox(inbox)
+    except OSError:
+        unreviewed = []
+    night_running = False
+    try:
+        _line = inbox_reminder_line(unreviewed, inbox)
+        try:
+            night_running = bool(_line) and nightly_in_progress() is not None
+        except OSError:
+            night_running = False
+    except Exception as exc:                                       # noqa: BLE001
+        log("SessionStart", "inbox-check", action="night check error %s" % exc)
+        _line = M.msg("HOOK_INBOX_UNREVIEWED", files=", ".join(unreviewed)) if unreviewed else None
+    if _line:
+        parts.append(_line)
+        log("SessionStart", "inbox-check", action=f"inject inbox={','.join(unreviewed)}"
+            + (" night-running" if night_running else ""))
+    else:
+        log("SessionStart", "inbox-check", action="silent (inbox clean)")
+
+    try:
+        parts.append(mark_ledger_line())
+        log("SessionStart", "mark-ledger", action="inject ledger")
+    except Exception as exc:                                       # noqa: BLE001
+        parts.append(M.msg("HOOK_LEDGER_ERROR", exc=exc))
+        log("SessionStart", "mark-ledger", action="error %s" % exc)
+
+    # The gates' fail-open records of the last 24 h, marked shown for this session.
+    try:
+        _fo = failopen_line(now() - FAILOPEN_WINDOW_S)
+        if _fo:
+            parts.append(_fo)
+        _fp, _fst = load_state(payload.get("session_id", ""))
+        _fst["failopen_seen_t"] = now()
+        save_state(_fp, _fst)
+        log("SessionStart", "failopen", action="inject %d B" % len(_fo))
+    except Exception as exc:                                       # noqa: BLE001
+        log("SessionStart", "failopen", action="error %s" % exc)
+
+    # The full directive enters the session ONCE, here, instead of riding on every prompt.
+    parts.append(directive_text())
+    emit("SessionStart", "\n".join(parts))
+
+
+# --- tool events -----------------------------------------------------------------------------------------
+def extract_bash_text(payload):
+    ti = payload.get("tool_input") or {}
+    cmd = str(ti.get("command", ""))[:200]
+    out = payload.get("tool_output")
+    if isinstance(out, dict):
+        out = json.dumps(out, ensure_ascii=False)
+    out = str(out or "")
+    tail = out[-2500:]
+    err_lines = [ln for ln in tail.splitlines() if ERROR_RE.search(ln)][:3]
+    text = cmd + " " + " ".join(err_lines)
+    if not DOMAIN_RE.search(text) and not err_lines:
+        return None
+    return text[:400]
 
 
 def run_precheck(tags):
+    """Zero LLM tokens: precheck.sh prints the policies, gotchas and refuted cards for the tags. Any
+    failure is silent -- this must never block a call."""
     try:
-        r = subprocess.run([os.path.join(P.TOOLS_DIR, "precheck.sh"), *tags],
+        r = subprocess.run([os.path.join(TOOLS, "precheck.sh"), *tags],
                            capture_output=True, text=True, timeout=PRECHECK_TIMEOUT)
         out = (r.stdout or "").strip()
     except (OSError, subprocess.SubprocessError):
@@ -618,291 +394,1165 @@ def run_precheck(tags):
 
 
 def try_precheck(payload, st, t):
-    """PreToolUse(Bash) only. The output counts against the injection budget but
-    is not blocked by it: the whole point is the command that is about to delete
-    something, and that command must not lose its warning to a busy window. The
-    per-session, per-tag-set cooldown is what bounds this path instead."""
+    """PreToolUse(Bash) only. Returns text to emit, or None.
+
+    The output is COUNTED against the injection budget but not BLOCKED by it: a warning on the one
+    destructive command of a capped window is exactly the one that must not be dropped. The per-session,
+    per-tag-set cooldown is what bounds this path."""
     cmd = str((payload.get("tool_input") or {}).get("command", ""))
-    tags = risky_tags(cmd)
+    tags = sel.risky_tags(cmd)
     if not tags:
         return None
     key = "+".join(tags)
     if t - st["precheck"].get(key, 0) < PRECHECK_COOLDOWN:
         return None
-    st["recent"] = [x for x in st["recent"] if t - x < RATE_WINDOW]
+    st["recent"] = [x for x in st["recent"] if t - x < PARAMS.rate_window]
     body = run_precheck(tags)
     st["precheck"][key] = t
     if not body:
         return None
     st["recent"].append(t)
-    return ("KHMS precheck (risky command class: " + key + ") — active policies, "
-            "gotchas and refuted dead ends:\n" + body
-            + "\nIf any of it bears on this command, open the card before running it.")
+    return M.msg("HOOK_PRECHECK_HEAD", tags=key) + "\n" + body + "\n" + M.msg("HOOK_PRECHECK_FOOT")
 
 
-def dense_hits(query):
-    """[(card id, cosine)] from the dense channel, or [] — never raises, never
-    waits. A missing module, a missing daemon or a slow one all mean the same
-    thing: this call is lexical, exactly as it was before the channel existed."""
+# --- the experiment file ---------------------------------------------------------------------------------
+def load_experiment():
+    """The per-event injection switch and the gate flags. FAIL-OPEN in both directions: a missing, empty or
+    broken file means "behave as without the experiment", so deleting it is a complete rollback."""
     try:
-        import khms_recall_hybrid as hy
-    except Exception:
-        return []
-    try:
-        hits, err, _ms = hy.dense_query(query, topn=hy.CAND,
-                                        timeout_ms=DENSE_TIMEOUT_MS)
-        return [] if err else hits
-    except Exception:
-        return []
+        with open(EXPERIMENT, encoding="utf-8") as f:
+            cfg = json.load(f)
+    except (OSError, ValueError, TypeError):
+        return {}
+    return cfg if isinstance(cfg, dict) else {}
 
 
-def extract_bash_text(payload):
+def inject_on(exp, event):
+    return bool((exp.get("inject") or {}).get(event, True))
+
+
+def exp_tag(exp):
+    """Stamped into every log line, so a day's records say which regime produced them."""
+    if not exp:
+        return ""
+    name = exp.get("name")
+    if not name:
+        off = [SHORT_EVENT[e] for e in INJECT_EVENTS if not inject_on(exp, e)]
+        name = ("no-" + "+".join(off)) if off else "on"
+    return f"exp:{name}"
+
+
+# --- the retrieval-claim gate ------------------------------------------------------------------------------
+# A report line that CITES cards must be backed by a src=cli recall inside the current report turn;
+# otherwise the line is satisfiable from the hook's own injection -- a check whose passing condition holds
+# whether or not a retrieval happened. Deliberately narrow, it denies exactly two things:
+#   (i)  a substantial report in a report turn with NO claim line at all;
+#   (ii) a claim line that cites card ids while no recall of this turn matches the query it names.
+# A line that cites no card claims nothing about the base and passes, and so does every honest form.
+def _reply_text(payload):
     ti = payload.get("tool_input") or {}
-    cmd = str(ti.get("command", ""))[:200]
-    out = payload.get("tool_output")
-    if isinstance(out, dict):
-        out = json.dumps(out, ensure_ascii=False)
-    out = str(out or "")
-    err_lines = [ln for ln in out[-2500:].splitlines() if ERROR_RE.search(ln)][:3]
-    text = cmd + " " + " ".join(err_lines)
-    if not DOMAIN_RE.search(text) and not err_lines:
+    for k in ("text", "content", "message", "body"):
+        v = ti.get(k)
+        if isinstance(v, str) and v:
+            return v
+    return " ".join(str(v) for v in ti.values() if isinstance(v, str))
+
+
+def _claim_line(text):
+    """The claim line, raw and normalised (diacritics stripped, lowercased), tolerant of bullets and bold."""
+    kw = CLAIM_KEYWORD
+    for ln in (text or "").splitlines():
+        n = ks.norm(ln).strip().lstrip("-*_>•·+ \t")
+        if n.startswith(kw + ":") or n.startswith(kw + " :"):
+            return ln.strip(), n
+    return None, None
+
+
+def _claim_query_tokens(nline):
+    """Tokens of the QUERY part: after the keyword, before the arrow, card ids out."""
+    q = nline.split(":", 1)[1] if ":" in nline else nline
+    q = re.split(r"→|->|=>", q)[0]
+    q = re.sub(r"k-\d+", " ", q)
+    return set(ks.tokens(q))
+
+
+def recall_cli_since(since_t):
+    """Token sets of the src=cli lines of the recall log at or after since_t. Reads the TAIL only; ONLY
+    src=cli counts -- the hook's own lines are what made the line fakeable in the first place."""
+    path = ks.recall_log_path()
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - CLAIM_TAIL))
+            data = f.read().decode("utf-8", "replace")
+    except (OSError, TypeError):
+        return []
+    lines = data.splitlines()
+    if size > CLAIM_TAIL and lines:
+        lines = lines[1:]                      # the seek cut one line in half
+    out = []
+    for ln in lines:
+        parts = ln.split(" | ")
+        if len(parts) < 5 or not parts[-1].startswith("src=cli"):
+            continue
+        try:
+            t = datetime.datetime.fromisoformat(parts[0]).timestamp()
+        except ValueError:
+            continue
+        if t + CLAIM_SLACK < since_t:
+            continue
+        out.append(set(ks.tokens(" | ".join(parts[1:-3]))))
+    return out
+
+
+def claim_verdict(text, st):
+    """(ALLOW|DENY|EXEMPT, reason, query-part, kind). kind is "missing" for a report without the line."""
+    turn_start = st.get("turn_start")
+    pending = bool(st.get("baze_pending")) and turn_start is not None
+    line, nline = _claim_line(text)
+    if line is None:
+        if pending and len(text or "") >= CLAIM_MIN_CHARS:
+            return "DENY", M.msg("HOOK_WHY_NO_LINE", n=len(text)), "", "missing"
+        return ("EXEMPT", M.msg("HOOK_WHY_SHORT") if pending else M.msg("HOOK_WHY_NOT_A_TURN"),
+                "", "")
+    qpart = nline[:120]
+    for h in CLAIM_HONEST:
+        if h in nline:
+            return "ALLOW", M.msg("HOOK_WHY_HONEST", form=h), qpart, ""
+    if not re.search(r"k-\d{4,6}", nline):
+        return "ALLOW", M.msg("HOOK_WHY_NO_IDS"), qpart, ""
+    if turn_start is None:
+        return "EXEMPT", M.msg("HOOK_WHY_NO_TURN"), qpart, ""
+    recalls = recall_cli_since(turn_start)
+    if not recalls:
+        return "DENY", M.msg("HOOK_WHY_NO_RECALL"), qpart, "cite"
+    qtok = _claim_query_tokens(nline)
+    if not qtok:
+        return "ALLOW", M.msg("HOOK_WHY_NO_QUERY"), qpart, ""
+    best = max(len(qtok & r) / float(len(qtok)) for r in recalls)
+    if best >= CLAIM_SHARE:
+        return "ALLOW", M.msg("HOOK_WHY_MATCH", pct="%.0f" % (100 * best)), qpart, ""
+    return "DENY", M.msg("HOOK_WHY_LOW_MATCH", pct="%.0f" % (100 * best)), qpart, "cite"
+
+
+def baze_verdict(text, st):
+    """Legacy three-tuple form of claim_verdict."""
+    return claim_verdict(text, st)[:3]
+
+
+def claim_log(session, verdict, why, qpart):
+    _append(CLAIM_LOG, "%s | %s | %s | %s | %s\n" % (_stamp(), session or "-", verdict, why,
+                                                    (qpart or "")[:120]))
+
+
+def run_claim_gate(payload, event, exp):
+    """True == the report was DENIED (and the deny was already printed)."""
+    if not exp.get("baze_gate", exp.get("claim_gate", True)):
+        return False
+    session = payload.get("session_id", "")
+    path, st = load_state(session)
+    text = _reply_text(payload)
+    verdict, why, qpart, kind = claim_verdict(text, st)
+    claim_log(session, verdict, why, qpart)
+    if verdict == "DENY":
+        deny(event, M.msg("HOOK_CLAIM_DENY_MISSING" if kind == "missing" else "HOOK_CLAIM_DENY_CITE",
+                          why=why))
+        log(event, "report", action="DENY (claim: %s)" % why)
+        return True
+    if verdict == "ALLOW" and st.get("baze_pending"):
+        st["baze_pending"] = False
+        save_state(path, st)
+    return False
+
+
+run_baze_gate = run_claim_gate      # legacy name
+
+
+# --- the proposal gate -----------------------------------------------------------------------------------
+# A report or a brief that carries a PROPOSAL (a recommendation, a "shall I ...?", an A) B) choice) is
+# denied unless a recall of the same turn shares the proposal's own key terms: a recall on the symptom
+# alone does not show that the base was asked about the proposed remedy. The matchers below have English
+# defaults; a deployment adds its own language through the private KHMS_PATTERNS file.
+PROPOSAL_LOG = (os.environ.get("KHMS_PROPOSAL_LOG")
+                or (os.path.join(os.path.dirname(os.environ["KHMS_BAZE_LOG"]), ".proposal_gate.log")
+                    if os.environ.get("KHMS_BAZE_LOG") else None)
+                or P.soft("KHMS_PROPOSAL_LOG"))
+PROPOSAL_EN_MARKER_RE = re.compile(
+    r"\b(?:i|we)\s+(?:would\s+|'d\s+|do\s+|strongly\s+)?(?:propose|recommend|suggest)\b"
+    r"|\b(?:my|our)\s+(?:proposal|recommendation|suggestion|advice)\b"
+    r"|\b(?:shall|should)\s+(?:i|we)\b[^?]*\?")
+PROPOSAL_EN_LABEL_RE = re.compile(
+    r"(?:^|[(\[]\s*|[.!;:]\s+|\s[-–—]\s+)(recommendation|recommended|recommend|proposal|"
+    r"suggestion|proposed fix|proposed change)\s*:", re.I)
+PROPOSAL_EN_CHOICE_RE = re.compile(r"\bchoose\b|\bwhich (?:option|one|variant)\b|\bpick (?:one|a|an)\b")
+# Report-mode marker: the deployment's own (HOOK_PROPOSAL_MARKER) or the English one. Brief mode always
+# accepts both, because a brief may be written in either language.
+PROPOSAL_MARKER_RE = PAT.regex("HOOK_PROPOSAL_MARKER", PROPOSAL_EN_MARKER_RE.pattern)
+PROPOSAL_OPTION_RE = re.compile(r"^\s*(?:[-*•]\s*)?(?:\d+[.)]\s*)?(?:\*\*)?\(?([A-E])\)")
+PROPOSAL_LIST_RE = re.compile(r"^\s*(?:[-*•]|\d+(?:[–-]\d+)?[.)])\s")
+# A line that refers back to a previous proposal ("item 2", "A or B").
+PROPOSAL_REF_RE = PAT.regex(
+    "HOOK_PROPOSAL_REF", r"\b(?:[Ii]tem|[Pp]oint)s?\s+\d|\b[A-E]\s*(?:,|\band\b|\bor\b|/)\s*[A-E]\b")
+# Words that make an option block a CHOICE put to the principal.
+PROPOSAL_CHOICE_RE = PAT.regex("HOOK_PROPOSAL_CHOICE", PROPOSAL_EN_CHOICE_RE.pattern)
+# The mandatory report lines are not proposals (normalised line start, with the colon).
+PROPOSAL_SKIP_RE = PAT.regex("HOOK_PROPOSAL_SKIP", r"^(?:base|verified|if i were wrong)\s*:")
+# ...and are not context either (normalised line start).
+PROPOSAL_META_RE = PAT.regex("HOOK_PROPOSAL_META", r"^(base|verified|if i were wrong)\b")
+_QUOTED_RE = re.compile(r"`[^`]*`|\"[^\"\n]*\"|„[^“\n]*“|“[^”\n]*”")
+_SLASH_NEAR = 3                # a marker this close to a `/` is an item of a word list
+
+PROPOSAL_MAX_SHOWN = 3        # proposals named in one refusal
+PROPOSAL_QUERY_TERMS = 8      # terms in the suggested query
+PROPOSAL_MIN_TERMS = 3        # fewer on the marker line -> take the line above
+PROPOSAL_STOP = frozenset("""
+the and for with this that from into then than are was
+its not our you your will would should shall propose proposed proposal recommend recommended
+recommendation suggest suggestion option variant choose
+""".split()) | frozenset(PAT.words("HOOK_PROPOSAL_STOPWORDS", ()))
+# Term prefixes too generic to tell one proposal from another in this deployment.
+PROPOSAL_GENERIC = tuple(PAT.words("HOOK_PROPOSAL_GENERIC", ()))
+_PROPOSAL_NOISE_RE = re.compile(r"^(?:k-\d+|[\d.,:/x%\-]+|https?:.*|.*://.*)$")
+
+
+def _unquoted(text):
+    return _QUOTED_RE.sub(" ", text or "")
+
+
+def _not_listed(m, text):
+    a, b = m.start(), m.end()
+    return "/" not in text[max(0, a - _SLASH_NEAR):a] and "/" not in text[b:b + _SLASH_NEAR]
+
+
+def brief_marker(raw, n):
+    """A proposal marker on one brief line -- either language, not quoted, not in a `/` word list, not a
+    section title (a markdown heading or an ALL-CAPS label)."""
+    if raw.lstrip().startswith("#"):
+        return False
+    t = _unquoted(n)
+    for rx in (PROPOSAL_MARKER_RE, PROPOSAL_EN_MARKER_RE):
+        if any(_not_listed(m, t) for m in rx.finditer(t)):
+            return True
+    r = _unquoted(raw)
+    for m in PROPOSAL_EN_LABEL_RE.finditer(r):
+        if m.group(1).isupper():
+            continue
+        return True
+    return False
+
+
+def _prop_same(a, b):
+    """Same word up to an inflection: equal, or a common prefix of at least 4 letters that leaves at most
+    2 letters of the shorter word over (calibrate/calibration)."""
+    if a == b:
+        return True
+    n = 0
+    for x, y in zip(a, b):
+        if x != y:
+            break
+        n += 1
+    return n >= 4 and n >= min(len(a), len(b)) - 2
+
+
+def _prop_line_norm(raw):
+    return ks.norm(raw).strip().lstrip("-*_>•·+ \t")
+
+
+def proposal_spans(text, brief=False):
+    """[(label, span_text)] -- every proposal of a report (or, with brief=True, of a brief).
+
+    * A marker line is one proposal. A marker HEADER directly followed by a list takes the list; a marker
+      line that says too little on its own (a bare question) takes the line above with it.
+    * An option block `A) ... B) ...` is one proposal together with the line that asks -- but only when it
+      is a CHOICE (a question, a marker or a choice word nearby); A) B) C) used as part labels propose
+      nothing."""
+    lines = (text or "").splitlines()
+    usable = []                         # (index, raw, normalised) outside code
+    pos = {}                            # raw line index -> usable index
+    in_code = False
+    for i, raw in enumerate(lines):
+        if raw.strip().startswith("```"):
+            in_code = not in_code
+            continue
+        if in_code or raw.lstrip().startswith(">"):
+            continue
+        n = _prop_line_norm(raw)
+        if not n or PROPOSAL_SKIP_RE.match(n):
+            continue
+        pos[i] = len(usable)
+        usable.append((i, raw, n))
+    spans, taken = [], set()
+
+    def marker(x):
+        return brief_marker(usable[x][1], usable[x][2]) if brief \
+            else PROPOSAL_MARKER_RE.search(usable[x][2])
+
+    def asks(ks_, opts=()):
+        return any(("?" in usable[x][2] and not (brief and x in opts)) or marker(x)
+                   or PROPOSAL_CHOICE_RE.search(usable[x][2])
+                   or (brief and PROPOSAL_EN_CHOICE_RE.search(usable[x][2])) for x in ks_)
+
+    k = 0
+    while k < len(usable):
+        m = PROPOSAL_OPTION_RE.match(usable[k][1])
+        if not (m and m.group(1) == "A"):
+            k += 1
+            continue
+        block, want, j = [k], "B", k + 1
+        while j < len(usable) and j <= block[-1] + 3:
+            mj = PROPOSAL_OPTION_RE.match(usable[j][1])
+            if mj and mj.group(1) == want:
+                block.append(j)
+                want = chr(ord(want) + 1)
+            j += 1
+        if len(block) < 2:
+            k += 1
+            continue
+        idx = list(range(block[0], block[-1] + 1))
+        head = [k - 1] if k > 0 and usable[k - 1][0] >= usable[k][0] - 2 else []
+        after = [x for x in (block[-1] + 1, block[-1] + 2) if x < len(usable)]
+        if asks(head + idx + after, opts=set(idx)):
+            taken.update(idx + head)
+            body = " ".join(usable[x][1].strip() for x in head + idx)
+            spans.append((usable[k][1].strip(), body))
+        k = block[-1] + 1
+    for k, (i, raw, n) in enumerate(usable):
+        if k in taken or not marker(k):
+            continue
+        body = raw.strip()
+        nxt = lines[i + 1] if i + 1 < len(lines) else ""
+        if PROPOSAL_LIST_RE.match(nxt) and not PROPOSAL_LIST_RE.match(raw):
+            j = i + 1
+            while j < len(lines) and lines[j].strip() and j <= i + 15:
+                if j in pos:
+                    taken.add(pos[j])
+                    body += " " + lines[j].strip()
+                j += 1
+        elif spans and PROPOSAL_REF_RE.search(raw):
+            label, prev = spans[-1]
+            spans[-1] = (label, prev + " " + body)
+            taken.add(k)
+            continue
+        elif ("?" in n or len(proposal_terms(body)) < PROPOSAL_MIN_TERMS) \
+                and k > 0 and (k - 1) not in taken:
+            body = usable[k - 1][1].strip() + " " + body
+        taken.add(k)
+        spans.append((raw.strip(), body))
+    return spans
+
+
+def proposal_terms(span):
+    """Key terms of a proposal in order of appearance, one per stem."""
+    out = []
+    for t in ks.tokens(span):
+        t = t.strip(".,-/")
+        if len(t) < 3 or t in PROPOSAL_STOP or _PROPOSAL_NOISE_RE.match(t) \
+                or (PROPOSAL_GENERIC and t.startswith(PROPOSAL_GENERIC)):
+            continue
+        if any(_prop_same(t, o) for o in out):
+            continue
+        out.append(t)
+    return out
+
+
+def proposal_query(body, terms):
+    """The suggested recall: the most specific terms, in reading order. Specific = a capitalised name
+    inside a sentence, an identifier (digits, `_`, `.`, `/`), then length."""
+    caps = {ks.norm(w) for w in re.findall(r"(?<![.!?]\s)(?<!^)\b([A-Z][\w\-]+)", body or "")}
+    rank = sorted(range(len(terms)), key=lambda i: (
+        -(terms[i] in caps or bool(re.search(r"[\d_./]", terms[i]))), -len(terms[i]), i))
+    keep = sorted(rank[:PROPOSAL_QUERY_TERMS])
+    return " ".join(terms[i] for i in keep)
+
+
+def _prop_words(terms, glossary):
+    words = set(terms)
+    for t in terms:                        # the base may be written in another language than the report
+        for key, en in glossary.items():
+            if t.startswith(key):
+                words.update(ks.tokens(en))
+    return words
+
+
+def _prop_covered(words, recall_tokens):
+    return any(_prop_same(w, r) for w in words for r in recall_tokens)
+
+
+# Recall binding. Only recalls of THIS session's turn count: the session's own transcript (a recall.sh
+# Bash call whose tool_result is not an error), and a subagent's recall only through its own transcript
+# AND only when the gated text cites a card that call returned. The PreToolUse intent record says which
+# subagent issued which recall.
+RECALL_CMD_RE = re.compile(
+    r"(?:^|[\s;&|(])(?:\S*/)?recall\.sh\s+(.+?)(?=\s+\d*[<>]|\s*[|;\n]|\s*&&|\s*\)|$)")
+
+
+def recall_intent_path():
+    if os.environ.get("KHMS_RECALL_INTENT"):
+        return os.environ["KHMS_RECALL_INTENT"]
+    if os.environ.get("KHMS_RECALL_LOG"):
+        return os.environ["KHMS_RECALL_LOG"] + ".intent.jsonl"
+    return P.soft("KHMS_RECALL_INTENT")
+
+
+def recall_queries_of(cmd):
+    """Queries of every `recall.sh ...` in a shell command (flags and redirects out)."""
+    out = []
+    for m in RECALL_CMD_RE.finditer(cmd or ""):
+        arg = m.group(1)
+        try:
+            words = shlex.split(arg)
+        except ValueError:
+            words = arg.split()
+        words = [w for w in words if not w.startswith("--")]
+        if words:
+            out.append(" ".join(words))
+    return out
+
+
+def record_recall_intent(payload):
+    """PreToolUse(Bash): one intent line per recall.sh in the command. Never raises."""
+    try:
+        cmd = str((payload.get("tool_input") or {}).get("command", ""))
+        if "recall.sh" not in cmd:
+            return 0
+        qs = recall_queries_of(cmd)
+        if not qs:
+            return 0
+        path = recall_intent_path()
+        if not path or not P.may_write(path):
+            return 0
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            for q in qs:
+                f.write(json.dumps({
+                    "ts": round(time.time(), 3), "sid": payload.get("session_id", ""),
+                    "agent_id": payload.get("agent_id") or "",
+                    "tool_use_id": payload.get("tool_use_id") or "",
+                    "query": q}, ensure_ascii=False) + "\n")
+        return len(qs)
+    except Exception:                                              # noqa: BLE001
+        return 0
+
+
+def _jsonl_tail(path, nbytes=CLAIM_TAIL):
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - nbytes))
+            data = f.read().decode("utf-8", "replace")
+    except (OSError, TypeError):
+        return []
+    lines = data.splitlines()
+    if size > nbytes and lines:
+        lines = lines[1:]
+    out = []
+    for ln in lines:
+        try:
+            out.append(json.loads(ln))
+        except ValueError:
+            continue
+    return out
+
+
+def _result_text(content):
+    if isinstance(content, list):
+        return "\n".join(str(c.get("text", "")) if isinstance(c, dict) else str(c) for c in content)
+    return str(content or "")
+
+
+def transcript_recalls(path, since_t, main=True, only_ids=None):
+    """[(tool_use_id, query, cards)] of the recall.sh Bash calls in transcript `path` issued at/after
+    `since_t` whose tool_result (matched by tool_use_id) is NOT an error. `main` skips sidechain lines;
+    `only_ids` restricts to those calls."""
+    uses, results = {}, {}
+    try:
+        fh = open(path, encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    with fh:
+        for ln in fh:
+            is_use = '"tool_use"' in ln and "recall.sh" in ln
+            is_res = '"tool_result"' in ln and uses and any(i in ln for i in uses)
+            if not (is_use or is_res):
+                continue
+            try:
+                d = json.loads(ln)
+            except ValueError:
+                continue
+            if main and d.get("isSidechain"):
+                continue
+            msg = d.get("message")
+            content = msg.get("content") if isinstance(msg, dict) else None
+            if not isinstance(content, list):
+                continue
+            for blk in content:
+                if not isinstance(blk, dict):
+                    continue
+                if blk.get("type") == "tool_use" and d.get("type") == "assistant":
+                    tid = blk.get("id") or ""
+                    cmd = str((blk.get("input") or {}).get("command", ""))
+                    ts = _ts_epoch(d.get("timestamp"))
+                    if (not tid or blk.get("name") != "Bash" or "recall.sh" not in cmd
+                            or ts is None or ts + CLAIM_SLACK < since_t
+                            or (only_ids is not None and tid not in only_ids)):
+                        continue
+                    uses[tid] = recall_queries_of(cmd)
+                elif blk.get("type") == "tool_result" and d.get("type") == "user":
+                    tid = blk.get("tool_use_id")
+                    if tid in uses:
+                        results[tid] = (bool(blk.get("is_error")), _result_text(blk.get("content")))
+    out = []
+    for tid, qs in uses.items():
+        if tid not in results or results[tid][0]:
+            continue                       # still running, or failed: no recall
+        cards = set(re.findall(r"\bK-\d{5}\b", results[tid][1]))
+        out += [(tid, q, cards) for q in qs]
+    return out
+
+
+AGENT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def bound_recalls(session, since_t, text="", transcript="", agent_id=""):
+    """[(token set, how)] of the recalls bound to THIS session's turn. `agent_id`: the gated call comes
+    from that subagent, so ITS transcript is the "own" one."""
+    if not session or since_t is None or not transcript:
+        return []
+    transcript = os.path.expanduser(str(transcript))
+    cited = set(re.findall(r"K-\d{5}", text or ""))
+
+    def terms(q):
+        return {t for t in ks.tokens(q) if t not in PROPOSAL_STOP
+                and not (PROPOSAL_GENERIC and t.startswith(PROPOSAL_GENERIC))}
+    out = []
+    base = transcript[:-len(".jsonl")] if transcript.endswith(".jsonl") else transcript
+    own, own_main = transcript, True
+    if agent_id:
+        if not AGENT_ID_RE.match(str(agent_id)):
+            return []
+        own, own_main = os.path.join(base, "subagents", "agent-%s.jsonl" % agent_id), False
+    for tid, q, _cards in transcript_recalls(own, since_t, main=own_main):
+        if ks.tokens(q):
+            out.append((terms(q), M.msg("HOOK_HOW_OWN")))
+    by_agent = {}
+    for it in _jsonl_tail(recall_intent_path()):
+        aid, tid = str(it.get("agent_id") or ""), str(it.get("tool_use_id") or "")
+        if (it.get("sid") == session and aid and tid and AGENT_ID_RE.match(aid)
+                and it.get("ts", 0) + CLAIM_SLACK >= since_t):
+            by_agent.setdefault(aid, set()).add(tid)
+    for aid, tids in sorted(by_agent.items()):
+        if aid == agent_id:
+            continue                       # already counted as the caller's own
+        sub = os.path.join(base, "subagents", "agent-%s.jsonl" % aid)
+        for tid, q, cards in transcript_recalls(sub, since_t, main=False, only_ids=tids):
+            if ks.tokens(q) and cited & cards:
+                out.append((terms(q), M.msg("HOOK_HOW_SUBAGENT", agent=aid[:12])))
+    return out
+
+
+def _prop_context_terms(text, body):
+    """Terms of the text OUTSIDE this proposal (the mandatory report lines out): a word the whole text is
+    about cannot be what tells this proposal apart."""
+    rest = []
+    for ln in (text or "").splitlines():
+        core = ln.strip().lstrip("-*•·+> \t").strip()
+        if not core or core in (body or "") or PROPOSAL_META_RE.match(_prop_line_norm(ln)):
+            continue
+        rest.append(ln)
+    return proposal_terms("\n".join(rest))
+
+
+def proposal_covered(body, terms, ctx_terms, recalls, glossary):
+    """A recall covers a proposal when it shares at least two of its terms (one, if the proposal has only
+    one) AND one shared term DISTINGUISHES it -- a term the rest of the text does not use. Heuristic: it
+    shows a recall on the proposal's own subject was evidenced, not that the proposal is right."""
+    distinct = [t for t in terms if not any(_prop_same(t, c) for c in ctx_terms)]
+    if not distinct:
+        distinct = proposal_query(body, terms).split()[:3]
+    need = min(2, len(terms))
+    for rt in recalls:
+        shared = [t for t in terms if _prop_covered(_prop_words([t], glossary), rt)]
+        if len(shared) >= need and any(t in distinct for t in shared):
+            return True
+    return False
+
+
+def proposal_verdict(text, st, session="", transcript="", since_t=None, agent_id="", brief=False):
+    """(ALLOW|DENY|EXEMPT, reason, [(label, suggested query)] of the uncovered proposals). `since_t`
+    overrides the report turn (the dispatch gate passes its own); `agent_id` names the calling subagent."""
+    turn_start = st.get("turn_start") if since_t is None else since_t
+    if turn_start is None:
+        return "EXEMPT", M.msg("HOOK_WHY_NO_TURN"), []
+    spans = proposal_spans(text, brief=brief)
+    if not spans:
+        return "EXEMPT", M.msg("HOOK_WHY_NO_PROPOSAL"), []
+    bound = bound_recalls(session, turn_start, text, transcript, agent_id)
+    recalls = [r for r, _how in bound]
+    try:
+        glossary = ks.load_glossary()
+    except Exception:                                            # noqa: BLE001
+        glossary = {}
+    missing = []
+    for label, body in spans:
+        terms = proposal_terms(body)
+        if not terms:
+            continue
+        if proposal_covered(body, terms, _prop_context_terms(text, body), recalls, glossary):
+            continue
+        missing.append((label, proposal_query(body, terms)))
+    if missing:
+        return ("DENY", M.msg("HOOK_WHY_UNCOVERED", n=len(missing), total=len(spans),
+                              bound=len(recalls)), missing)
+    return ("ALLOW", M.msg("HOOK_WHY_COVERED", n=len(spans),
+                           how=", ".join(sorted({h for _r, h in bound})) or "-"), [])
+
+
+def proposal_log(session, verdict, why, label):
+    _append(PROPOSAL_LOG, "%s | %s | %s | %s | %s\n" % (
+        _stamp(), session or "-", verdict, why, re.sub(r"\s+", " ", label or "")[:120]))
+
+
+def _proposal_items(missing):
+    """One line per uncovered proposal, each with the exact recall to run."""
+    return "\n".join(M.msg("HOOK_PROPOSAL_ITEM", label=re.sub(r"\s+", " ", label)[:90], query=q)
+                     for label, q in missing[:PROPOSAL_MAX_SHOWN])
+
+
+def run_proposal_gate(payload, event, exp):
+    """True == the report was DENIED (and the deny was already printed)."""
+    if not exp.get("proposal_gate", True):
+        return False
+    session = payload.get("session_id", "")
+    _path, st = load_state(session)
+    verdict, why, missing = proposal_verdict(_reply_text(payload), st, session,
+                                             payload.get("transcript_path") or "")
+    if verdict == "EXEMPT":
+        return False
+    proposal_log(session, verdict, why, missing[0][0] if missing else "")
+    if verdict != "DENY":
+        return False
+    deny(event, M.msg("HOOK_PROPOSAL_DENY", why=why, items=_proposal_items(missing)))
+    log(event, "report", action="DENY (proposal without recall: %s)" % why)
+    return True
+
+
+# --- the dispatch gate: the same rule when a subagent is launched -------------------------------------
+# A PreToolUse on the Agent tool whose prompt, or the brief file the prompt names, carries a proposal is
+# denied without a bound recall on that proposal in the same turn (every UserPromptSubmit opens a turn,
+# task notifications too). An unreadable brief fails open, and the fail-open is logged as one.
+AGENT_TOOLS = ("Agent", "Task")
+ISSUE_LINE_RE = re.compile(r"^\s*Issue:\s*#(\d+)\b", re.M)
+BRIEF_PATH_RE = re.compile(r"(/[^\s'\"`<>|;()]+\.md)\b")
+MD_TOKEN_RE = re.compile(r"[^\s'\"`<>|;()]+\.md\b")
+HEAD_LINES = 5
+
+
+def _head(text, n=HEAD_LINES):
+    return "\n".join(str(text or "").splitlines()[:n])
+
+
+def brief_head(prompt):
+    """(head text, source) -- the first lines that carry an `Issue:` line. The prompt's own first lines
+    win; otherwise the first named `.md` file that exists and carries the line in ITS first lines. The
+    source is "prompt", the path, or None."""
+    head = _head(prompt)
+    if ISSUE_LINE_RE.search(head):
+        return head, "prompt"
+    for path in BRIEF_PATH_RE.findall(str(prompt or "")):
+        try:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                fhead = "".join(fh.readline() for _ in range(HEAD_LINES))
+        except OSError:
+            continue
+        if ISSUE_LINE_RE.search(fhead):
+            return fhead, path
+    return head, None
+
+
+def _is_brief_name(p, src=None):
+    return p == src or "/briefs/" in p or os.path.basename(p).startswith("brief")
+
+
+def dispatch_brief_paths(prompt, cwd=None, unresolved=None):
+    """The brief files a dispatch prompt names: the one brief_head found, and every named .md under a
+    `briefs/` directory or named `brief...` -- a design or a handoff it points at is context, not the brief.
+    `~` is expanded and a relative path is joined to `cwd`; a relative brief path with no cwd is appended to
+    `unresolved`, never dropped."""
+    _head_text, src = brief_head(prompt)
+    out = []
+    for tok in MD_TOKEN_RE.findall(str(prompt or "")):
+        if tok.startswith("/"):
+            p = tok
+        elif tok.startswith("~"):
+            p = os.path.expanduser(tok)
+        elif cwd:
+            p = os.path.normpath(os.path.join(cwd, tok))
+        else:
+            if _is_brief_name("/" + tok) and unresolved is not None and tok not in unresolved:
+                unresolved.append(tok)
+            continue
+        if _is_brief_name(p, src) and p not in out:
+            out.append(p)
+    return out
+
+
+def dispatch_texts(prompt, cwd=None):
+    """[(where, text)] to check, [(path, error)] of named briefs that could not be read."""
+    texts, errors, unresolved = [("prompt", str(prompt or ""))], [], []
+    for p in dispatch_brief_paths(prompt, cwd, unresolved):
+        try:
+            with open(p, encoding="utf-8", errors="replace") as fh:
+                texts.append((p, fh.read()))
+        except OSError as exc:
+            errors.append((p, exc.__class__.__name__))
+    errors += [(t, M.msg("HOOK_WHY_RELATIVE")) for t in unresolved]
+    return texts, errors
+
+
+def stamp_prompt_turn(payload):
+    """UserPromptSubmit: every prompt opens a turn for the dispatch gate."""
+    path, st = load_state(payload.get("session_id", ""))
+    st["prompt_t"] = now()
+    save_state(path, st)
+
+
+def run_dispatch_proposal_gate(payload, exp):
+    """True == the dispatch was DENIED (and the deny was already printed)."""
+    if not exp.get("proposal_gate", True):
+        return False
+    session = payload.get("session_id", "")
+    _path, st = load_state(session)
+    ti = payload.get("tool_input") or {}
+    what = "dispatch %s" % re.sub(r"\s+", " ", str(ti.get("description")
+                                                   or ti.get("subagent_type") or "?"))[:60]
+    since = st.get("prompt_t", st.get("turn_start"))
+    texts, errors = dispatch_texts(ti.get("prompt") or "", payload.get("cwd") or None)
+    for p, err in errors:
+        proposal_log(session, "ERROR->ALLOW", M.msg("HOOK_WHY_BRIEF_UNREADABLE", what=what, err=err), p)
+    if since is None:
+        proposal_log(session, "EXEMPT", "%s: %s" % (what, M.msg("HOOK_WHY_NO_DISPATCH_TURN")), "")
+        return False
+    missing, where, verdicts = [], [], []
+    for src, text in texts:
+        verdict, why, miss = proposal_verdict(
+            text, st, session, payload.get("transcript_path") or "",
+            since_t=since, agent_id=str(payload.get("agent_id") or ""), brief=True)
+        verdicts.append((verdict, why))
+        if verdict == "DENY":
+            missing += miss
+            where.append("brief " + src if src != "prompt" else "prompt")
+    if not missing:
+        allowed = [w for v, w in verdicts if v == "ALLOW"]
+        proposal_log(session, "ALLOW" if allowed else "EXEMPT",
+                     "%s: %s" % (what, "; ".join(allowed) if allowed else M.msg("HOOK_WHY_NO_PROPOSAL")),
+                     "")
+        return False
+    why = M.msg("HOOK_WHY_DISPATCH_UNCOVERED", n=len(missing))
+    proposal_log(session, "DENY", "%s: %s" % (what, why), missing[0][0])
+    deny("PreToolUse", M.msg("HOOK_DISPATCH_DENY", why=why, where=", ".join(where),
+                             items=_proposal_items(missing)))
+    log("PreToolUse", what, action="DENY (proposal in brief without recall: %s)" % why)
+    return True
+
+
+# --- fail-open records: a broken gate is not an idle one ---------------------------------------------
+STOP_LOG = _loc("KHMS_STOP_LOG", "KHMS_STOP_LOG")
+FAILOPEN_WINDOW_S = 24 * 3600
+
+
+def failopen_logs():
+    """[(gate label, log path)] of the gates whose fail-opens are reported."""
+    return [(M.msg("HOOK_GATE_PROPOSALS"), PROPOSAL_LOG), (M.msg("HOOK_GATE_STOP"), STOP_LOG)]
+
+
+def failopen_records(since_t):
+    """[(epoch, gate, why, log path)] of `ERROR->ALLOW` records newer than since_t."""
+    out = []
+    for gate, path in failopen_logs():
+        try:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                lines = fh.readlines()[-2000:]
+        except (OSError, TypeError):
+            continue
+        for ln in lines:
+            if "| ERROR->ALLOW |" not in ln:
+                continue
+            f = [x.strip() for x in ln.split("|")]
+            try:
+                t = datetime.datetime.fromisoformat(f[0]).timestamp()
+            except (ValueError, IndexError):
+                continue
+            if t > since_t:
+                out.append((t, gate, " | ".join(f[3:]).strip(" |")[:140], path))
+    return sorted(out)
+
+
+def failopen_line(since_t):
+    recs = failopen_records(since_t)
+    if not recs:
+        return ""
+    t, gate, why, path = recs[-1]
+    gates = collections.Counter(g for _t, g, _w, _p in recs)
+    try:
+        shown = os.path.relpath(path, BRAIN) if BRAIN and P.under(path, BRAIN) else path
+    except (TypeError, ValueError):
+        shown = path
+    return M.msg("HOOK_FAILOPEN", n=len(recs),
+                 gates=", ".join("%s %d" % kv for kv in sorted(gates.items())),
+                 hhmm=_hhmm(t), gate=gate, why=why, path=shown)
+
+
+def _with_failopen(text, payload):
+    """Prepend the fail-open records this session has not been shown yet."""
+    try:
+        path, st = load_state(payload.get("session_id", ""))
+        since = st.get("failopen_seen_t", now() - FAILOPEN_WINDOW_S)
+        line = failopen_line(since)
+        st["failopen_seen_t"] = now()
+        save_state(path, st)
+    except Exception as exc:                                       # noqa: BLE001
+        log("UserPromptSubmit", "failopen", action="error %s" % exc)
+        return text
+    return (line + "\n" + text) if line else text
+
+
+# --- Stop: the reply-owed gate -------------------------------------------------------------------------
+# When the principal's LAST message came in over the report channel and no successful report-tool call
+# followed it, the turn may not end: the principal does not see the terminal.
+_TAG_ATTR_RE = re.compile(r'\b(chat_id|message_id)="([^"]*)"')
+_SCRIPT_PROMPTS = ("[AUTO-PING]", "[POST-CLEAR", "[SYSTEM NOTIFICATION",
+                   "<task-notification>", "<local-command-")
+
+
+def _channel_tag_re():
+    return re.compile(r'^\s*<channel\s+source="[^"]*%s[^"]*"' % re.escape(REPORT_SERVER))
+
+
+def _prompt_of(d):
+    """(text, origin, meta) of a transcript entry that carries a PROMPT, None for everything else
+    (assistant turns, tool results, hook attachments)."""
+    if not isinstance(d, dict) or d.get("isSidechain"):
         return None
-    return text[:400]
+    typ = d.get("type")
+    if typ == "user":
+        c = (d.get("message") or {}).get("content")
+        if isinstance(c, list):
+            blocks = [b for b in c if isinstance(b, dict)]
+            if any(b.get("type") == "tool_result" for b in blocks):
+                return None
+            text = " ".join(str(b.get("text", "")) for b in blocks if b.get("type") == "text")
+        else:
+            text = str(c or "")
+        return (text, d.get("origin") or {}, bool(d.get("isMeta") or d.get("isCompactSummary")))
+    if typ == "attachment":
+        a = d.get("attachment") or {}
+        if a.get("type") != "queued_command":
+            return None
+        return str(a.get("prompt") or ""), a.get("origin") or {}, bool(a.get("isMeta"))
+    return None
+
+
+def owner_message_kind(d):
+    """'report' | 'terminal' | 'channel:<server>' | None (not the principal).
+
+    Transcript shapes (Claude Code): a channel message is a `user` entry with isMeta and origin
+    {"kind": "channel", "server": ...} or, when it lands mid-turn, an `attachment` of type `queued_command`
+    with the same origin; a subagent's completion has origin kind `task-notification`; a prompt typed into
+    the terminal has kind `human`. An unknown kind is not the principal."""
+    got = _prompt_of(d)
+    if got is None:
+        return None
+    text, origin, meta = got
+    kind = origin.get("kind") if isinstance(origin, dict) else None
+    if kind == "channel":
+        server = str(origin.get("server", ""))
+        return "report" if REPORT_SERVER in server else "channel:" + server
+    if _channel_tag_re().match(text):
+        return "report"           # a transcript written before `origin` existed
+    s = text.lstrip()
+    if not s or s.startswith(_SCRIPT_PROMPTS):
+        return None
+    if kind == "human":
+        return "terminal"
+    if kind is not None or meta:
+        return None
+    return "terminal"
+
+
+def reply_owed(transcript_path):
+    """(owed, why, owner) -- owed only when the principal's LAST message came over the report channel and
+    no report-tool call after it succeeded. Read backwards and stops at that message. A call whose result
+    is an error (a gate denied it) does not count; one whose result is not written yet does -- unknown
+    resolves toward letting the turn end."""
+    with open(transcript_path, encoding="utf-8", errors="replace") as f:
+        lines = f.readlines()
+    replies, errors = [], set()
+    for raw in reversed(lines):
+        if not raw.strip():
+            continue
+        try:
+            d = json.loads(raw)
+        except ValueError:
+            continue
+        if not isinstance(d, dict):
+            continue
+        content = (d.get("message") or {}).get("content") if isinstance(d.get("message"), dict) else None
+        if d.get("type") == "assistant" and isinstance(content, list):
+            for b in content:
+                if isinstance(b, dict) and b.get("type") == "tool_use" \
+                        and REPORT_TOOL_RE.search(str(b.get("name") or "")):
+                    replies.append(b.get("id"))
+            continue
+        if d.get("type") == "user" and isinstance(content, list):
+            for b in content:
+                if isinstance(b, dict) and b.get("type") == "tool_result" and b.get("is_error"):
+                    errors.add(b.get("tool_use_id"))
+        kind = owner_message_kind(d)
+        if kind is None:
+            continue
+        text = _prompt_of(d)[0]
+        ts = d.get("timestamp") or (d.get("attachment") or {}).get("timestamp")
+        owner = {"kind": kind, "ts": ts, "text": text}
+        if kind != "report":
+            return False, "last owner message: " + kind, owner
+        ok = [r for r in replies if r not in errors]
+        if ok:
+            return False, "replied (%d reply call(s) after it)" % len(ok), owner
+        return True, ("no reply call after it" if not replies else
+                      "%d reply call(s) after it, all failed" % len(replies)), owner
+    return False, "no owner message in the transcript", None
+
+
+discord_reply_owed = reply_owed      # legacy name
+
+
+def _ts_epoch(ts):
+    try:
+        return datetime.datetime.fromisoformat(str(ts).replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def stop_log(session, verdict, why, owner=None):
+    snip = re.sub(r"\s+", " ", re.sub(r"<[^>]{1,400}>", " ", (owner or {}).get("text", "")))[:80].strip()
+    _append(STOP_LOG, f"{_stamp()} | {(session or 'nosession')[:8]} | {verdict} | {why}"
+                      f"{(' | owner: ' + snip) if snip else ''}\n")
+
+
+def run_stop_gate(payload):
+    """Prints the block decision when a reply is owed; silent (= the turn ends) otherwise. Every outcome is
+    one line in the stop log -- the count of BLOCK lines is the measurement."""
+    session = payload.get("session_id", "")
+    if not load_experiment().get("stop_gate", True):
+        stop_log(session, "ALLOW", "stop_gate off in the experiment file")
+        return
+    if payload.get("stop_hook_active"):
+        stop_log(session, "ALLOW", "stop_hook_active (already continuing after a block)")
+        return
+    if payload.get("agent_id"):
+        stop_log(session, "ALLOW", "subagent")
+        return
+    tp = str(payload.get("transcript_path") or "")
+    if not tp:
+        stop_log(session, "ALLOW", "no transcript_path")
+        return
+    owed, why, owner = reply_owed(os.path.expanduser(tp))
+    if not owed:
+        stop_log(session, "ALLOW", why, owner)
+        return
+    _p, st = load_state(session)
+    replied_t, owner_t = st.get("discord_reply_t"), _ts_epoch(owner.get("ts"))
+    if replied_t and owner_t and float(replied_t) >= owner_t:
+        stop_log(session, "ALLOW", "reply passed the PreToolUse gates %.0f s after the "
+                 "owner message; transcript lags" % (float(replied_t) - owner_t), owner)
+        return
+    attrs = dict(_TAG_ATTR_RE.findall(owner.get("text", "")))
+    print(json.dumps({"decision": "block", "reason": M.msg(
+        "HOOK_STOP_REASON", chat_id=attrs.get("chat_id", "?"), message_id=attrs.get("message_id", "?"),
+        tool=REPORT_TOOL_RE.pattern)}, ensure_ascii=False))
+    stop_log(session, "BLOCK", why, owner)
+
+
+# --- the entry point ---------------------------------------------------------------------------------------
+def is_report_tool(payload):
+    return bool(REPORT_TOOL_RE.pattern) and bool(REPORT_TOOL_RE.search(str(payload.get("tool_name", ""))))
+
+
+def handle_report(payload, event, exp):
+    """PreToolUse on the report tool: the claim gate, then the proposal gate. Each fails open; a report
+    that passes both is stamped for the Stop gate, which cannot count on the transcript showing it yet."""
+    try:
+        if run_claim_gate(payload, event, exp):
+            return
+    except Exception as exc:                                       # noqa: BLE001
+        log(event, "report", action="claim-gate error %s" % exc)
+    try:
+        if run_proposal_gate(payload, event, exp):
+            return
+    except Exception as exc:                                       # noqa: BLE001
+        log(event, "report", action="proposal-gate error %s" % exc)
+        proposal_log(payload.get("session_id", ""), "ERROR->ALLOW", "bypass: %s" % str(exc)[:80], "")
+    try:
+        _sp, _sst = load_state(payload.get("session_id", ""))
+        _sst["discord_reply_t"] = now()
+        save_state(_sp, _sst)
+    except Exception as exc:                                       # noqa: BLE001
+        log(event, "report", action="stop-stamp error %s" % exc)
 
 
 def main():
-    if os.environ.get("KHMS_HOOKS_OFF") == "1" or os.path.exists(P.HOOKS_OFF):
+    global EXP_TAG
+    if os.environ.get("KHMS_HOOKS_OFF") == "1" or (HOOKS_OFF_FILE and os.path.exists(HOOKS_OFF_FILE)):
         return
     payload = json.load(sys.stdin)
     event = payload.get("hook_event_name", "")
-    global EXP_TAG
+    if event == "Stop":
+        # First and on its own: it needs nothing the other branches load, and whatever goes wrong inside
+        # it must end in "let the turn end".
+        try:
+            run_stop_gate(payload)
+        except Exception as exc:                                   # noqa: BLE001
+            stop_log(payload.get("session_id", ""), "ERROR->ALLOW", "%s: %s" % (type(exc).__name__, exc))
+        return
     exp = load_experiment()
     EXP_TAG = exp_tag(exp)
-
-    # The report to the principal is gated BEFORE anything else costs anything:
-    # it is a permission decision, not a retrieval.
-    if (event == "PreToolUse"
-            and REPORT_TOOL_RE.pattern
-            and REPORT_TOOL_RE.search(str(payload.get("tool_name", "")))):
+    # Every prompt opens a turn for the dispatch gate -- task notifications too -- before anything below
+    # can return early on such a prompt.
+    if event == "UserPromptSubmit":
         try:
-            if run_claim_gate(payload, event, exp):
-                return
+            stamp_prompt_turn(payload)
         except Exception as exc:                                   # noqa: BLE001
-            # FAIL OPEN, loudly: a gate that throws must never stand between the
-            # agent and its report.
-            log(event, "report-tool", f"claim-gate error {exc}")
+            log(event, "prompt-turn", action="stamp error %s" % exc)
+
+    if event == "PreToolUse" and payload.get("tool_name") in AGENT_TOOLS:
+        try:
+            run_dispatch_proposal_gate(payload, exp)
+        except Exception as exc:                                   # noqa: BLE001
+            log(event, "dispatch", action="dispatch-proposal-gate error %s" % exc)
+            proposal_log(payload.get("session_id", ""), "ERROR->ALLOW",
+                         "dispatch bypass: %s" % str(exc)[:80], "")
+        return
+
+    if event == "PreToolUse" and payload.get("tool_name") == "Bash":
+        record_recall_intent(payload)
+
+    if event == "PreToolUse" and is_report_tool(payload):
+        handle_report(payload, event, exp)
         return
 
     if event == "SessionStart":
-        handle_session_start()
+        handle_session_start(payload)
         return
-    if event not in THRESHOLD:
+    if event not in PARAMS.threshold:
         return
 
-    tool = payload.get("tool_name")
+    job = False
     if event == "UserPromptSubmit":
         raw = str(payload.get("prompt", ""))
-        # A gated TURN starts here — detected BEFORE the tag stripping below eats
-        # the channel tag. Everything until the next such prompt is "this turn"
-        # for the retrieval-claim gate.
+        if "<task-notification>" in raw or raw.lstrip().startswith("[SYSTEM NOTIFICATION"):
+            return
+        job = sel.is_job_prompt(raw)
+        # A report turn starts here; detected before the tag stripping below removes the channel tag.
+        # Everything until the next such prompt is "this turn" for the claim gate.
         if REPORT_CHANNEL_RE is None or REPORT_CHANNEL_RE.search(raw):
             _p, _st = load_state(payload.get("session_id", ""))
             _st["turn_start"] = now()
-            _st["claim_pending"] = True
+            _st["baze_pending"] = True
             save_state(_p, _st)
-        raw = re.sub(r"<[^>]{1,400}>", " ", raw)          # strip harness/channel tags
+        raw = re.sub(r"<[^>]{1,400}>", " ", raw)
+        raw = re.sub(r'\b(chat_id|message_id|user_id|ts|source)="[^"]*"', " ", raw)
         if len(raw.strip()) < MIN_PROMPT_LEN:
-            log(event, raw, "skip (short)")
+            log(event, raw, action="skip (short)")
             return
         query = raw[:500]
-    elif event == "PreToolUse" and tool in ("Edit", "Write"):
+    elif event == "PreToolUse" and payload.get("tool_name") in ("Edit", "Write"):
         ti = payload.get("tool_input") or {}
-        text = " ".join([str(ti.get("file_path", "")),
-                         str(ti.get("old_string", ""))[:200],
-                         str(ti.get("new_string", ""))[:200],
-                         str(ti.get("content", ""))[:200]])
+        text = " ".join([
+            str(ti.get("file_path", "")),
+            str(ti.get("old_string", ""))[:200],
+            str(ti.get("new_string", ""))[:200],
+            str(ti.get("content", ""))[:200],
+        ])
         if not DOMAIN_RE.search(text):
             return
         query = text[:400]
     else:
         query = extract_bash_text(payload)
-        if query is None and not (event == "PreToolUse" and tool == "Bash"):
+        if query is None and not (event == "PreToolUse" and payload.get("tool_name") == "Bash"):
             return
 
-    # An event whose card injection is switched off exits HERE — no state, no
-    # card base, no search, no line in the recall log. The UserPromptSubmit
-    # handler above still ran (the turn marker), and the prompt still gets the
-    # one-line directive: the experiment removes the CARDS, not the duty to say
-    # where an answer came from.
-    if not inject_on(exp, event) and not (event == "PreToolUse"
-                                          and tool == "Bash"):
+    # An event whose card injection is switched off exits HERE -- no state, no base, no search, no recall
+    # log line. A prompt still gets the directive line: the experiment removes the CARDS, not the duty to
+    # say where an answer came from.
+    if not inject_on(exp, event) and not (event == "PreToolUse" and payload.get("tool_name") == "Bash"):
         if event == "UserPromptSubmit":
-            emit(event, DIRECTIVE_LINE)
-        log(event, query, "skip (exp:no-inject)")
+            emit(event, _with_failopen(directive_line(), payload))
+        log(event, query, action="skip (exp:no-inject)")
         return
 
     path, st = load_state(payload.get("session_id", ""))
     t = now()
 
-    # The risky-command class checks itself, BEFORE retrieval, so a destructive
-    # command never loses its warning to the ordinary card budget.
-    if event == "PreToolUse" and tool == "Bash":
+    # The risky-command class checks itself, before retrieval, so a command about to delete something does
+    # not lose its warning to the ordinary card budget.
+    if event == "PreToolUse" and payload.get("tool_name") == "Bash":
         pc = try_precheck(payload, st, t)
         if pc is not None:
             save_state(path, st)
             emit(event, pc)
-            log(event, str((payload.get("tool_input") or {}).get("command", ""))[:200],
-                "PRECHECK")
+            log(event, str((payload.get("tool_input") or {}).get("command", ""))[:200], action="PRECHECK")
             return
         if query is None:
             save_state(path, st)
             return
-        # PreToolUse(Bash) reaches here only after precheck: the automatic
-        # precheck is NOT part of the injection experiment, the cards are.
+        # precheck is not part of the injection experiment; ordinary Bash scoring is.
         if not inject_on(exp, event):
             save_state(path, st)
-            log(event, query, "skip (exp:no-inject)")
+            log(event, query, action="skip (exp:no-inject)")
             return
 
     qh = hashlib.sha1(query.encode("utf-8", "replace")).hexdigest()[:12]
-    thr = THRESHOLD[event]
-
-    if t - st["queries"].get(qh, 0) < QUERY_COOLDOWN:
+    # The budget FIRST, the card base second: everything pregate can decide needs no search result.
+    pre = sel.pregate(event, query, st, t, PARAMS, query_hash=qh)
+    if pre.decision is not None:
         save_state(path, st)
-        log(event, query, "skip (query cooldown)", qh=qh)
-        return
-    st["queries"][qh] = t
-    st["recent"] = [x for x in st["recent"] if t - x < RATE_WINDOW]
-    st["bypass"] = [x for x in st["bypass"] if t - x < RATE_WINDOW]
-
-    capped = len(st["recent"]) >= RATE_MAX
-    bypass_allowed = (capped and event == "UserPromptSubmit"
-                      and len(st["bypass"]) < BYPASS_PER_WINDOW)
-    if capped and not bypass_allowed:
-        save_state(path, st)
-        log(event, query, "skip (rate cap)", qh=qh)
+        # Not written to the recall log: nothing was searched.
+        log(event, query, decision=pre.decision, qh=qh)
         return
 
-    cards = prepare_cards(ks.load_cards())
-    expanded, _added = ks.expand_query(query, ks.load_glossary())
-    raw_results, _ = ks.search(expanded, cards=cards, exclude_meta=True, topn=8)
-    results = sorted(((damp(s, c["_ntok"]), m, c) for s, m, c in raw_results),
-                     key=lambda r: -r[0])
-    ks.log_query(query, results, src=f"hook:{event}")
+    dense_fn = None
+    if event in PARAMS.dense_events:
+        try:
+            import khms_recall_hybrid as hyb
+            dense_fn = (lambda q, n: hyb.dense_query(
+                q, topn=n, timeout_ms=float(os.environ.get("KHMS_DENSE_TIMEOUT_MS", "150"))))
+        except Exception:                                          # noqa: BLE001
+            dense_fn = None
 
-    top_score = results[0][0] if results else 0.0
-    skips = []
-
-    if capped:
-        # The rate cap used to spend the window first-come, dropping the best
-        # question of the hour because three routine ones arrived first. A top hit
-        # that clears a high bar buys one extra ride per window; everything else is
-        # still dropped, but now the score is in the log, so the miss is diagnosable.
-        if top_score < BYPASS_MIN:
-            save_state(path, st)
-            if results:
-                skips.append((results[0][2]["id"], f"cap top={top_score:.1f}"))
-            if event == "UserPromptSubmit":
-                emit(event, DIRECTIVE_LINE
-                     + "  (no cards this turn: rate cap)")
-            log(event, query, "skip (rate cap)", results, skips, qh)
-            return
-        st["bypass"].append(t)
-
-    cands = [r for r in results[:4] if r[0] >= SECOND_CARD_MIN] if results else []
-    if not results or top_score < thr:
-        if results:
-            skips.append((results[0][2]["id"], f"threshold {top_score:.1f}<{thr:.0f}"))
-        cands = []
-
-    # ---------------------------------------------------------- dense channel
-    dense = dense_hits(query) if event in DENSE_EVENTS else []
-    mode = "lexical"
-    if dense:
-        by_id = {c["id"]: c for c in cards}
-        have = {c["id"] for _s, _m, c in cands}
-
-        # RESCUE — only ADDS candidates, never reorders the lexical ones, so a
-        # query the lexical channel already answers is untouched. This is the path
-        # that catches a card the lexical channel did not reach AT ALL: the
-        # cross-lingual miss the hybrid channel exists for.
-        rescue = []
-        for cid, cos in dense[:DENSE_RESCUE_N]:
-            if cos < DENSE_MIN_COS or cid in have:
-                continue
-            c = by_id.get(cid)
-            if c is None or c["status"] == "superseded":
-                continue
-            if len(c["first"]) < RESCUE_MIN_FIRST_LEN:
-                continue
-            rescue.append((thr, [], c))
-        if rescue:
-            cands = cands + rescue
-            mode = "hybrid+rescue"
-
-        # RESERVED SLOT — off by default, and it is a different policy from the
-        # rescue: the rescue cannot help when the slots are already spoken for,
-        # which is the case where a lexically-mediocre but semantically-right card
-        # is logged `slots-full` and never served. This gives the dense channel's
-        # best card THAT THE LEXICAL PICKS DO NOT ALREADY CONTAIN the last primary
-        # slot. Scoped to calls that were going to inject anyway: with no lexical
-        # candidate there is no contested slot, and "inject the nearest neighbour
-        # of every prompt" is a much noisier policy than this one.
-        # Measured caveat before you switch it on: on the very incident that
-        # motivated it, the dense channel ALSO ranked the wanted card third, so
-        # this lever did not fix it — raising MAX_PRIMARY did. Switch it on from
-        # your own log, not from this paragraph.
-        if DENSE_RESERVED_SLOT and cands:
-            have = {c["id"] for _s, _m, c in cands}
-            for cid, _cos in dense[:DENSE_RESCUE_N]:
-                if cid in have:
-                    continue
-                c = by_id.get(cid)
-                if c is None or c["status"] == "superseded":
-                    continue
-                if len(c["first"]) < RESCUE_MIN_FIRST_LEN:
-                    continue
-                keep = max(0, MAX_PRIMARY - 1)
-                cands = cands[:keep] + [(thr, [], c)] + cands[keep:]
-                mode = "hybrid+slot"
-                break
-
-    if not cands:
-        save_state(path, st)
-        if event == "UserPromptSubmit":
-            emit(event, DIRECTIVE_LINE
-                 + "  (no cards this turn: nothing above the bar)")
-        log(event, query, "silent (below threshold)", results, skips, qh)
-        return
-
-    text, used = build_injection(cands, cards, st["injected"], t, skips)
-    if not text:
-        save_state(path, st)
-        if event == "UserPromptSubmit":
-            emit(event, DIRECTIVE_LINE
-                 + "  (no cards this turn: the relevant ones already came up)")
-        log(event, query, "silent (all deduped)", results, skips, qh)
-        return
-
-    for kid in used:
-        st["injected"][kid] = t
-    st["recent"].append(t)
+    cards = sel.prepare_cards(ks.load_cards())
+    d = sel.decide(event, query, st, t, cards, PARAMS, dense_fn=dense_fn, job=job, query_hash=qh, pre=pre)
+    if d.searched:
+        ks.log_query(query, d.results, src=f"hook2:{event}")
     save_state(path, st)
+
+    text = d.text
+    if text and text.startswith("%DIRECTIVE%"):
+        note = text[len("%DIRECTIVE%"):].strip()
+        text = directive_line() + (("  (" + note + ")") if note else "")
+    elif text and event == "UserPromptSubmit":
+        text = text + "\n" + directive_line()
     if event == "UserPromptSubmit":
-        text += "\n" + DIRECTIVE_LINE
-    emit(event, text)
-    log(event, query, f"INJECT [{','.join(used)}] chars={len(text)}"
-        + ("" if mode == "lexical" else f" mode={mode}"), results, skips, qh)
+        text = _with_failopen(text or "", payload)
+    if text:
+        emit(event, text)
+    log(event, query, decision=d, qh=qh)
 
 
 if __name__ == "__main__":
     try:
         main()
-    except Exception as e:                      # fail open, always
-        try:
-            with open(P.INJECT_LOG, "a", encoding="utf-8") as f:
-                f.write(f"{datetime.datetime.now().astimezone().isoformat(timespec='seconds')}"
-                        f" | ERROR | {type(e).__name__}: {e}\n")
-        except OSError:
-            pass
+    except Exception as e:      # fail open, always
+        _append(LOG, f"{_stamp()} | ERROR | v2 {type(e).__name__}: {e}\n")
         sys.exit(0)

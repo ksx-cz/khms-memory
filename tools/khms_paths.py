@@ -62,6 +62,9 @@ DEFAULTS = [
     ("KHMS_INJECT_LOG", "${KHMS_STATE}/inject.log"),
     ("KHMS_PRECHECK_LOG", "${KHMS_STATE}/precheck.log"),
     ("KHMS_CLAIM_LOG", "${KHMS_STATE}/claim_gate.log"),
+    ("KHMS_PROPOSAL_LOG", "${KHMS_STATE}/proposal_gate.log"),
+    ("KHMS_STOP_LOG", "${KHMS_STATE}/stop_gate.log"),
+    ("KHMS_RECALL_INTENT", "${KHMS_STATE}/recall_intent.jsonl"),
     ("KHMS_HOOK_STATE", "${KHMS_STATE}/hook-state"),
     ("KHMS_HOOKS_OFF_FILE", "${KHMS_STATE}/hooks-off"),
     ("KHMS_LEN_CACHE", "${KHMS_STATE}/cardlen.json"),
@@ -76,6 +79,10 @@ DEFAULTS = [
     ("KHMS_TRANSCRIPTS", ""),
     ("KHMS_MESSAGES", "${KHMS_CONFIG_DIR}/messages.env"),
     ("KHMS_PATTERNS", "${KHMS_CONFIG_DIR}/patterns.env"),
+    ("KHMS_NIGHTLY_LOCK", "${KHMS_SHARED_STATE}/nightly.lock"),
+    ("KHMS_REPORT_TOOL", ""),                               # regex of the report tool ("" = built-in default)
+    ("KHMS_REPORT_CHANNEL", ""),                            # regex: prompts that open a report turn ("" = all)
+    ("KHMS_REPORT_SERVER", ""),                             # channel server name part ("" = built-in default)
 ]
 KEYS = [k for k, _ in DEFAULTS]
 _DEFAULT = dict(DEFAULTS)

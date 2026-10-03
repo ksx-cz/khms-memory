@@ -12,6 +12,12 @@ are NOT expanded). Absent file = English only. Keys:
   LINT_BLOCK_<n>=<label>::<regex> an extra unambiguous correction marker (case-sensitive), in file order
   LINT_CONTEXT_<n>=<label>::<regex> an extra correction phrase, matched on normalised (lower-case,
                                   diacritics stripped) lines that also talk about the record, in file order
+  HOOK_<NAME>=<value>             a matcher of khms_hook.py that REPLACES its English default
+                                  (regex(), value()) or extends it (words()); khms_hook.py names each key:
+                                  HOOK_CLAIM_KEYWORD, HOOK_CLAIM_HONEST, HOOK_DOMAIN, HOOK_PROPOSAL_MARKER,
+                                  HOOK_PROPOSAL_REF, HOOK_PROPOSAL_CHOICE, HOOK_PROPOSAL_SKIP,
+                                  HOOK_PROPOSAL_META, HOOK_PROPOSAL_STOPWORDS, HOOK_PROPOSAL_GENERIC
+  The hook's input is normalised before matching (lower-case, diacritics stripped) where its docstring says so.
 """
 import os
 import re
@@ -53,3 +59,25 @@ def labelled(prefix):
             label, rx = v.split("::", 1)
             out.append((label, re.compile(rx)))
     return out
+
+
+def value(key, default):
+    """The configured value of `key` (a replacement), or `default`."""
+    for k, v in _load():
+        if k == key and v:
+            return v
+    return default
+
+
+def regex(key, default, flags=0):
+    """A compiled matcher: the configured pattern of `key` REPLACES the default pattern."""
+    return re.compile(value(key, default), flags)
+
+
+def words(key, default, sep=None):
+    """A word list: the configured list of `key` (split on `sep`, whitespace by default) when set, else
+    `default`. Callers that EXTEND a built-in list pass an empty default and add their own."""
+    v = value(key, None)
+    if v is None:
+        return tuple(default)
+    return tuple(w.strip() for w in v.split(sep) if w.strip())
