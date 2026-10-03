@@ -123,3 +123,18 @@ class Allocation(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_a_bare_relative_counter_name_is_allocated_in_the_cwd(tmp_path, monkeypatch):
+    """Found by the #173 step-3c frozen comparison: `khms_triage_report.py --tomb-counter ctr` (a bare
+    name, dirname '') crashed in os.makedirs(''); the pre-allocator code wrote it in the cwd."""
+    root = tmp_path / "base"
+    (root / "memory" / "know").mkdir(parents=True)
+    monkeypatch.setenv("KHMS_ROOT", str(root))
+    monkeypatch.chdir(tmp_path)
+    tools = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools")
+    r = subprocess.run([sys.executable, "-c", "import sys; sys.path.insert(0, sys.argv[1]); import khms_alloc; "
+                        "print(khms_alloc.reserve('tombstone', 1, path='ctr')[0])", tools],
+                       capture_output=True, text=True, timeout=60, env=dict(os.environ, KHMS_ROOT=str(root)))
+    assert r.returncode == 0, r.stderr
+    assert (tmp_path / "ctr").exists()

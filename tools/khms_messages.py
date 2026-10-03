@@ -155,6 +155,10 @@ DEFAULTS = {
     "HOOK_STOP_REASON": ("REPORT OWED: the principal's last message came over the report channel (chat_id="
                          "{chat_id}, message_id={message_id}) and no successful report-tool call ({tool}) "
                          "followed it in this turn -- answer there; the principal does not see the terminal."),
+    # khms_contradict.py / khms_triage_report.py: the words that say what the base is about, in the judge's
+    # instructions ("You audit <domain> for CONTRADICTIONS") and the subject check ("... notes about <scope>").
+    "TRIAGE_KB_DOMAIN": "an engineering knowledge base",
+    "TRIAGE_SUBJECT_SCOPE": "one project",
 }
 
 _LOADED = None

@@ -98,7 +98,8 @@ def reserve(kind="card", n=1, floor_extra=0, path=None):
         raise AllocError(f"cannot reserve {n} ids")
     P.require_writable(f"reserve {kind} ids")
     spec = KINDS.get(kind) or {}
-    path = path or counter_path(kind)
+    # absolute: a bare relative counter name (`--tomb-counter ctr`) has no dirname to create
+    path = os.path.abspath(path or counter_path(kind))
     os.makedirs(P.SHARED_STATE, exist_ok=True)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(P.ALLOC_LOCK, "a+") as lock:

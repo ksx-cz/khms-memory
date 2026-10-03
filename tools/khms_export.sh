@@ -64,20 +64,52 @@ if [[ ! -d "$KNOW" ]]; then
 fi
 khms_code_lock || exit $?
 
-# THE GUARD IN FRONT OF --delete. A target is acceptable when it does not
-# exist, is empty, or carries a manifest this script wrote. Anything else is
-# somebody's directory and is left alone.
+# THE GUARDS IN FRONT OF EVERY WRITE, all checked before the first one, on CANONICAL paths (symlinks and
+# `..` resolved, so an alias cannot walk around them). Every path this script mutates -- the target, its
+# know/, archive/, archive/know/ and manifest.json -- must
+#   1. be writable for this deployment: a reader (KHMS_READ_ONLY=1) may build an independent copy OUTSIDE
+#      the base, its config and the shared state, never inside them (khms_may_write);
+#   2. not overlap a SOURCE tree (the base's know/ and archive/know/): not the tree, not inside it, not an
+#      ancestor of it -- `rm -rf <target>/archive` with <target> = <base>/memory would delete the source
+#      archive, and an rsync --delete into the source would empty it.
+# And the target must not exist, be empty, or carry a manifest THIS tool wrote (its "tool" field names
+# khms_export.sh, or build_kb_snapshot.sh, the name of its predecessor): a file merely called manifest.json
+# proves nothing, so anything else is somebody's directory and is left alone.
+canon() { realpath -m -- "$1"; }
+overlaps() {   # overlaps A B -> rc 0 when A is B, inside B, or an ancestor of B (canonical paths)
+  local a b; a="$(canon "$1")"; b="$(canon "$2")"
+  [ "$a" = "$b" ] && return 0
+  case "$a/" in "${b%/}/"*) return 0 ;; esac
+  case "$b/" in "${a%/}/"*) return 0 ;; esac
+  return 1
+}
+for p in "$TARGET" "$TARGET/know" "$TARGET/archive" "$TARGET/archive/know" "$TARGET/manifest.json"; do
+  if ! khms_may_write "$p"; then
+    echo "khms_export.sh: read-only deployment (KHMS_READ_ONLY=1): $(canon "$p") is inside the base," >&2
+    echo "  its config or the shared state; export to a directory outside them. Nothing was written." >&2
+    exit 4
+  fi
+  for src in "$KNOW" "$ARCHIVE"; do
+    if overlaps "$p" "$src"; then
+      echo "khms_export.sh: $(canon "$p") overlaps the source tree $(canon "$src") —" >&2
+      echo "  refusing: an export never writes to or deletes from what it reads. Nothing was written." >&2
+      exit 1
+    fi
+  done
+done
 if [[ -e "$TARGET" ]]; then
   if [[ ! -d "$TARGET" ]]; then
     echo "khms_export.sh: $TARGET exists and is not a directory" >&2
     exit 1
   fi
-  if [[ -n "$(ls -A "$TARGET" 2>/dev/null)" && ! -f "$TARGET/manifest.json" ]]; then
-    echo "khms_export.sh: $TARGET is not empty and has no manifest.json —" >&2
+  if [[ -n "$(ls -A "$TARGET" 2>/dev/null)" ]] \
+     && ! grep -Eq '"tool": "(khms_export\.sh|build_kb_snapshot\.sh)"' "$TARGET/manifest.json" 2>/dev/null; then
+    echo "khms_export.sh: $TARGET is not empty and holds no manifest written by this tool —" >&2
     echo "  refusing to --delete inside a directory this script did not build." >&2
     exit 1
   fi
 fi
+TARGET="$(canon "$TARGET")"
 
 mkdir -p "$TARGET/know"
 rsync -a --delete --include='K-*.md' --exclude='*' "$KNOW/" "$TARGET/know/"

@@ -134,9 +134,16 @@ DATES="$(for f in "$INBOX"/*.md; do
            case "$b" in *.converted.md|*.approve.md|*.applied.md|*.preview.md) continue ;; esac
            printf '%s\n' "$b" | sed -E 's/^([0-9]{4}-[0-9]{2}-[0-9]{2})(-weekly)?.*/\1\2/'
          done | sort -u)"
-# Today's triage is expected even when its file is absent — that absence is the finding.
-case "$DATES" in *"$TODAY"*) ;; *) DATES="$DATES
+# Today's triage is expected even when its file is absent — that absence is the finding — but only
+# while the night runs a triage stage at all (KHMS_NIGHT_TRIAGE configured). A stage that is OFF is
+# not a sweep that failed: the night's own log says OFF, and so does this ping (by saying nothing).
+# Triage files already in the inbox are offered for review either way.
+TRIAGE_ON=0
+[ -n "$(khms_get KHMS_NIGHT_TRIAGE)" ] && TRIAGE_ON=1
+if [ "$TRIAGE_ON" = 1 ]; then
+  case "$DATES" in *"$TODAY"*) ;; *) DATES="$DATES
 $TODAY" ;; esac
+fi
 
 # CARD REVIEW IS PER UNIT (Diblin review of #209 A, P1-3, 2026-10-01). A date can hold several
 # units — DATE.md, DATE-weekly.md and every published nightly batch <night>-bNN.md — and a
@@ -204,7 +211,7 @@ exists and decided nothing; re-run the sweep, this is not a result to review)"
         else
           t="triage: PENDING$ratio"
         fi
-      elif [ "$d" = "$TODAY" ] && [ ! -f "$MARKERS/.reviewed-$d-triage" ]; then
+      elif [ "$TRIAGE_ON" = 1 ] && [ "$d" = "$TODAY" ] && [ ! -f "$MARKERS/.reviewed-$d-triage" ]; then
         # NOT the same thing as "the triage found nothing": the file is either still being
         # written by a live sweep or the sweep died. Say which — on 2026-09-02 this script
         # reported neither and the missing file passed for a clean night.
