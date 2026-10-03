@@ -28,7 +28,7 @@ ROOT=""
 for a in "$@"; do
   case "$a" in
     --register) REGISTER=1 ;;
-    -h|--help) sed -n '2,23p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,22p' "$0"; exit 0 ;;
     -*) echo "khms_init: unknown option $a" >&2; exit 2 ;;
     *) [ -z "$ROOT" ] || { echo "khms_init: one base directory, please" >&2; exit 2; }; ROOT="$a" ;;
   esac
