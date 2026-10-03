@@ -8,7 +8,7 @@ query is then a single forward pass (~65-95 ms) plus a 1113x1024 matmul (<2 ms).
 
 PROTOCOL: newline-delimited JSON over AF_UNIX (SOCK_STREAM).
   request : {"q": "<query text>", "topn": 20}                      (op "query")
-  response: {"ok": true, "model": "<slug>", "hits": [["K-00880", 0.71], ...]}
+  response: {"ok": true, "model": "<slug>", "hits": [["K-90880", 0.71], ...]}
             {"ok": false, "err": "..."}
   request : {"op": "embed", "model": "<slug>", "texts": ["...", ...]}
   response: {"ok": true, "model": "<slug>", "vectors": [[...], ...]}

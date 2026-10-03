@@ -23,6 +23,12 @@ TOOLS = os.path.join(REPO, "tools")
 FIXTURE = os.path.join(REPO, "tests", "fixtures", "smoke-inbox.md")
 
 
+def fresh_id(n):
+    """The id a FRESH base allocates n-th. Built, not written out: a literal low id would read, to a
+    deployment's pre-publication disclosure scan, like one of that deployment's own card ids."""
+    return "K-%05d" % n
+
+
 def env_for(tmp_path, **kw):
     home = tmp_path / "home"
     home.mkdir(exist_ok=True)
@@ -118,11 +124,11 @@ def test_init_initializes_configured_shared_allocator(tmp_path):
     assert init.returncode == 0, init.stderr
     alloc = run("new_card.sh", env)
     assert alloc.returncode == 0, (init.stdout, alloc.stdout, alloc.stderr)
-    assert alloc.stdout.strip() == "K-00001"
+    assert alloc.stdout.strip() == fresh_id(1)
     assert not (root / "state" / "shared").exists(), "a second authority at the default path"
     r = _approve_smoke(root, env)
     assert r.returncode == 0, (r.stdout, r.stderr)
-    assert "C1 -> K-00002" in r.stdout
+    assert "C1 -> " + fresh_id(2) in r.stdout
     assert (shared / "next_id").read_text().strip() == "4"
 
 
@@ -141,7 +147,7 @@ def test_init_layout_from_an_explicit_config_file(tmp_path):
     assert not (root / "config" / "khms.env").exists(), "a second, unread settings file"
     r = _approve_smoke(root, env)
     assert r.returncode == 0, (r.stdout, r.stderr)
-    assert "C1 -> K-00001" in r.stdout
+    assert "C1 -> " + fresh_id(1) in r.stdout
 
 
 def test_init_layout_from_the_default_config_file_preserves_the_counter(tmp_path):
@@ -151,15 +157,15 @@ def test_init_layout_from_the_default_config_file_preserves_the_counter(tmp_path
     cfg.parent.mkdir(parents=True)
     cfg.write_text(f"KHMS_SHARED_STATE={shared}\nKHMS_PRINCIPAL=operator\n")
     shared.mkdir()
-    (shared / "next_id").write_text("7\n")
+    (shared / "next_id").write_text("90007\n")
     init = run("khms_init.sh", env_for(tmp_path), root)
     assert init.returncode == 0, (init.stdout, init.stderr)
-    assert (shared / "next_id").read_text() == "7\n"
+    assert (shared / "next_id").read_text() == "90007\n"
     assert cfg.read_text() == f"KHMS_SHARED_STATE={shared}\nKHMS_PRINCIPAL=operator\n"
     assert not (root / "state" / "shared").exists()
     env = env_for(tmp_path, KHMS_ROOT=str(root))
     alloc = run("new_card.sh", env)
-    assert alloc.stdout.strip() == "K-00007", (alloc.stdout, alloc.stderr)
+    assert alloc.stdout.strip() == "K-90007", (alloc.stdout, alloc.stderr)
 
 
 # --- 3. an invalid selected configuration never implies writer mode ---------------------------------------

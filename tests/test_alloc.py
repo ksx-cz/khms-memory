@@ -100,10 +100,10 @@ class Allocation(unittest.TestCase):
 
     def test_counter_never_goes_below_an_existing_card(self):
         know = os.path.join(self.root, "memory", "know")
-        open(os.path.join(know, "K-00050.md"), "w").write("---\nid: K-00050\n---\nx\n")
+        open(os.path.join(know, "K-90050.md"), "w").write("---\nid: K-90050\n---\nx\n")
         r = self.run_cmd([os.path.join(TOOLS, "new_card.sh")])
-        self.assertEqual(r.stdout.strip(), "K-00051")
-        self.assertEqual(self.counter(), 52)
+        self.assertEqual(r.stdout.strip(), "K-90051")
+        self.assertEqual(self.counter(), 90052)
 
     def test_a_corrupt_counter_is_refused_not_guessed(self):
         path = os.path.join(self.root, "state", "shared", "next_id")

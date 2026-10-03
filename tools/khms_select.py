@@ -13,12 +13,12 @@ hook did not import this module and the docstring said so; it has imported it
 since, and khms_hook_v2.py — the pre-swap copy that still matched the old
 sentence — was deleted on 2026-09-04.)
 
-The parameter set is §7 CONFIGURATION (K-01553: "parameter values … are to be
-calibrated, not invented"). LIVE reproduces khms_hook.py exactly:
+The parameter set is §7 CONFIGURATION (the retrieval policy: "parameter values … are
+to be calibrated, not invented"). LIVE reproduces khms_hook.py exactly:
     dedup_ttl=inf, damp_alpha=0, bypass_min=inf, dense_events=(), job_filter=off
 so `decide(..., LIVE)` is the control arm of every experiment.
 
-Implements K-01553(a)+(b) and the four F10 defects:
+Implements the retrieval policy's (a)+(b) and the four F10 defects:
   (b)  dedup TTL                     — dedup_ttl
   F10c length attractors             — damp_alpha / damp_pivot
   F10c rate cap spends first-come    — bypass_min / bypass_events
@@ -70,7 +70,7 @@ class Params:
     rescue_min_first_len: int = 0   # a rescue is served as its FIRST LINE only
     # Finding #1 of the 2026-09-04 injection experiment (tools/khms_experiment.md):
     # replaying the owner's 09:19 prompt under the PRE-experiment policy logged
-    # `INJECT [K-00562,K-00857] … skipped=K-00542:slots-full` — the dense channel
+    # `INJECT [A,B] … skipped=C:slots-full` — the dense channel
     # HAD the card that answered the question and the two-slot budget had no room
     # for it. This is the lever for that: when True, the dense channel's rank-1
     # card takes the LAST primary slot whenever the lexical picks do not already
@@ -105,9 +105,9 @@ V2 = Params(
 
 # ------------------------------------------------------------------- KHMS jobs
 # The nightly/weekly pipeline talks to the same harness, so its prompts hit the
-# same hook. Measured (F10a): the consolidate stage drew K-00203 (dump-bed Cytron
-# wiring) twice and the weekly synthesis drew K-00080 ("neither npm nor
-# passwordless sudo"). These markers are the literal first lines of
+# same hook. Measured (F10a): the consolidate stage drew an unrelated wiring card
+# twice and the weekly synthesis drew a card about missing tooling. These markers
+# are the literal first lines of
 # tools/prompts/*.md and of khms_review_ping.sh's message.
 # The list is configuration (KHMS_MESSAGES key JOB_MARKERS): a deployment whose
 # review ping is worded differently names its own prefix there.
@@ -127,7 +127,7 @@ def is_job_prompt(query, env=None):
 
 
 # -------------------------------------------------------- risky-command class
-# K-01553(a): precheck.sh stops being a duty the actor must remember. The class
+# Retrieval policy (a): precheck.sh stops being a duty the actor must remember. The class
 # is the one the policy card names; the tags are what precheck.sh can match on.
 RISKY = [
     (re.compile(r"rsync\b[^\n|;]*--delete"), ("deployment", "jetson")),
@@ -278,9 +278,9 @@ REPORT_DIRECTIVE_FOUND = M.msg("REPORT_DIRECTIVE_FOUND")
 
 
 def _fresh(cid, injected, t, p):
-    """Dedup with a TTL (K-01553b). LIVE: dedup_ttl == inf → never fresh again,
-    which is what silenced the top-scoring K-00058 on 2026-08-17 after it was
-    injected on 2026-08-14 in the same still-open session."""
+    """Dedup with a TTL (retrieval policy (b)). LIVE: dedup_ttl == inf → never fresh
+    again, which is what once silenced the top-scoring card three days after it was
+    injected in the same still-open session."""
     ts = injected.get(cid)
     if ts is None:
         return True
@@ -311,10 +311,10 @@ def build_injection(cands, cards, injected, t, p, skips):
     2026-08-28 that only happened for cards already marked challenged/refuted/
     superseded — but a correction arrives BEFORE anyone re-statuses the old card,
     and the old card stays `active` in the meantime. That is exactly what
-    happened with K-00448/K-00449 (July: "IMU branches have no pull-ups, keep
-    them disconnected", still `active`) versus K-02006 (2026-08-24, owner: the
-    pull-ups are installed): the reverse index knew, the status gate hid it, and
-    the stale July card was recited to the owner four days later.
+    happened in the source deployment: two cards ("the sensor branches have no
+    pull-ups, keep them disconnected", still `active`) versus their correction (the
+    operator: the pull-ups are installed): the reverse index knew, the status gate
+    hid it, and the stale card was recited to the operator four days later.
     """
     by_id = {c["id"]: c for c in cards}
     rev = ks.reverse_correctors(cards)
@@ -530,8 +530,8 @@ def decide(event, query, state, t, cards, p, dense_fn=None, job=None,
     # Reserved dense slot (finding #1, 2026-09-04; OFF in LIVE and V2).
     # The rescue above only fires for cards the lexical channel did not reach
     # AT ALL and only above dense_min_cos — it cannot help when the slots are
-    # already spoken for, which is exactly what happened to K-00542 (logged
-    # `K-00542:slots-full`). This gives the dense channel's rank-1 card the LAST
+    # already spoken for, which is exactly what happened in the motivating case
+    # (logged `<id>:slots-full`). This gives the dense channel's rank-1 card the LAST
     # primary slot instead of the weakest lexical pick. Deliberately scoped to
     # calls that were going to inject anyway: with no lexical candidate there is
     # no contested slot, and "inject the nearest neighbour of every prompt" is a
@@ -541,9 +541,9 @@ def decide(event, query, state, t, cards, p, dense_fn=None, job=None,
         have = {x[2]["id"] for x in cands}
         # "the dense channel's top hit THAT THE LEXICAL PICKS DO NOT CONTAIN",
         # not "dense rank 1". Measured on the case this lever exists for (the
-        # owner's 09:19 prompt, 2026-09-04): dense rank 1 was K-00562, which the
-        # picks already held, so a strict rank-1 rule left the decision exactly
-        # as it was and K-00542 stayed `slots-full` — a lever inert on its own
+        # operator's prompt of 2026-09-04): dense rank 1 was a card the picks
+        # already held, so a strict rank-1 rule left the decision exactly as it
+        # was and the answering card stayed `slots-full` — a lever inert on its own
         # motivating example. Scan depth = dense_rescue_n, the same depth the
         # rescue above trusts.
         for cid, _cos in dense[:p.dense_rescue_n]:

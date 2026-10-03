@@ -5,12 +5,12 @@ Usage: run through tools/recall.sh [--lexical] <query ...>
 
 HISTORY. 2026-08-09 (WP-E) added the dense channel as strictly OPT-IN
 (`recall.sh --dense` / KHMS_DENSE=1), so the default path stayed byte-identical
-lexical. 2026-09-04 measured what that cost: card K-00542 (Foxglove loads
-meshes Y-up, ROS is Z-up) existed since 2026-07-29 and did not fire in three
-incidents (07-27, 08-09, 09-04); the owner's Czech sentence returns it at
-lexical rank 7 / not at all, and at dense-fused rank 1. The opt-in was the
-defect (K-02517, K-01867: an English KB queried in Czech owes the system a
-working cross-lingual channel, and that channel was switched off by default).
+lexical. 2026-09-04 measured what that cost: a card about a viewer's mesh axis
+convention existed for five weeks and did not fire in three incidents; the
+operator's sentence in another language returns it at lexical rank 7 / not at
+all, and at dense-fused rank 1. The opt-in was the defect (an English KB queried
+in another language owes the system a working cross-lingual channel, and that
+channel was switched off by default).
 
 WHAT CHANGED (2026-09-04):
   * recall.sh routes EVERY invocation here. The dense channel is used unless
@@ -36,7 +36,7 @@ FUSION: reciprocal rank fusion, score = sum_channels 1/(k + rank), k=60.
 Rank-based, so the two channels' incomparable score scales (lexical idf sums of
 10-60 vs. cosine 0-1) never need calibrating. Both candidate lists are capped
 (top CAND each) — that cap is what stops the dense channel from flooding an
-exact-identifier query where lexical is already right, which K-00601 warns is
+exact-identifier query where lexical is already right, which the decision to add it warns is
 the specific risk of adding embeddings ("an embedding would blur the exact token
 that is the signal").
 
@@ -205,13 +205,13 @@ def link_lines(c, by_id, superseded_by, contradicted_by, limit=LINK_MAX):
 def freshness_lines(cards, model=MODEL, max_cards=FRESH_MAX):
     """-> lines to print BEFORE the answer, [] when the index is level.
 
-    WHY (EMBSTALE #168, K-02856 + K-02868, three occurrences in two days): the
+    WHY (three occurrences in two days in the source deployment): the
     lexical channel is a stateless scan and cannot go stale, but the dense half
     reads a FILE. When that file is behind — a crash, a half-finished refresh, a
     card written by hand — recall still answers, cleanly, confidently and
     without the newest cards in it. An answer that looks identical whether or
-    not the thing it depends on is healthy is not an answer (K-00585), and
-    "remember to rebuild the index" is not a measure (K-00500).
+    not the thing it depends on is healthy is not an answer, and "remember to
+    rebuild the index" is not a measure.
 
     So: compare the index against the cards on disk (one sha1 each over cards
     already loaded for the lexical channel, ~30 ms), and then REFRESH — through

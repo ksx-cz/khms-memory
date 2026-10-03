@@ -19,10 +19,10 @@ Asking the model to link is a request (the consolidate prompt has asked for
 links since 2026-07-27).  This is the check.  Every candidate must carry exactly
 one line:
 
-    RELATION: supersedes K-01234 BECAUSE <one sentence>
-    RELATION: supports K-01234
-    RELATION: contradicts K-01234
-    RELATION: new — nearest K-01234 unrelated because <one sentence>
+    RELATION: supersedes K-90123 BECAUSE <one sentence>
+    RELATION: supports K-90123
+    RELATION: contradicts K-90123
+    RELATION: new — nearest K-90123 unrelated because <one sentence>
 
 The id must EXIST; a `supersedes` target must still be LIVE — `status: active`
 or `status: challenged` (an edge onto an already-superseded, refuted or
@@ -38,7 +38,7 @@ review can rescue anything by moving it back.
 
 Exit 0 when nothing was dropped, 1 when something was (NON-FATAL in the
 pipeline: wired with `|| true`, exactly like verify_quotes.py, whose fatal
-`set -e` death cost every nightly from 2026-07-28 — K-00490), 2 on a usage or
+`set -e` death once cost every nightly for days), 2 on a usage or
 format error.
 """
 import argparse
@@ -84,7 +84,7 @@ SUPPORTS_RE = re.compile(r"^(supports|contradicts)\s+(K-\d{5})\b\s*(.*)$", re.I)
 # gate dropped 5 of 20 valid candidates in one night (C7, C8, C10, C12, C15 of
 # the 2026-09-15 inbox), every one of which gave the justification in a
 # PARENTHESIS — "unrelated (an earlier watchdog gotcha list, not a build
-# cycle)" — instead of after "because".  That is K-02720's class exactly: a
+# cycle)" — instead of after "because".  That is a known class exactly: a
 # pipeline parser that accepts one exact textual form drops valid content, and
 # the content looks like a night that produced nothing.  The justification is
 # still MANDATORY: `unrelated` with nothing after it does not match.
@@ -263,49 +263,49 @@ def self_test():
         know, arch = os.path.join(d, "know"), os.path.join(d, "arch")
         os.makedirs(know)
         os.makedirs(arch)
-        for cid, status in (("K-00001", "active"), ("K-00003", "superseded"),
-                            ("K-00005", "challenged"), ("K-00006", "refuted")):
+        for cid, status in (("K-90001", "active"), ("K-90003", "superseded"),
+                            ("K-90005", "challenged"), ("K-90006", "refuted")):
             open(os.path.join(know, f"{cid}.md"), "w").write(
                 f"---\nid: {cid}\nstatus: {status}\n---\nbody\n")
-        open(os.path.join(arch, "K-00004.md"), "w").write(
-            "---\nid: K-00004\nstatus: active\n---\nbody\n")
-        near = ("NEAREST: K-00001 (1.0), K-00003 (0.5), K-00005 (0.4), "
-                "K-00006 (0.3)\n")
+        open(os.path.join(arch, "K-90004.md"), "w").write(
+            "---\nid: K-90004\nstatus: active\n---\nbody\n")
+        near = ("NEAREST: K-90001 (1.0), K-90003 (0.5), K-90005 (0.4), "
+                "K-90006 (0.3)\n")
         cases = [
             ("supersedes active",
-             near + "RELATION: supersedes K-00001 BECAUSE it was mismeasured.",
+             near + "RELATION: supersedes K-90001 BECAUSE it was mismeasured.",
              "OK"),
-            ("supports active", near + "RELATION: supports K-00001", "OK"),
+            ("supports active", near + "RELATION: supports K-90001", "OK"),
             ("new naming a nearest id",
-             near + "RELATION: new — nearest K-00001 unrelated because other "
+             near + "RELATION: new — nearest K-90001 unrelated because other "
                     "subsystem.", "OK"),
             # 2026-09-15: the justification may be parenthetical or after a
             # dash/colon — the gate wants the reason, not the word "because".
             ("new, parenthetical justification",
-             near + "RELATION: new — nearest K-00001 unrelated (an earlier "
+             near + "RELATION: new — nearest K-90001 unrelated (an earlier "
                     "watchdog gotcha list, not a build cycle).", "OK"),
             ("new, dash justification",
-             near + "RELATION: new — nearest K-00001 unrelated — other "
+             near + "RELATION: new — nearest K-90001 unrelated — other "
                     "subsystem.", "OK"),
             ("new, no justification at all",
-             near + "RELATION: new — nearest K-00001 unrelated", "DROP"),
-            ("archived target", near + "RELATION: supports K-00004", "FLAG"),
+             near + "RELATION: new — nearest K-90001 unrelated", "DROP"),
+            ("archived target", near + "RELATION: supports K-90004", "FLAG"),
             ("no relation", near + "DECIDED: nothing.", "DROP"),
             ("supersedes a superseded card",
-             near + "RELATION: supersedes K-00003 BECAUSE stale.", "DROP"),
+             near + "RELATION: supersedes K-90003 BECAUSE stale.", "DROP"),
             # G2: the target most in need of superseding is a CHALLENGED one.
             ("supersedes a challenged card",
-             near + "RELATION: supersedes K-00005 BECAUSE remeasured on a fixed "
+             near + "RELATION: supersedes K-90005 BECAUSE remeasured on a fixed "
                     "rig.", "OK"),
             ("supersedes a refuted card",
-             near + "RELATION: supersedes K-00006 BECAUSE stale.", "DROP"),
-            ("unknown id", near + "RELATION: supports K-09999", "DROP"),
-            ("malformed verb", near + "RELATION: refines K-00001", "DROP"),
+             near + "RELATION: supersedes K-90006 BECAUSE stale.", "DROP"),
+            ("unknown id", near + "RELATION: supports K-99999", "DROP"),
+            ("malformed verb", near + "RELATION: refines K-90001", "DROP"),
             ("new naming a non-nearest id",
-             near + "RELATION: new — nearest K-00004 unrelated because x.",
+             near + "RELATION: new — nearest K-90004 unrelated because x.",
              "DROP"),
             ("two relation lines",
-             near + "RELATION: supports K-00001\nRELATION: contradicts K-00001",
+             near + "RELATION: supports K-90001\nRELATION: contradicts K-90001",
              "DROP"),
         ]
         for name, body, want in cases:

@@ -24,12 +24,12 @@
 # 2026-08-09 (WP-E): the dense (embedding) channel arrived as OPT-IN, behind
 # `--dense` / KHMS_DENSE=1.
 #
-# 2026-09-04: THE DEFAULT IS HYBRID. The opt-in was the defect. K-00542
-# (Foxglove loads meshes Y-up, ROS is Z-up) had been in the base since
-# 2026-07-29 and did not fire in three incidents; on the owner's Czech sentence
-# the lexical channel puts it at rank 7 and the fused ranking at rank 1
-# (K-02517; K-01867: an English base queried in Czech owes the system a working
-# cross-lingual channel, and that channel was switched off by default).
+# 2026-09-04: THE DEFAULT IS HYBRID. The opt-in was the defect. A card about a
+# viewer's mesh axis convention had been in the base for five weeks and did not
+# fire in three incidents; on the operator's sentence in another language the
+# lexical channel puts it at rank 7 and the fused ranking at rank 1 (an English
+# base queried in another language owes the system a working cross-lingual
+# channel, and that channel was switched off by default).
 # Everything now goes through khms_recall_hybrid.py, which uses the dense
 # channel unless it is opted out of or the daemon does not answer in 150 ms:
 #   recall.sh <...>              hybrid (default)
@@ -38,7 +38,7 @@
 # The first printed line always names the channel that ANSWERED, and the
 # .recall.log line carries it too (src=cli:hybrid:bge / src=cli:lexical:fallback
 # / src=cli:lexical:optout), so a silent fail-back to the channel that caused
-# the miss is countable instead of invisible (K-00453).
+# the miss is countable instead of invisible.
 set -euo pipefail
 [ $# -ge 1 ] || { echo "usage: recall.sh [--lexical] <symptom/error/identifier ...>" >&2; exit 2; }
 exec python3 "$(dirname "$(readlink -f "$0")")/khms_recall_hybrid.py" "$@"

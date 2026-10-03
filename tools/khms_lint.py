@@ -8,24 +8,23 @@ One rule today, and it exists because of a measured failure:
   A card whose body says it CORRECTS something must carry a graph edge naming
   what it corrects.
 
-2026-07-25 measured K-00448/K-00449 ("bed IMU on mux ch1 has no pull-ups, keep
-it disconnected").  2026-08-24 the owner corrected that in person ("pull upy tam
-mame… to jsme meli odladeny") and K-02006 was written, opening with the word
-CORRECTED — but with `links: {contradicts: [], supersedes: null}`.  On
-2026-08-28 the July cards were recited to the owner as current, because nothing
-in the base connected them to their own correction: the retrieval layer can only
-follow edges, and there was no edge.  K-02006's body already carried the lesson
-as prose ("cards must be read with their date"), which is exactly K-00801's
-point — writing the lesson down is not a mechanism.  The mechanism is this
-refusal plus the reverse injection in the hook.
+In the source deployment two cards measured that a sensor branch "has no pull-ups,
+keep the device disconnected".  A month later the operator corrected that in
+person and a new card was written, opening with the word CORRECTED — but with
+`links: {contradicts: [], supersedes: null}`.  Four days later the old cards were
+recited to the operator as current, because nothing in the base connected them to
+their own correction: the retrieval layer can only follow edges, and there was no
+edge.  The correcting card's body already carried the lesson as prose ("cards must
+be read with their date") — and writing a lesson down is not a mechanism.  The
+mechanism is this refusal plus the reverse injection in the hook.
 
-The vocabulary is the spec's (K-00024 §4.10): derived_from / supports /
+The vocabulary is the spec's (spec/ §4.10): derived_from / supports /
 contradicts / supersedes / refuted_by.  There is no `refines` link; a correction
 uses `contradicts` (mutual conflict, symmetric) or `supersedes` (replacement,
 body must then read SUPERSEDES K-x BECAUSE …).
 
-Escape hatch, deliberately visible in the record (K-00500: a measure is a step
-that can be seen to have been taken): a card that genuinely corrects something
+Escape hatch, deliberately visible in the record (a measure is a step that can
+be seen to have been taken): a card that genuinely corrects something
 never carded writes
 
     NO-CORRECTION-TARGET: <why nothing in the base can be pointed at>
@@ -51,18 +50,18 @@ CARD_ID_RE = re.compile(r"\bK-\d{5}\b")
 # the 2187-card base of 2026-08-28: the flat word list fires on 476 cards (22 %
 # of everything, 270 of them on the Czech stem "oprav*", which in a robotics
 # base overwhelmingly means *repair*).  A lint that fires on a fifth of all
-# cards gets switched off, which is the K-00500 failure mode, so:
+# cards gets switched off, and a switched-off check measures nothing, so:
 #
 #   BLOCK — the KHMS body markers, upper-case, as the spec and the card corpus
-#           actually write them (K-00024 §4.2: "SUPERSEDES K-x BECAUSE";
-#           K-02006 opens with "CORRECTED (owner: …)").  Unambiguous.
+#           actually write them (spec §4.2: "SUPERSEDES K-x BECAUSE"; a
+#           correcting card opens with "CORRECTED (owner: …)").  Unambiguous.
 #   CONTEXT — everything else, only on a line that ALSO talks about the record
 #           (a K-id, "card", "knowledge base", plus deployment vocabulary from
 #           khms_patterns.py).  "We fixed the cable" does not fire; "correction
-#           of card K-00448" does.
+#           of card K-xxxxx" does.
 #
 # Same list of words the rule names, anchored so each means what the rule means.
-# Calibrated together: 41 of 2187 cards (1.9 %), K-02006 among them.
+# Calibrated together: 41 of 2187 cards (1.9 %), the motivating correction among them.
 BLOCK_PATTERNS = (
     ("CORRECTED", re.compile(r"\bCORRECT(ED|ION|IONS|S)\b")),
     # ACTIVE voice only: "SUPERSEDES K-x" is the replacing card speaking. The
@@ -160,7 +159,7 @@ def check_correction_edges(card_id, meta, body, known_ids=None):
             f"K-xxxxx (replacement — body must then contain 'SUPERSEDES K-xxxxx "
             f"BECAUSE: …'), or links.refuted_by: [K-xxxxx]. Without that edge the "
             f"corrected card is still served alone and the correction is never "
-            f"reached (measured 2026-08-28: K-00448/K-00449 recited over K-02006). "
+            f"reached (measured: old cards recited over their own correction). "
             f"If nothing in the base can be pointed at, say so in the body: "
             f"'NO-CORRECTION-TARGET: <reason>'.")
     if known_ids is not None:
@@ -191,7 +190,7 @@ def check_correction_edges(card_id, meta, body, known_ids=None):
 #
 # Both are wired into approve_inbox.py (before an id is spent) and build_views.py (over the
 # whole base, loud) — the mechanism lives in the artefact that would otherwise fail
-# (K-00801), not in a rule someone has to remember.
+# (writing a lesson down is not a mechanism), not in a rule someone has to remember.
 
 ERRATUM_BLOCK_RE = re.compile(r"^ERRATUM (TS-\d{5}) \(.*?(?=\n\s*\n|\Z)", re.S | re.M)
 ERRATUM_MARK_RE = re.compile(r"\[ERRATUM\s+(TS-\d{5})\]")   # \s+: survives a re-wrap
@@ -307,7 +306,7 @@ def _main(argv):
     known = {os.path.basename(p)[:-3] for p in paths}
     # ... and every card that already lives beside them: a single-file lint of a
     # superseding card used to report its (existing) target as 'points at nothing'
-    # (2026-09-04, K-02519 -> K-02518), because only the batch was 'known'.
+    # (measured once in the source deployment), because only the batch was 'known'.
     known |= known_card_ids(os.path.dirname(os.path.abspath(paths[0])))
     # An edge may legitimately point into the fog: superseded and condensed cards
     # move to memory/archive/know/. Counting those as "points at nothing" turned

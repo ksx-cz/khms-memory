@@ -2,7 +2,7 @@
 """KHMS dense index builder — one vector per card, incremental.
 
 WHY THIS EXISTS: lexical recall (khms_search.py) is precise on identifiers and
-blind to paraphrase. K-00601 decided embeddings are an ADDED channel, never a
+blind to paraphrase. Embeddings were decided to be an ADDED channel, never a
 replacement — "for symptoms and identifiers lexical search is more precise, an
 embedding would blur the exact token that is the signal". This builds the added
 channel; fusion and the ship decision live elsewhere.
@@ -23,8 +23,9 @@ the WEIGHTS live outside the brain, in ~/models, and must stay there.
 
 FRESHNESS (2026-09-23, EMBSTALE #168): this file used to be a thing somebody had
 to REMEMBER to run — cards written during the day were invisible to the dense
-half of recall until the 05:10 cron (K-02856, K-02868), silently, which is the
-K-00585 shape. It is now called from both sides: `build_views.py` refreshes the
+half of recall until the early-morning cron, silently — an answer that looks
+the same whether or not its index is current. It is now called from both sides:
+`build_views.py` refreshes the
 index at the end of every card write, and `khms_recall_hybrid.py` refuses to
 answer over an index that is behind without saying so. Both go through
 `refresh()` below, and `refresh()` encodes through the ALREADY-WARM embed_server
@@ -371,7 +372,7 @@ def build(slug, rebuild=False, verbose=True, cards=None, via="auto"):
     # the two writes the manifest is the OLDER one — which makes the next
     # freshness check say "behind" and refresh again. Manifest-first would have
     # claimed cards were indexed that are not: silent, and the exact failure
-    # this whole mechanism exists to remove (K-00585).
+    # this whole mechanism exists to remove.
     _atomic(vpath, lambda fh: np.savez_compressed(fh, ids=np.array(ids),
                                                   vectors=V))   # '<U9', no pickle
     _atomic(mpath, lambda fh: fh.write(json.dumps(man_new).encode("utf-8")))

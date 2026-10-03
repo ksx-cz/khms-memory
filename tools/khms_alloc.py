@@ -2,7 +2,7 @@
 """khms_alloc.py -- the ONE identifier reservation primitive of a KHMS base.
 
 Usage:
-  khms_alloc.py card [N]        reserve N card ids (default 1), print them one per line (K-00042)
+  khms_alloc.py card [N]        reserve N card ids (default 1), print them one per line (K-90042)
   khms_alloc.py tombstone [N]   reserve N tombstone ids (TS-00007)
   khms_alloc.py --peek card     print the next card id without reserving anything
   import khms_alloc; khms_alloc.reserve("card", 3) -> [42, 43, 44]

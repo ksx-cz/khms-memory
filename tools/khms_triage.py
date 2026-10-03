@@ -193,7 +193,7 @@ def classify(card: dict, refuted_by_evidence: bool = False) -> Triage:
 
 
 # ------------------------------------------------- claim-level triage
-# WHY CLAIM GRANULARITY IS NOT OPTIONAL (K-00185, owner-verified 2026-08-31):
+# WHY CLAIM GRANULARITY IS NOT OPTIONAL (a motor card, operator-verified 2026-08-31):
 # that card is TRUE about the motor — identity, 100 N.m, 48 V, 600/800 W, gear ratio 5,
 # the 8-pin aviation connector, the SVD48V50A pairing, several of which exist nowhere else —
 # and FALSE about exactly one clause: it repeats the vendor page's default "13x5-6 tubeless
@@ -221,7 +221,7 @@ def split_claims(body: str) -> list[Claim]:
     """Cut a card body into independently-checkable assertions.
 
     Sentences first; then, inside a sentence that is a spec LIST ("Vendor-page specs: a, b,
-    c, ..."), on the commas as well — K-00185 puts fourteen separate vendor claims in one
+    c, ..."), on the commas as well — the motor card above puts fourteen separate vendor claims in one
     sentence and only one of them is wrong.
     """
     claims: list[Claim] = []
@@ -300,7 +300,7 @@ def triage_card(card: dict, false_claim_idx=None, refuted_by_evidence: bool = Fa
             f"{len(false_claims)} of {len(real)} claims false; the other {len(survivors)} "
             f"stand. Correct each false claim IN PLACE with tools/khms_erratum.py "
             f"(declare -> apply): the retracted wording stays inside the card in an ERRATUM "
-            f"block and gets one tombstone PER FALSE CLAIM (K-02396; owner 2026-09-20: a "
+            f"block and gets one tombstone PER FALSE CLAIM (operator policy 2026-09-20: a "
             f"wrong record is fixed, a refuted belief is kept). The card is not removed and "
             f"its status does not change.")
     elif frame_attempt and refuted_by_evidence:
@@ -355,7 +355,8 @@ def render_tombstone(ts_id, date, was, keys, claim, wrong, truth, recurrences, b
 
     `recurrences` is the load-bearing field: a repeat of the same wrong claim appends a date
     HERE instead of creating a second tombstone, so a tombstone with two or more dates is the
-    machine-readable statement that the previous countermeasure failed (K-00500, K-00801).
+    machine-readable statement that the previous countermeasure failed (writing a lesson
+    down is not a measure).
     """
     return (f"{ts_id} | {date} | was={was} | keys={','.join(keys)} | "
             f"claim=\"{claim}\" | wrong=\"{wrong}\" | truth={truth} | "

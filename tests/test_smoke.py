@@ -43,10 +43,10 @@ class FreshHome(unittest.TestCase):
         # idempotent: nothing replaced, counter and settings preserved
         with open(os.path.join(self.root, "config", "khms.env"), "a") as fh:
             fh.write("KHMS_PRINCIPAL=operator\n")
-        open(counter, "w").write("7\n")
+        open(counter, "w").write("90007\n")
         r = self.ok([os.path.join(TOOLS, "khms_init.sh"), "--register", self.root])
         self.assertIn("nothing created", r.stdout)
-        self.assertEqual(open(counter).read(), "7\n")
+        self.assertEqual(open(counter).read(), "90007\n")
         self.assertIn("KHMS_PRINCIPAL=operator", open(os.path.join(self.root, "config", "khms.env")).read())
         # a different registration is refused, never replaced
         other = os.path.join(self.tmp, "other base")
@@ -60,12 +60,12 @@ class FreshHome(unittest.TestCase):
         inbox = os.path.join(self.root, "memory", "inbox", "2026-03-05.md")
         shutil.copy(FIXTURE, inbox)
         r = self.ok([sys.executable, os.path.join(TOOLS, "approve_inbox.py"), inbox])
-        self.assertIn("C1 -> K-00007", r.stdout)
+        self.assertIn("C1 -> K-90007", r.stdout)
         self.assertIn("not installed (optional", r.stdout)
         r = self.ok([sys.executable, os.path.join(TOOLS, "build_views.py")])
         self.assertIn("dense index: not configured (optional", r.stdout)
         r = self.ok([os.path.join(TOOLS, "recall.sh"), "anemometer", "bearing"])
-        self.assertIn("K-00007", r.stdout)
+        self.assertIn("K-90007", r.stdout)
         self.assertIn("channel=lexical(dense not configured", r.stdout)
         self.ok([sys.executable, os.path.join(TOOLS, "khms_lint.py"), os.path.join(self.root, "memory", "know")])
         r = self.ok([sys.executable, os.path.join(TOOLS, "khms_hook.py")],

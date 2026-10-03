@@ -94,7 +94,7 @@ class HookCase(unittest.TestCase):
                  "input": {"command": "tools/recall.sh '%s'" % query}}]}},
             {"type": "user", "timestamp": iso(t), "message": {"content": [
                 {"type": "tool_result", "tool_use_id": tid, "is_error": not ok,
-                 "content": "K-00001 (0.03): a card"}]}})
+                 "content": "K-90001 (0.03): a card"}]}})
 
 
 # --- the proposal gate on a report ---------------------------------------------------------------------
@@ -264,14 +264,14 @@ class SwitchesAndContext(HookCase):
                 "tool_input": {"command": cmd}}
 
     def test_a_risky_command_gets_the_precheck_once_per_cooldown(self):
-        self.card("K-00001", ["deployment"])
+        self.card("K-90001", ["deployment"])
         ctx = self.context(self.bash("rm -rf /srv/build/old"))
         self.assertIn("risky command: deployment", ctx)
-        self.assertIn("K-00001", ctx)
+        self.assertIn("K-90001", ctx)
         self.assertEqual(self.context(self.bash("rm -rf /srv/build/older")), "")   # cooldown
 
     def test_an_ordinary_command_gets_no_precheck(self):
-        self.card("K-00001", ["deployment"])
+        self.card("K-90001", ["deployment"])
         self.assertNotIn("risky command", self.context(self.bash("ls -la")))
 
     def test_a_running_night_is_said_at_session_start(self):
@@ -324,10 +324,10 @@ class MessageCatalogue(unittest.TestCase):
     def test_a_deployment_messages_file_replaces_the_wording(self):
         code = ("import sys; sys.path.insert(0, %r)\n"
                 "import khms_select as s\n"
-                "old = {'id': 'K-00002', 'status': 'active', 'level': 'observation', 'tags': [],\n"
+                "old = {'id': 'K-90002', 'status': 'active', 'level': 'observation', 'tags': [],\n"
                 "       'links': {'supports': [], 'refuted_by': []}, 'first': 'old claim'}\n"
-                "new = {'id': 'K-00003', 'status': 'active', 'level': 'observation', 'tags': [],\n"
-                "       'links': {'supports': [], 'refuted_by': [], 'contradicts': ['K-00002']},\n"
+                "new = {'id': 'K-90003', 'status': 'active', 'level': 'observation', 'tags': [],\n"
+                "       'links': {'supports': [], 'refuted_by': [], 'contradicts': ['K-90002']},\n"
                 "       'first': 'the correction'}\n"
                 "print(s.build_injection([(40.0, [], old)], [old, new], {}, 1.0, s.V2, [])[0])\n" % TOOLS)
         with tempfile.TemporaryDirectory() as d:
@@ -338,8 +338,8 @@ class MessageCatalogue(unittest.TestCase):
             plain = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env)
             env["KHMS_MESSAGES"] = msgs
             custom = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env)
-        self.assertIn("! CORRECTED BY K-00003: the correction", plain.stdout, plain.stderr)
-        self.assertIn(">> FIXED BY K-00003: the correction", custom.stdout, custom.stderr)
+        self.assertIn("! CORRECTED BY K-90003: the correction", plain.stdout, plain.stderr)
+        self.assertIn(">> FIXED BY K-90003: the correction", custom.stdout, custom.stderr)
         self.assertNotIn("CORRECTED BY", custom.stdout)
 
 

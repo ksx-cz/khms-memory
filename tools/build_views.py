@@ -47,7 +47,8 @@ DER_TYPES = {"principle", "policy", "goal→method", "overview"}
 # `status` were validated, so the 2026-09-20 nightly's `type: observation
 # (problem→solution)` — a shape 0 of 2,851 cards in know/ use — would have been
 # approved unnoticed on all 20 cards, and one of them at a level its own type
-# contradicts.  The type is not decoration: triage reads it (K-02816), the
+# contradicts.  The type is not decoration: triage reads it (a principle or a
+# decision cannot be the winner of a factual contradiction), the
 # condense score reads it (`fact` is protected), and cards are immutable once
 # approved, so a wrong one stays wrong for good.
 TYPES = OBS_TYPES | DER_TYPES
@@ -175,7 +176,8 @@ def load_cards():
     # Errata (2026-09-20, package KBFIX): a claim retracted into the tombstone ledger may not
     # stand unmarked in ANY card (R1), and a card's `errata:` head, its ERRATUM blocks and the
     # ledger must agree (R2). Loud on purpose: between `khms_erratum.py declare` and `apply`
-    # this build FAILS, which is the check being a check (K-00585) — and a nightly card that
+    # this build FAILS, which is the check being a check (a check that passes either way is
+    # no check) — and a nightly card that
     # re-derives a retracted sentence from the journal fails here too, not in a review's eye.
     retracted = khms_lint.load_retracted(BRAIN)
     ledger_ids = {t["ts"] for t in retracted}
@@ -227,20 +229,20 @@ def supersede_problems(cards, archived=None):
     """-> [message] for every `supersedes` edge whose back half is open.
 
     `NEW supersedes: OLD` written on the new card alone leaves OLD `status: active`, and
-    retrieval keeps serving it as current (K-00448 / K-02006). The back half used to be
-    closed only on the inbox path (approve_inbox.mark_superseded); a card written by hand
-    on 2026-10-03 (K-03599 -> K-02263, K-03600 -> K-02862) left both targets active and
-    this build stayed green (issue #209). The edge is CLOSED when OLD is:
+    retrieval keeps serving it as current. The back half used to be closed only on the
+    inbox path (approve_inbox.mark_superseded); two cards written by hand in the source
+    deployment left both their targets active and this build stayed green. The edge is
+    CLOSED when OLD is:
       * `superseded` with `superseded_by` naming NEW — or naming another card that itself
-        declares `supersedes: OLD` (two successors, one scalar pointer: K-00796, K-02688);
+        declares `supersedes: OLD` (two successors, one scalar pointer);
       * `refuted` — retired whole by apply_triage, never served as current;
       * absent from know/ but present in the fog (archive/know/): moved out of the base.
     Anything else — active, challenged, superseded without a pointer, a pointer to a card
     that does not supersede OLD, an edge to no card at all — is a message naming both ids.
     An `errata:` key on OLD is NOT an exemption: an erratum corrects a wrong record in an
-    otherwise true card that stays active (K-02934), and the ledger names no correcting
-    card, so the exemption could not be tied to NEW — it spared K-02784, whose title CAUSE
-    K-03042 refutes, until review FRVSUP (#209) closed it.
+    otherwise true card that stays active, and the ledger names no correcting card, so the
+    exemption could not be tied to NEW — it once spared a card whose title cause a later
+    card refutes, until a review closed it.
     """
     archived = archived or {}
     successors = {}
@@ -426,8 +428,8 @@ def write_views(cards, reg, alias):
     # in memory from the cards it has already loaded (ks.reverse_correctors), so
     # this file is not what it reads — it is the human-readable half, and the
     # place a review can see at a glance which corrections are wired up. Written
-    # after 2026-08-28, when a correction with no edge (K-02006) left the cards
-    # it corrected being recited as current for four days.
+    # after a correction with no edge left the cards it corrected being recited
+    # as current for four days.
     rev = {}
     for c in cards.values():
         for tgt in c["links"]["contradicts"]:
@@ -515,8 +517,8 @@ def refresh_dense_index():
     tells you to run it, the review ping's four-step recipe ends with it, and a
     card written by hand is not considered written until it is green (core rule
     #8). `approve_inbox.py` was the other candidate and is the WRONG one: it
-    covers the inbox route only, and both of the measured misses (K-02856,
-    K-02868) were cards written by hand, which never touch it. One choke point,
+    covers the inbox route only, and both of the measured misses were cards
+    written by hand, which never touch it. One choke point,
     on the path that is already mandatory.
 
     It is INCREMENTAL by construction (embed_index keeps a content hash per

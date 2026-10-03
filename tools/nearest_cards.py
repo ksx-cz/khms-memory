@@ -18,7 +18,7 @@ half: for every `### C<n>` candidate it runs the SAME retrieval the recall layer
 uses (khms_search, plus the dense channel when the daemon answers) over the
 candidate's own title and body, and writes back
 
-    NEAREST: K-01234 (41.2), K-00987 (33.8), K-02201 (28.1)
+    NEAREST: K-90123 (41.2), K-90987 (33.8), K-92201 (28.1)
 
 as the last line of the candidate.  0 API tokens.  The consolidate prompt then
 requires exactly one RELATION line naming one of these ids (or another existing

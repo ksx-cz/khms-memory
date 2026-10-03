@@ -185,18 +185,17 @@ def mark_superseded(edges):
     """Close the other half of a `supersedes` edge on the TARGET card.
 
     A supersedes edge written on the new card alone leaves the old one
-    `status: active`, so retrieval keeps serving it as current — the K-00448 /
-    K-02006 failure (measured 2026-08-28: July cards recited over their own
-    correction) in its second form.  The morning review has been closing it BY
-    HAND: on 2026-09-04, K-02484 got `status: superseded` + `superseded_by:
-    K-02515` typed into it after `approve_inbox.py` had already run.  This is
+    `status: active`, so retrieval keeps serving it as current — the failure of
+    a correction that is never reached (measured in the source deployment: old
+    cards recited over their own correction for days) in its second form.  The
+    morning review used to close it BY HAND, typing `status: superseded` +
+    `superseded_by:` into the old card after `approve_inbox.py` had run.  This is
     that hand edit, done by the tool that knows both ids.
 
     Deliberately narrow: only `supersedes`, only a target that exists in know/,
     only one that is still `active` or `challenged` — a challenged card is the
-    best supersede target there is (weekly prompt), and skipping it left K-00036
-    served as a live decision after K-03018 replaced it (K-03116; issue #209
-    closed it).  `supports` and `contradicts` change no
+    best supersede target there is (weekly prompt), and skipping it once left a
+    replaced decision served as live.  `supports` and `contradicts` change no
     status here, because no existing tool has ever done so and this is not the
     place to invent a status policy.
     """
@@ -354,9 +353,9 @@ def main():
               "already written.")
 
     # A correction with no edge is a correction that will never be reached: the
-    # retrieval layer follows links, and K-02006 ("CORRECTED … pull-ups ARE
-    # installed") carried none, so on 2026-08-28 the July cards it corrects were
-    # recited to the owner as current. Refuse BEFORE any id is allocated, so a
+    # retrieval layer follows links, and a card opening with "CORRECTED …" that
+    # carried none once left the cards it corrects being recited to the principal
+    # as current. Refuse BEFORE any id is allocated, so a
     # refused run leaves the counter and know/ exactly as they were and the
     # reviewer re-runs the whole file after adding the edge.
     known = khms_lint.known_card_ids(KNOW) | {str(m["id"]) for m, _ in all_cards}
@@ -403,7 +402,7 @@ def main():
         meta["id"] = mapping[old]
         links = meta.get("links") or {}
         # Belt and braces (2026-08-25): a link written as a TOP-LEVEL key —
-        # `supports: [K-01968]` instead of `links: {supports: [...]}` — is not an
+        # `supports: [K-xxxxx]` instead of `links: {supports: [...]}` — is not an
         # error anywhere; it is silently dropped, because build_views.py reads
         # links only from meta["links"]. Eight of that day's 120 cards carried
         # one, and a `derived` card whose derived_from sat outside `links`

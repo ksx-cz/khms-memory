@@ -18,6 +18,10 @@ import tempfile
 import threading
 import unittest
 
+# Ids of cards in the shipped example base (examples/). Built, not written out: a literal low id would read, to
+# a deployment's pre-publication disclosure scan, like one of that deployment's own card ids.
+EX1, EX2 = "K-%05d" % 1, "K-%05d" % 2
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from conftest import fingerprint  # noqa: E402
 
@@ -129,7 +133,7 @@ class ReaderCannotWrite(unittest.TestCase):
         r = subprocess.run([sys.executable, "-c", code, TOOLS], capture_output=True, text=True, env=w)
         assert r.returncode == 0, r.stderr
         cls.manifest = os.path.join(cls.root, "state", "shared", "embed", "bge.manifest.json")
-        cls.daemon = FakeDaemon(os.path.join(cls.sockdir, "embed.sock"), [["K-00002", 0.9], ["K-00001", 0.5]])
+        cls.daemon = FakeDaemon(os.path.join(cls.sockdir, "embed.sock"), [[EX2, 0.9], [EX1, 0.5]])
         cls.daemon.start()
         freeze(cls.root)
         cls.before = fingerprint(cls.root)
@@ -173,7 +177,7 @@ class ReaderCannotWrite(unittest.TestCase):
     def test_lexical_recall_logs_only_into_the_reader_state(self):
         r = self.run_reader([os.path.join(TOOLS, "recall.sh"), "--lexical", "heater", "relay"])
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        self.assertIn("K-00001", r.stdout)
+        self.assertIn(EX1, r.stdout)
         self.assertIn("heater relay", open(os.path.join(self.reader_state, "recall.log")).read())
 
     def test_dense_with_a_fresh_shared_index_is_queried_not_written(self):
@@ -216,7 +220,7 @@ class ReaderCannotWrite(unittest.TestCase):
     def test_precheck_runs_and_logs_only_into_the_reader_state(self):
         r = self.run_reader([os.path.join(TOOLS, "precheck.sh"), "gotcha"])
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertIn("GOTCHA K-00002", r.stdout)
+        self.assertIn("GOTCHA " + EX2, r.stdout)
         self.assertTrue(os.path.exists(os.path.join(self.reader_state, "precheck.log")))
 
     def test_a_reader_whose_state_points_into_the_base_writes_nothing(self):
