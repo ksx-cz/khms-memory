@@ -1,4 +1,5 @@
-# This repository ships tooling, not a base. A live base keeps its own git repo.
+# This repository ships code only. A base (cards, journal, settings, state) lives OUTSIDE it and is
+# never committed to any repository; khms_init.sh refuses to create a base inside the checkout.
 __pycache__/
 *.pyc
 

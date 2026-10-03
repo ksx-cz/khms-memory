@@ -1,54 +1,45 @@
 #!/usr/bin/env bash
-# Pre-action check: print active policies, gotchas and refuted/challenged cards for given tags.
-#
-# Usage: precheck.sh <tag> [tag...]   — a duty before risky actions (deletions,
-#        configuration changes, deployments, hardware writes). Zero model tokens.
-#
-# Every invocation is logged to tools/.precheck.log. That log is the point: the
-# rule "check before you act" fails by not firing, and a count of firings against
-# the day's risky actions makes the omission visible instead of leaving it to the
-# judgement of the moment. khms_hook.py also runs this automatically for a named
-# class of dangerous commands — a backstop, not a replacement for the habit.
+# Pre-action check: print active policies, gotchas, refuted/challenged cards for given tags.
+# Usage: precheck.sh <tag> [tag...]   -- a duty before risky actions (hardware writes, config, deletion).
+# Zero LLM tokens.
 set -euo pipefail
+. "$(dirname "$(readlink -f "$0")")/khms_paths.sh"
 [ $# -ge 1 ] || { echo "usage: precheck.sh <tag> [tag...]" >&2; exit 2; }
-HERE="$(dirname "$(readlink -f "$0")")"
-ROOT="${KHMS_ROOT:-$(dirname "$HERE")}"
+khms_load || exit 3
+ROOT="$(khms_get KHMS_ROOT)"
+LOG="$(khms_get KHMS_PRECHECK_LOG)"
 
-echo "$(date -Is) $*" >> "$ROOT/tools/.precheck.log" 2>/dev/null || true
+# Every invocation is logged, so the daily review can count precheck runs against the day's
+# root-cause entries: the rule "run precheck before investigating" kept failing on
+# self-classification, and the count makes the omission visible instead of relying on the
+# moment's judgement. A reader deployment logs only into its own state.
+if khms_may_write "$LOG"; then
+  mkdir -p "$(dirname "$LOG")" && echo "$(date -Is) $*" >> "$LOG"
+fi
 
-KHMS_ROOT="$ROOT" python3 - "$@" <<'EOF'
-import glob
-import os
-import re
-import sys
-
-import yaml
-
-root = os.environ["KHMS_ROOT"]
+KHMS_KNOW="$ROOT/memory/know" python3 - "$@" <<'PY'
+import glob, os, re, sys, yaml
 tags = set(sys.argv[1:])
 hits = []
-for path in sorted(glob.glob(os.path.join(root, "memory", "know", "K-*.md"))):
-    with open(path, encoding="utf-8") as f:
-        text = f.read()
+for path in sorted(glob.glob(os.path.join(os.environ["KHMS_KNOW"], "K-*.md"))):
+    text = open(path, encoding="utf-8").read()
     m = re.match(r"^---\n(.*?)\n---\n(.*)$", text, re.S)
     if not m:
         continue
-    meta = yaml.safe_load(m.group(1))
-    body = m.group(2).strip()
+    meta = yaml.safe_load(m.group(1)); body = m.group(2).strip()
     if not (set(meta.get("tags") or []) & tags):
         continue
     warn = None
     if meta.get("status") in ("refuted", "challenged"):
-        warn = f"!! {meta['status'].upper()}"          # a dead end, kept on purpose
+        warn = f"⛔ {meta['status'].upper()}"
     elif "gotcha" in (meta.get("tags") or []) and meta.get("status") == "active":
-        warn = "!  GOTCHA"
+        warn = "⚠ GOTCHA"
     elif meta.get("type") == "policy" and meta.get("status") == "active":
-        warn = "=  POLICY"
+        warn = "📏 POLICY"
     if warn:
         first = body.splitlines()[0] if body else ""
         hits.append(f"{warn} {meta['id']}: {first}")
         for line in body.splitlines()[1:4]:
             hits.append(f"      {line}")
-print("\n".join(hits) if hits
-      else f"precheck: nothing on record for tags: {', '.join(sorted(tags))}")
-EOF
+print("\n".join(hits) if hits else f"precheck: nothing on record for tags: {', '.join(sorted(tags))}")
+PY

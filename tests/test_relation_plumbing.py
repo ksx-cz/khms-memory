@@ -18,7 +18,7 @@ import sys
 import tempfile
 import unittest
 
-TOOLS = os.path.dirname(os.path.abspath(__file__))
+TOOLS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools")
 APPROVE = os.path.join(TOOLS, "approve_inbox.py")
 VERIFY = os.path.join(TOOLS, "verify_relations.py")
 
@@ -56,8 +56,8 @@ class Withheld(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.root, True)
         self.know = os.path.join(self.root, "memory", "know")
         os.makedirs(self.know)
-        os.makedirs(os.path.join(self.root, "tools"))
-        self.counter = os.path.join(self.root, "tools", ".next_id")
+        os.makedirs(os.path.join(self.root, "state", "shared"), exist_ok=True)
+        self.counter = os.path.join(self.root, "state", "shared", "next_id")
         open(self.counter, "w").write("90500\n")
         self.inbox = os.path.join(self.root, "inbox.md")
 
@@ -127,8 +127,8 @@ class GateWritesWhatApproveRefusesToRead(unittest.TestCase):
         self.addCleanup(shutil.rmtree, root, True)
         know = os.path.join(root, "memory", "know")
         os.makedirs(know)
-        os.makedirs(os.path.join(root, "tools"))
-        open(os.path.join(root, "tools", ".next_id"), "w").write("90500\n")
+        os.makedirs(os.path.join(root, "state", "shared"), exist_ok=True)
+        open(os.path.join(root, "state", "shared", "next_id"), "w").write("90500\n")
         open(os.path.join(know, "K-90001.md"), "w").write(
             "---\nid: K-90001\nstatus: active\n---\nbody\n")
         inbox = os.path.join(root, "inbox.md")
@@ -175,8 +175,8 @@ class LinksLine(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.root, True)
         self.know = os.path.join(self.root, "memory", "know")
         os.makedirs(self.know)
-        os.makedirs(os.path.join(self.root, "tools"))
-        open(os.path.join(self.root, "tools", ".next_id"), "w").write("90500\n")
+        os.makedirs(os.path.join(self.root, "state", "shared"), exist_ok=True)
+        open(os.path.join(self.root, "state", "shared", "next_id"), "w").write("90500\n")
         self.inbox = os.path.join(self.root, "inbox.md")
 
     def approve(self, line):
@@ -232,8 +232,8 @@ class SupersedeMarking(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.root, True)
         self.know = os.path.join(self.root, "memory", "know")
         os.makedirs(self.know)
-        os.makedirs(os.path.join(self.root, "tools"))
-        open(os.path.join(self.root, "tools", ".next_id"), "w").write("90500\n")
+        os.makedirs(os.path.join(self.root, "state", "shared"), exist_ok=True)
+        open(os.path.join(self.root, "state", "shared", "next_id"), "w").write("90500\n")
         self.inbox = os.path.join(self.root, "inbox.md")
 
     def target(self, cid, status="active"):
@@ -270,9 +270,11 @@ class SupersedeMarking(unittest.TestCase):
         self.assertIn("four metres tall", self.read("K-90001"))
 
     def test_a_non_active_target_is_left_alone_and_reported(self):
-        self.target("K-90001", status="challenged")
+        # Current core rule: an `active` or `challenged` target is marked superseded (a challenged
+        # card is the one most in need of a pointer to its replacement); a refuted one is left alone.
+        self.target("K-90001", status="refuted")
         r = self.approve("**LINKS:** supersedes=[K-90001]")
-        self.assertIn("status: challenged", self.read("K-90001"))
+        self.assertIn("status: refuted", self.read("K-90001"))
         self.assertIn("not active", r.stdout)
 
     def test_a_missing_target_is_reported_not_crashed(self):

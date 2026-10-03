@@ -1,0 +1,27 @@
+# Required check for every commit that may be deployed: a deployment verifies that THIS workflow
+# succeeded for the exact SHA it installs. Synthetic English fixtures only; no private data, no
+# credentials, no artifacts are uploaded.
+name: test
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install the declared runtime dependencies (nothing else)
+        run: python -m pip install -r requirements.txt pytest
+      - name: Boundary scan of the tracked tree
+        run: python tools/khms_boundary.py
+      - name: Tests (fresh HOME and temporary bases, see tests/conftest.py)
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: python -m pytest -q -p no:cacheprovider tests/

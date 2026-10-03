@@ -1,28 +1,106 @@
 #!/usr/bin/env python3
-"""Approve stage: turn reviewed candidate cards (temp labels) into know/ cards (K ids).
+"""Approve-stage helper: turn reviewed candidate cards (TMP ids) into know/ cards (K ids).
 
-Usage: approve_inbox.py [--dry-run] inbox/2026-03-04.md [more.md ...]
-
-- Parses card blocks (--- yaml --- body), tolerating ```yaml / ```markdown fences.
-- Allocates sequential ids from tools/.next_id and rewrites temp cross-references
-  inside links, so a candidate that referenced C7 ends up referencing its real id.
-- Writes memory/know/K-*.md and prints the mapping.
-
-RUN ONLY AFTER REVIEW (spec P6). This script is the only thing in the system that
-writes into know/, and it has no judgement of its own. Validate afterwards with
-build_views.py.
+Usage: approve_inbox.py [--dry-run] file.md [file2.md ...]
+- Parses bare card blocks (--- yaml --- body), tolerates ```markdown fences.
+- Reserves sequential K-ids through khms_alloc.py (the one locked allocator), rewrites TMP cross-references in links.
+- Writes memory/know/K-*.md; prints the TMP→K mapping.
+Run ONLY after human/smart review of the input files (P6). Validate with build_views.py afterwards.
 """
-import os
 import re
+import subprocess
 import sys
+import os
 
 import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import khms_lint  # noqa: E402
+import khms_alloc  # noqa: E402
 import khms_paths as P  # noqa: E402
 
-CARD_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n(.*?)(?=\n---\s*\n|\Z)", re.S | re.M)
+BRAIN = P.ROOT
+REAL_BRAIN = BRAIN            # tests rebind BRAIN; this stays the real one, see snapshot_first
+KNOW = os.path.join(BRAIN, "memory", "know")
+
+
+def snapshot_first(tag):
+    """Take a rollback point before the first card is written (audit 2026-09-02 §6 A1).
+
+    THE BASE IS NOT IN GIT — the owner's rule — so "undo the approve" means "copy the file
+    back out of a snapshot", and the snapshot has to exist BEFORE the write. The one moment
+    that is true is here: after every refusal has had its say, before the first id is spent.
+    (The audit's own incident: khms_dedup.py rewrote eleven cards, and what saved them was a
+    snapshot somebody happened to take by hand that morning. Nothing should depend on that.)
+
+    Silent no-op for a throwaway brain — the tests rebind BRAIN — and for KHMS_NO_SNAPSHOT=1.
+    A snapshot that FAILS never blocks the approve, but it is said out loud: "this run has no
+    rollback point" is the first thing a reviewer needs to know, not the last.
+    """
+    if os.environ.get("KHMS_NO_SNAPSHOT") == "1" or BRAIN != REAL_BRAIN:
+        return
+    script = os.path.join(P.CODE, "khms_snapshot.sh")
+    if not os.path.exists(script):
+        print(f"WARN: {script} is missing — writing WITHOUT a rollback point", file=sys.stderr)
+        return
+    r = subprocess.run(["bash", script, "--tag", tag], capture_output=True,
+                       text=True, timeout=900)
+    if r.returncode == 0:
+        print((r.stdout or "").strip().splitlines()[0], file=sys.stderr)
+    else:
+        print(f"WARN: snapshot rc={r.returncode} — NO rollback point for this run: "
+              f"{(r.stderr or '').strip()[:200]}", file=sys.stderr)
+
+def unit_of(approve_file):
+    """The inbox unit an approve/converted file was made from:
+    memory/inbox/2026-10-02-b01.approve.md -> (stem 2026-10-02-b01, its .md path)."""
+    base = os.path.basename(approve_file)
+    stem = re.sub(r"\.(approve|converted)(\.[^.]+)?\.md$|\.md$", "", base)
+    return stem, os.path.join(BRAIN, "memory", "inbox", stem + ".md")
+
+
+def write_review_marker(approve_file):
+    stem, unit = unit_of(approve_file)
+    if not re.match(r"^\d{4}-\d{2}-\d{2}", stem):
+        return None
+    os.makedirs(P.REVIEW_MARKERS, exist_ok=True)
+    marker = os.path.join(P.REVIEW_MARKERS, f".reviewed-{stem}-cards")
+    body = ""
+    if os.path.exists(unit):
+        import hashlib
+        h = hashlib.sha256(open(unit, "rb").read()).hexdigest()
+        body = f"sha256={h}\nunit=memory/inbox/{stem}.md\napprove={os.path.basename(approve_file)}\n"
+    with open(marker, "w", encoding="utf-8") as fh:
+        fh.write(body)
+    return marker
+
+
+def ledger_report():
+    """The morning review's coverage line (board #209): re-derive the MARK ledger now
+    that the approved cards (with their `marks:` ids) and the `.reviewed-*` markers
+    exist, and return the OPEN count + the oldest OPEN mark.  Marks the reviewed
+    proposal did not card are back in the queue from this moment; dismissing one
+    needs a reason: tools/mark_ledger.py dismiss <id> --reason "…" (or
+    --from-inbox <file> to accept the night's own NOT CARDED verdicts).
+    Never fatal — the cards are already written — but never silent either."""
+    try:
+        import mark_ledger
+    except ImportError:
+        return ("\nMARK LEDGER: not installed (optional night-pipeline component, mark_ledger.py) "
+                "-- coverage line skipped")
+    try:
+        paths = mark_ledger.Paths(BRAIN)
+        floor = mark_ledger.floor_of(paths, None)
+        with mark_ledger.ledger_lock(paths):
+            marks = mark_ledger.derive(paths, floor)
+            summary = mark_ledger.summarize(marks, floor, paths)
+            mark_ledger.write_state(paths, marks, summary)
+        return ("\n" + mark_ledger.status_line(summary)
+                + "\n  an OPEN mark with no card and no reason goes back to the night queue; dismiss only with a reason:"
+                + " tools/mark_ledger.py dismiss <id> --reason \"…\" | --from-inbox <inbox>")
+    except Exception as exc:                                   # noqa: BLE001
+        return f"\nMARK LEDGER: recomputation failed ({exc}) -- run tools/mark_ledger.py sync by hand"
+
 
 # WITHHELD SECTIONS. `verify_relations.py` does not delete a candidate it rejects: it
 # MOVES the whole block — yaml fence, body, quotes and all — into `## DEFERRED` or
@@ -77,6 +155,109 @@ def cut_trailers(text):
     return (text[:m.start()], m.group(0).strip()) if m else (text, None)
 
 
+CARD_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n(.*?)(?=\n---\s*\n|\Z)", re.S | re.M)
+
+FRONT_ORDER = ["id", "type", "level", "status", "tags", "scope", "evidence",
+               "source", "date", "links"]
+
+
+def dump_card(meta, body):
+    front = {}
+    for k in FRONT_ORDER:
+        if k in meta:
+            front[k] = meta[k]
+    for k, v in meta.items():
+        if k not in front and k != "body":
+            front[k] = v
+    fm = yaml.safe_dump(front, sort_keys=False, allow_unicode=True,
+                        default_flow_style=None, width=1000).strip()
+    return f"---\n{fm}\n---\n{body.strip()}\n"
+
+
+def _write_card(path, meta, body):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(dump_card(meta, body))
+    os.replace(tmp, path)
+
+
+def mark_superseded(edges):
+    """Close the other half of a `supersedes` edge on the TARGET card.
+
+    A supersedes edge written on the new card alone leaves the old one
+    `status: active`, so retrieval keeps serving it as current — the K-00448 /
+    K-02006 failure (measured 2026-08-28: July cards recited over their own
+    correction) in its second form.  The morning review has been closing it BY
+    HAND: on 2026-09-04, K-02484 got `status: superseded` + `superseded_by:
+    K-02515` typed into it after `approve_inbox.py` had already run.  This is
+    that hand edit, done by the tool that knows both ids.
+
+    Deliberately narrow: only `supersedes`, only a target that exists in know/,
+    only one that is still `active` or `challenged` — a challenged card is the
+    best supersede target there is (weekly prompt), and skipping it left K-00036
+    served as a live decision after K-03018 replaced it (K-03116; issue #209
+    closed it).  `supports` and `contradicts` change no
+    status here, because no existing tool has ever done so and this is not the
+    place to invent a status policy.
+    """
+    changed, notes = 0, []
+    for new_id, targets in edges:
+        for tgt in targets:
+            path = os.path.join(KNOW, f"{tgt}.md")
+            if not os.path.exists(path):
+                notes.append(f"   {new_id} supersedes {tgt}: no such card in "
+                             f"know/ — target NOT marked")
+                continue
+            text = open(path, encoding="utf-8").read()
+            m = re.match(r"^---\s*\n(.*?)\n---\s*\n(.*)$", text, re.S)
+            if not m:
+                notes.append(f"   {tgt}: unparseable card — NOT marked")
+                continue
+            try:
+                meta = yaml.safe_load(m.group(1)) or {}
+            except yaml.YAMLError as e:
+                notes.append(f"   {tgt}: bad yaml ({str(e)[:60]}) — NOT marked")
+                continue
+            status = str(meta.get("status", "active"))
+            links = meta.get("links") or {}
+            if not isinstance(links, dict):
+                links = {}
+            # The pointer lives in `links.superseded_by` only — that is the key the
+            # build gate and retrieval read. A TOP-LEVEL `superseded_by` is a hand
+            # edit in the wrong place (7 cards on 2026-10-03, review FRVSUP F2);
+            # dump_card would re-emit it beside the nested one, so it is dropped
+            # whenever this tool writes the card.
+            had_stray = "superseded_by" in meta
+            stray = meta.pop("superseded_by", None)
+            if status == "superseded" and not links.get("superseded_by"):
+                # Already superseded by hand but with no pointer: the back-link
+                # is still owed — 33 such cards existed on 2026-10-02 (owner:
+                # "at ukazujou na ty co je nahradily"). The status is left alone.
+                pass
+            elif status == "superseded" and had_stray:
+                # Closed already; only the stray top-level copy goes. The nested
+                # pointer is authoritative and is not overwritten.
+                _write_card(path, meta, m.group(2))
+                changed += 1
+                notes.append(f"   {tgt}: stray top-level superseded_by {stray} "
+                             f"removed (links.superseded_by "
+                             f"{links.get('superseded_by')} kept)")
+                continue
+            elif status not in ("active", "challenged"):
+                notes.append(f"   {tgt}: status is '{status}', not active — "
+                             f"left as it is; review decides")
+                continue
+            meta["status"] = "superseded"
+            links["superseded_by"] = new_id
+            meta["links"] = links
+            _write_card(path, meta, m.group(2))
+            changed += 1
+            notes.append(f"   {tgt}: status -> superseded, superseded_by "
+                         f"{new_id}" + (f" (stray top-level superseded_by {stray} "
+                                        f"removed)" if had_stray else ""))
+    return changed, notes
+
+
 def parse_cards(text, skipped=None, unknown_links=None):
     cards = []
     if skipped is None:
@@ -88,115 +269,48 @@ def parse_cards(text, skipped=None, unknown_links=None):
         try:
             meta = yaml.safe_load(front)
         except yaml.YAMLError as e:
-            ident = re.search(r"^id: (\S+)", front, re.M)
+            import re as _re
+            ident = _re.search(r"^id: (\S+)", front, _re.M)
             skipped.append((ident.group(1) if ident else "?", str(e).split("\n")[0]))
             print(f"SKIP (bad yaml): {str(e)[:120]} :: {front[:80]!r}", file=sys.stderr)
             return
         if isinstance(meta, dict) and "id" in meta and "type" in meta:
             body = re.split(r"\n## (?:STATS|NEW-TAGS)\b", body)[0].strip()
+            # drop trailing markdown commentary lines (e.g. "*(reviewer note)*")
             body = re.sub(r"\n\*\(.*?\)\*\s*$", "", body, flags=re.S).strip()
             body = fold_links_line(meta, body, unknown_links)
             cards.append((meta, body))
 
+    # pass 1: fenced cards (nightly-inbox format): ```yaml front \n---\n body ```
     def _take_fenced(m):
         inner = m.group(1)
         fm = re.match(r"(.*?)\n---\n(.*)", inner, re.S)
         if fm and re.search(r"^id: ", fm.group(1), re.M):
             try_card(fm.group(1).strip(), fm.group(2).strip())
-            return ""                     # consumed, so the bare pass cannot re-match it
+            return ""            # remove from text so pass 2 can't re-match
         return inner
-
     text = re.sub(r"```yaml\n(.*?)```", _take_fenced, text, flags=re.S)
     text = re.sub(r"```(?:markdown)?\n?", "", text)
 
+    # pass 2: bare card blocks (consolidator/extractor format)
     for m in CARD_RE.finditer(text):
         front = m.group(1)
         if not re.search(r"^id: ", front, re.M):
-            continue                      # a markdown '---' rule, not a card
+            continue             # a markdown '---' separator, not a card
         try_card(front, m.group(2).strip())
     return cards
 
 
-FRONT_ORDER = ["id", "type", "level", "status", "tags", "scope", "evidence",
-               "source", "date", "links"]
-
-
-def dump_card(meta, body):
-    """One card file, with a stable and readable key order. Shared by the writer
-    below and by mark_superseded, so a card rewritten by the second one comes out
-    in the same shape as a card written by the first."""
-    front = {k: meta[k] for k in FRONT_ORDER if k in meta}
-    for k, v in meta.items():
-        if k not in front and k != "body":
-            front[k] = v
-    fm = yaml.safe_dump(front, sort_keys=False, allow_unicode=True,
-                        default_flow_style=None, width=1000).strip()
-    return f"---\n{fm}\n---\n{body.strip()}\n"
-
-
-def mark_superseded(edges):
-    """Close the OTHER half of a `supersedes` edge, on the target card.
-
-    An edge written on the new card alone leaves the old one `status: active`, so
-    retrieval keeps serving it as current — and the injection layer, which cannot
-    read intentions, serves it as the state of the world. Measured in the reference
-    deployment: cards corrected in August kept their active July predecessors and
-    were quoted back to the operator as current, correctly, by the rules as they
-    then stood. The review had been closing this by hand, one card at a time, after
-    approve_inbox.py had already run. This is that hand edit, done by the tool that
-    already knows both ids.
-
-    Deliberately narrow: only `supersedes`, only a target that exists in know/, only
-    one that is still `active`. `supports` and `contradicts` change no status here —
-    inventing a status policy is not this script's job, and a tool that silently
-    re-statuses cards on a link it guessed at is worse than the hand edit.
-    """
-    changed, notes = 0, []
-    for new_id, targets in edges:
-        for tgt in targets:
-            path = os.path.join(P.KNOW, f"{tgt}.md")
-            if not os.path.exists(path):
-                notes.append(f"   {new_id} supersedes {tgt}: no such card in know/ "
-                             f"— target NOT marked")
-                continue
-            with open(path, encoding="utf-8") as fh:
-                text = fh.read()
-            m = re.match(r"^---\s*\n(.*?)\n---\s*\n(.*)$", text, re.S)
-            if not m:
-                notes.append(f"   {tgt}: unparseable card — NOT marked")
-                continue
-            try:
-                meta = yaml.safe_load(m.group(1)) or {}
-            except yaml.YAMLError as e:
-                notes.append(f"   {tgt}: bad yaml ({str(e)[:60]}) — NOT marked")
-                continue
-            status = str(meta.get("status", "active"))
-            if status != "active":
-                notes.append(f"   {tgt}: status is '{status}', not active — left as "
-                             f"it is; the review decides")
-                continue
-            meta["status"] = "superseded"
-            links = meta.get("links") or {}
-            if not isinstance(links, dict):
-                links = {}
-            links["superseded_by"] = new_id
-            meta["links"] = links
-            tmp = path + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as fh:
-                fh.write(dump_card(meta, m.group(2)))
-            os.replace(tmp, path)
-            changed += 1
-            notes.append(f"   {tgt}: status -> superseded, superseded_by {new_id}")
-    return changed, notes
-
-
 def main():
     dry = "--dry-run" in sys.argv
+    if not dry:
+        P.require_writable("approve cards")
     files = [a for a in sys.argv[1:] if not a.startswith("--")]
     if not files:
         print(__doc__)
         sys.exit(2)
-    all_cards, skipped = [], []
+    all_cards = []
+    skipped = []
     withheld, unknown_links = [], []
     for f in files:
         with open(f, encoding="utf-8") as fh:
@@ -215,11 +329,23 @@ def main():
     if not all_cards:
         print("no cards found")
         sys.exit(1)
-
-    # A card that fails to parse used to be one stderr line and exit code 0, so a
-    # partial import read as a complete one and the dropped cards were never seen
-    # again. Silence about what was lost IS the failure: say it loudly, and exit
-    # non-zero at the end so no caller can mistake it for a finished run.
+    # Two inputs whose temp labels collide (two published units both starting at C1) would
+    # map two cards to ONE K-id and write only the second. Refuse before any id is spent.
+    seen_ids, dup = {}, []
+    for meta, _ in all_cards:
+        k = str(meta.get("id"))
+        if k in seen_ids:
+            dup.append(k)
+        seen_ids[k] = True
+    if dup:
+        print(f"\n!! REFUSED: temp id(s) {', '.join(sorted(set(dup)))} occur more than once "
+              f"across {files} — approve those files in separate runs. NOTHING was written.")
+        sys.exit(1)
+    # A card that fails to parse used to be one line on stderr and an exit code
+    # of 0, so a partial import read as a complete one: on 2026-08-05, 12 of 69
+    # cards were dropped because a quoted section title inside `source:` put a
+    # second colon in the value, and the run still ended "OK". Silence about
+    # what was lost is the failure; say it loudly and exit non-zero.
     if skipped:
         print(f"\n!! {len(skipped)} card(s) FAILED to parse and were NOT written:")
         for cid, err in skipped:
@@ -227,24 +353,37 @@ def main():
         print("   Fix them and re-run with ONLY those cards — the ones below are "
               "already written.")
 
-    # A correction with no edge is a correction nothing can reach: retrieval
-    # follows links, so a card that says CORRECTED but names nothing leaves the
-    # card it corrects being served alone, as current, for as long as anybody
-    # keeps asking about it. Refuse BEFORE any id is allocated, so a refused run
-    # leaves know/ and the counter exactly as they were and the reviewer re-runs
-    # the whole file once the edge is in.
-    known = khms_lint.known_card_ids(P.KNOW) | {str(m["id"]) for m, _ in all_cards}
+    # A correction with no edge is a correction that will never be reached: the
+    # retrieval layer follows links, and K-02006 ("CORRECTED … pull-ups ARE
+    # installed") carried none, so on 2026-08-28 the July cards it corrects were
+    # recited to the owner as current. Refuse BEFORE any id is allocated, so a
+    # refused run leaves the counter and know/ exactly as they were and the
+    # reviewer re-runs the whole file after adding the edge.
+    known = khms_lint.known_card_ids(KNOW) | {str(m["id"]) for m, _ in all_cards}
+    # … and (2026-09-20) a candidate that re-states a sentence the tombstone ledger has
+    # retracted — the nightly re-deriving it from the journal, or a quote of it — is refused
+    # the same way (khms_lint R1/R2), so an erratum cannot be undone by the next sweep.
+    retracted = khms_lint.load_retracted(BRAIN)
     problems = khms_lint.lint_batch(
-        [(str(m["id"]), m, b) for m, b in all_cards], known)
+        [(str(m["id"]), m, b) for m, b in all_cards], known, retracted,
+        {t["ts"] for t in retracted})
     if problems:
-        print(f"\n!! REFUSED: {len(problems)} card(s) claim to correct something "
-              f"without saying what. NOTHING was written, no ids were allocated.")
+        print(f"\n!! REFUSED: {len(problems)} card(s) failed lint (a correction without its "
+              f"edge, a retracted claim re-stated, or inconsistent errata). NOTHING was "
+              f"written, no ids were allocated.")
         for p in problems:
             print(f"   {p}")
         sys.exit(1)
 
-    with open(P.COUNTER) as f:
-        cur = int(f.read().strip())
+    if not dry:
+        snapshot_first("pre-approve")
+
+    # One locked reservation for the whole batch, persisted BEFORE any card is written (khms_alloc.py):
+    # a second writer on the same base -- another agent, another clone -- can never receive these ids.
+    if dry:
+        cur = khms_alloc.peek("card")
+    else:
+        cur = khms_alloc.reserve("card", len(all_cards))[0]
     mapping = {}
     for meta, _ in all_cards:
         mapping[str(meta["id"])] = f"K-{cur:05d}"
@@ -257,15 +396,20 @@ def main():
             return None
         return mapping.get(str(v), str(v))
 
+    written = 0
     supersede_edges = []
     for meta, body in all_cards:
         old = str(meta["id"])
         meta["id"] = mapping[old]
         links = meta.get("links") or {}
-        # A link written as a TOP-LEVEL key (`supports: [K-NNNNN]` instead of
-        # `links: {supports: [...]}`) is not an error anywhere — it is silently
-        # dropped, because every consumer reads links only from meta["links"].
-        # Pop whatever arrives that way so no edge reaches know/ loose.
+        # Belt and braces (2026-08-25): a link written as a TOP-LEVEL key —
+        # `supports: [K-01968]` instead of `links: {supports: [...]}` — is not an
+        # error anywhere; it is silently dropped, because build_views.py reads
+        # links only from meta["links"]. Eight of that day's 120 cards carried
+        # one, and a `derived` card whose derived_from sat outside `links`
+        # failed validation with "derived card with empty derived_from".
+        # convert_inbox.py nests them; this pops whatever still arrives that way
+        # (hand-edited cards, other producers) so nothing reaches know/ loose.
         for k in ("derived_from", "supports", "contradicts", "refuted_by"):
             stray = meta.pop(k, None)
             vals = list(links.get(k) or [])
@@ -277,32 +421,43 @@ def main():
         stray_ss = meta.pop("supersedes", None)
         links["supersedes"] = remap(links.get("supersedes") or stray_ss)
         meta["links"] = links
-
-        out = dump_card(meta, body)
         ss = links["supersedes"]
         targets = [str(t) for t in (ss if isinstance(ss, list) else [ss])
                    if t and str(t).startswith("K-")]
         if targets:
             supersede_edges.append((meta["id"], targets))
-        path = os.path.join(P.KNOW, f"{meta['id']}.md")
+        # frontmatter dump: keep key order stable & readable
+        out = dump_card(meta, body)
+        path = os.path.join(KNOW, f"{meta['id']}.md")
         if dry:
             print(f"DRY {old} -> {meta['id']}")
         else:
             if os.path.exists(path):
-                print(f"ERROR: {path} exists — id counter out of sync", file=sys.stderr)
+                print(f"ERROR: {path} exists — counter desync?", file=sys.stderr)
                 sys.exit(1)
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(out)
+            open(path, "w", encoding="utf-8").write(out)
+            written += 1
     if not dry:
-        with open(P.COUNTER, "w") as f:
-            f.write(str(cur) + "\n")
         n_marked, notes = mark_superseded(supersede_edges)
         if notes:
-            print(f"\nsupersedes edges: {n_marked} target card(s) marked superseded")
+            print(f"\nsupersedes edges: {n_marked} target card(s) marked "
+                  f"superseded")
             for n in notes:
                 print(n)
-        os.makedirs(P.STAGING, exist_ok=True)
-        with open(os.path.join(P.STAGING, "last-mapping.txt"), "a", encoding="utf-8") as mf:
+        # THE MARKER IS THE RECORD OF THE FACT, and there are two facts per date, not one:
+        # the card batch (this) and the contradiction triage (apply_triage.py writes
+        # `-triage`). They shared `.reviewed-DATE` until 2026-09-03, so approving cards
+        # silenced the triage ping and `2026-09-02-triage.md` went unread — 0 verdicts
+        # applied, no trace. Written per input file, from the date in its name.
+        # REVIEW IS PER UNIT, NOT PER DATE (Diblin review of #209 A, P1-3): the marker is
+        # named after the inbox UNIT the approve file came from (DATE, DATE-weekly, or a
+        # published batch <night>-bNN) and carries the unit's sha256, so a later batch is a
+        # new unit and anything appended to this one after the review un-reviews it.
+        for f in files:
+            write_review_marker(f)
+        mpath = os.path.join(BRAIN, "memory", "inbox", ".staging", "last-mapping.txt")
+        os.makedirs(os.path.dirname(mpath), exist_ok=True)
+        with open(mpath, "a", encoding="utf-8") as mf:
             for o, n in mapping.items():
                 mf.write(f"{o} {n}\n")
     print(f"{'would write' if dry else 'wrote'} {len(all_cards)} cards "
@@ -310,7 +465,11 @@ def main():
     for o, n in list(mapping.items())[:10]:
         print(f"  {o} -> {n}")
     if len(mapping) > 10:
-        print(f"  … +{len(mapping) - 10} more")
+        print(f"  … +{len(mapping)-10} more")
+    if not dry:
+        print(ledger_report())
+    # Non-zero when anything was dropped: a caller that only checks the exit
+    # code must not read a partial import as a finished one.
     if skipped:
         sys.exit(1)
 

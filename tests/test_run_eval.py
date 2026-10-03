@@ -20,7 +20,7 @@ import sys
 import tempfile
 import unittest
 
-TOOLS = os.path.dirname(os.path.abspath(__file__))
+TOOLS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools")
 REPO = os.path.dirname(TOOLS)
 EVAL = os.path.join(TOOLS, "eval", "run_eval.py")
 EXAMPLES = os.path.join(REPO, "examples")
@@ -39,7 +39,7 @@ def base_with_examples():
     root = tempfile.mkdtemp(prefix="eval-")
     know = os.path.join(root, "memory", "know")
     os.makedirs(know)
-    os.makedirs(os.path.join(root, "tools"))
+    os.makedirs(os.path.join(root, "state", "shared"), exist_ok=True)
     for f in sorted(os.listdir(EXAMPLES)):
         if f.startswith("K-") and f.endswith(".md"):
             shutil.copy(os.path.join(EXAMPLES, f), know)

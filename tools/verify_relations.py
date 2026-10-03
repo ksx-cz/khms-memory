@@ -6,39 +6,40 @@
 
 WHY THIS EXISTS
 ---------------
-A distillation pipeline PRODUCES; nothing in it MERGES. Measured in the reference
-deployment after a year of nightly runs: 17 cards about one measured parameter,
-14 about another, 8 about a third — one quantity, re-measured and written down as
-new knowledge every time. In the same audit a contradiction sweep confirmed 75
-contradictions in a 250-pair sample while the WHOLE base carried 8 superseded +
-7 refuted edges, and the morning review's approval rate was ~100 %. Nothing between
-the sweep and the knowledge directory ever asked "does this replace something we
-already know?".
+Measured 2026-09-02: the base holds 17 cards about "SVD48V bus voltage", 14 (+3)
+about "minimum turning radius", 8 about "wheel radius"; the triage stage
+confirmed 75 contradictions in a 250-pair sample; and the WHOLE base carries
+8 superseded + 7 refuted + 23 challenged edges.  The nightly pipeline produces
+and never merges, and the morning review's approval rate is ~100 %, so nothing
+between the sweep and know/ ever asks "does this replace something we already
+know?".  On 2026-09-04 the review did that work by hand: 36 candidates → 16
+approved, 7 of them merges, 14 rejected.
 
-Asking the model to link is a REQUEST (the consolidate prompt has asked for links
-from the start). This is the CHECK. Every candidate must carry exactly one line:
+Asking the model to link is a request (the consolidate prompt has asked for
+links since 2026-07-27).  This is the check.  Every candidate must carry exactly
+one line:
 
-    RELATION: supersedes K-NNNNN BECAUSE <one sentence>
-    RELATION: supports K-NNNNN
-    RELATION: contradicts K-NNNNN
-    RELATION: new — nearest K-NNNNN unrelated because <one sentence>
+    RELATION: supersedes K-01234 BECAUSE <one sentence>
+    RELATION: supports K-01234
+    RELATION: contradicts K-01234
+    RELATION: new — nearest K-01234 unrelated because <one sentence>
 
-The id must EXIST; a `supersedes` target must still be LIVE — `status: active` or
-`status: challenged` (an edge onto an already-superseded, refuted or condensed card
-chains onto a dead end); and `new` must name one of the ids `tools/nearest_cards.py`
-computed for that candidate, so "nothing in the base is close" cannot be asserted
-about a card the retrieval layer never proposed.
+The id must EXIST; a `supersedes` target must still be LIVE — `status: active`
+or `status: challenged` (an edge onto an already-superseded, refuted or
+condensed card chains onto a dead end); and `new` must name one of the ids
+`tools/nearest_cards.py` computed for that candidate, so "nothing in the base is
+close" cannot be asserted about a card the retrieval layer never proposed.
 
-NOTHING IS DELETED. A candidate that fails is MOVED, whole, into
-`## DROPPED (no valid RELATION)` at the end of the file; a candidate over `--max` is
-MOVED, whole, into `## DEFERRED`. Both sections are review plumbing: the approve
-stage parses cards, not sections, so neither can become a card by accident, and the
-morning review rescues anything by moving a block back under `## Cards`.
+NOTHING IS DELETED.  A candidate that fails is MOVED, whole, into
+`## DROPPED (no valid RELATION)` at the end of the file; a candidate over
+`--max` is MOVED, whole, into `## DEFERRED`.  Both sections are review plumbing:
+`convert_inbox2.py` stops at them, so they never become cards, and the morning
+review can rescue anything by moving it back.
 
-Exit 0 when nothing was dropped, 1 when something was (NON-FATAL in the pipeline:
-wire it with `|| true`, exactly like verify_quotes.py — a validator that exits
-non-zero for doing its job kills, under `set -e`, the night it was meant to
-improve), 2 on a usage or format error.
+Exit 0 when nothing was dropped, 1 when something was (NON-FATAL in the
+pipeline: wired with `|| true`, exactly like verify_quotes.py, whose fatal
+`set -e` death cost every nightly from 2026-07-28 — K-00490), 2 on a usage or
+format error.
 """
 import argparse
 import os
@@ -48,20 +49,21 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import khms_paths as P  # noqa: E402
 
-KNOW = P.KNOW
-ARCHIVE = P.ARCHIVE_KNOW
+KNOW = None        # default: the base's memory/know, resolved when the CLI runs (khms_paths)
+ARCHIVE = None     # default: the base's memory/archive/know
 
 DROPPED_HEAD = "## DROPPED (no valid RELATION)"
 DEFERRED_HEAD = "## DEFERRED"
 
-# WHICH TARGET STATUSES A `supersedes` EDGE MAY POINT AT.  The rule started life
-# as "must be active", and that literal reading dropped the one case the whole
-# gate exists to create: `challenged` is the status that gets written onto the
-# LOSER of a confirmed contradiction, i.e. onto exactly the card a better-measured
-# candidate ought to replace.  Dropping such a candidate left the challenged card
-# standing AND threw its replacement away — merge pressure pointing backwards.
-# `superseded` / `refuted` / `condensed` stay out: those edges chain onto a dead
-# end, which is the reason the rule existed in the first place.
+# WHICH TARGET STATUSES A `supersedes` EDGE MAY POINT AT (widened 2026-09-04,
+# package G2).  The rule was written as "must be active", and that literal
+# reading dropped the one case the whole gate exists to create: `challenged` is
+# the status the triage stage writes onto the LOSER of a contradiction, i.e.
+# onto exactly the card a better-measured candidate ought to replace.  Dropping
+# such a candidate left the challenged card standing AND threw its replacement
+# away — merge pressure pointed backwards.  `superseded` / `refuted` /
+# `condensed` stay out: those edges chain onto a dead end, which is the reason
+# the rule existed in the first place.
 SUPERSEDABLE = ("active", "challenged")
 
 # Same label grammar as verify_quotes.py / nearest_cards.py.
@@ -76,8 +78,19 @@ CARD_ID_RE = re.compile(r"K-\d{5}")
 SUPERSEDES_RE = re.compile(
     r"^supersedes\s+(K-\d{5})\b\s*BECAUSE\b\s*:?\s*(\S.*)$", re.I)
 SUPPORTS_RE = re.compile(r"^(supports|contradicts)\s+(K-\d{5})\b\s*(.*)$", re.I)
+# WHAT THE `new` SHAPE IS ACTUALLY CHECKING: that the candidate NAMES its
+# nearest card and SAYS, in its own words, why that card is not the same
+# subject.  It is not checking the word "because".  Widened 2026-09-15 after the
+# gate dropped 5 of 20 valid candidates in one night (C7, C8, C10, C12, C15 of
+# the 2026-09-15 inbox), every one of which gave the justification in a
+# PARENTHESIS — "unrelated (an earlier watchdog gotcha list, not a build
+# cycle)" — instead of after "because".  That is K-02720's class exactly: a
+# pipeline parser that accepts one exact textual form drops valid content, and
+# the content looks like a night that produced nothing.  The justification is
+# still MANDATORY: `unrelated` with nothing after it does not match.
 NEW_RE = re.compile(
-    r"^new\b\s*[—–:-]?\s*nearest\s+(K-\d{5})\b\s*unrelated\s+because\s+(\S.*)$",
+    r"^new\b\s*[—–:-]?\s*nearest\s+(K-\d{5})\b\s*unrelated\b"
+    r"\s*(?:because\b\s*:?|[—–:,-]|(?=\())\s*(\S.*)$",
     re.I)
 
 
@@ -101,8 +114,8 @@ def split_head(text):
 
     Everything from the first `## ` heading that is NOT the cards heading is
     review plumbing (`## Flagged`, `## Dropped`, `## DEFERRED`, ...) and is
-    carried through verbatim.  The lesson verify_quotes.py paid for first: a last
-    candidate that absorbs the file's tail invents findings out of prose.
+    carried through verbatim.  The 2026-07-30 lesson from verify_quotes.py: a
+    last candidate that absorbs the file's tail invents findings out of prose.
     """
     for m in SECTION_RE.finditer(text):
         if m.group(1).strip().lower().rstrip(":") != "cards":
@@ -250,39 +263,49 @@ def self_test():
         know, arch = os.path.join(d, "know"), os.path.join(d, "arch")
         os.makedirs(know)
         os.makedirs(arch)
-        for cid, status in (("K-90001", "active"), ("K-90003", "superseded"),
-                            ("K-90005", "challenged"), ("K-90006", "refuted")):
+        for cid, status in (("K-00001", "active"), ("K-00003", "superseded"),
+                            ("K-00005", "challenged"), ("K-00006", "refuted")):
             open(os.path.join(know, f"{cid}.md"), "w").write(
                 f"---\nid: {cid}\nstatus: {status}\n---\nbody\n")
-        open(os.path.join(arch, "K-90004.md"), "w").write(
-            "---\nid: K-90004\nstatus: active\n---\nbody\n")
-        near = ("NEAREST: K-90001 (1.0), K-90003 (0.5), K-90005 (0.4), "
-                "K-90006 (0.3)\n")
+        open(os.path.join(arch, "K-00004.md"), "w").write(
+            "---\nid: K-00004\nstatus: active\n---\nbody\n")
+        near = ("NEAREST: K-00001 (1.0), K-00003 (0.5), K-00005 (0.4), "
+                "K-00006 (0.3)\n")
         cases = [
             ("supersedes active",
-             near + "RELATION: supersedes K-90001 BECAUSE it was mismeasured.",
+             near + "RELATION: supersedes K-00001 BECAUSE it was mismeasured.",
              "OK"),
-            ("supports active", near + "RELATION: supports K-90001", "OK"),
+            ("supports active", near + "RELATION: supports K-00001", "OK"),
             ("new naming a nearest id",
-             near + "RELATION: new — nearest K-90001 unrelated because other "
+             near + "RELATION: new — nearest K-00001 unrelated because other "
                     "subsystem.", "OK"),
-            ("archived target", near + "RELATION: supports K-90004", "FLAG"),
+            # 2026-09-15: the justification may be parenthetical or after a
+            # dash/colon — the gate wants the reason, not the word "because".
+            ("new, parenthetical justification",
+             near + "RELATION: new — nearest K-00001 unrelated (an earlier "
+                    "watchdog gotcha list, not a build cycle).", "OK"),
+            ("new, dash justification",
+             near + "RELATION: new — nearest K-00001 unrelated — other "
+                    "subsystem.", "OK"),
+            ("new, no justification at all",
+             near + "RELATION: new — nearest K-00001 unrelated", "DROP"),
+            ("archived target", near + "RELATION: supports K-00004", "FLAG"),
             ("no relation", near + "DECIDED: nothing.", "DROP"),
             ("supersedes a superseded card",
-             near + "RELATION: supersedes K-90003 BECAUSE stale.", "DROP"),
+             near + "RELATION: supersedes K-00003 BECAUSE stale.", "DROP"),
             # G2: the target most in need of superseding is a CHALLENGED one.
             ("supersedes a challenged card",
-             near + "RELATION: supersedes K-90005 BECAUSE remeasured on a fixed "
+             near + "RELATION: supersedes K-00005 BECAUSE remeasured on a fixed "
                     "rig.", "OK"),
             ("supersedes a refuted card",
-             near + "RELATION: supersedes K-90006 BECAUSE stale.", "DROP"),
-            ("unknown id", near + "RELATION: supports K-99999", "DROP"),
-            ("malformed verb", near + "RELATION: refines K-90001", "DROP"),
+             near + "RELATION: supersedes K-00006 BECAUSE stale.", "DROP"),
+            ("unknown id", near + "RELATION: supports K-09999", "DROP"),
+            ("malformed verb", near + "RELATION: refines K-00001", "DROP"),
             ("new naming a non-nearest id",
-             near + "RELATION: new — nearest K-90004 unrelated because x.",
+             near + "RELATION: new — nearest K-00004 unrelated because x.",
              "DROP"),
             ("two relation lines",
-             near + "RELATION: supports K-90001\nRELATION: contradicts K-90001",
+             near + "RELATION: supports K-00001\nRELATION: contradicts K-00001",
              "DROP"),
         ]
         for name, body, want in cases:
@@ -301,8 +324,8 @@ def main(argv=None):
     ap.add_argument("--max", type=int, default=None,
                     help="cap on candidates kept; the overflow goes to "
                          "## DEFERRED in file order")
-    ap.add_argument("--know", default=KNOW)
-    ap.add_argument("--archive", default=ARCHIVE)
+    ap.add_argument("--know", default=None)
+    ap.add_argument("--archive", default=None)
     ap.add_argument("--dry-run", action="store_true",
                     help="report only, do not rewrite the file")
     ap.add_argument("--self-test", action="store_true")
@@ -310,6 +333,10 @@ def main(argv=None):
 
     if a.self_test:
         return self_test()
+    a.know = a.know or P.KNOW
+    a.archive = a.archive or P.ARCHIVE_KNOW
+    if a.cards and not a.dry_run and not P.may_write(a.cards):
+        P.require_writable(f"rewrite {a.cards}")
     if not a.cards:
         ap.error("cards file required (or use --self-test)")
     try:
@@ -339,10 +366,10 @@ def main(argv=None):
             fh.write(out)
         os.replace(tmp, a.cards)
     # A GATE THAT REJECTS EVERYTHING IS REPORTING ON ITSELF, not on the night.
-    # Measured on a copy of a real inbox written before this gate existed: 36 of
-    # 36 dropped. That is what a prompt the stage did not follow looks like from
-    # here, and it must not read as "36 bad candidates" to whoever opens the
-    # report at five in the morning. Printed BEFORE the summary on purpose —
+    # Measured 2026-09-04 on a copy of that morning's real inbox (written before
+    # this gate existed): 36 of 36 dropped. That is what a prompt the stage did
+    # not follow looks like from here, and it must not read as "36 bad
+    # candidates" at 04:45. Printed BEFORE the summary on purpose —
     # nightly_distill.sh logs `tail -1` of this report and that line has to stay
     # the counts.
     if counts["dropped"] >= 5 and counts["dropped"] > counts["kept"]:

@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+# khms_paths.sh -- the shell half of the KHMS location resolver; khms_paths.py is the other half.
+#
+# Usage (sourced):   . "$(dirname "$(readlink -f "$0")")/khms_paths.sh"; khms_load || exit $?
+#                    root="$(khms_get KHMS_ROOT)"; khms_require_writable "allocate ids" || exit $?
+# Usage (executed):  khms_paths.sh KEY | --all | --root      (same output and exit codes as khms_paths.py)
+#
+# Both readers implement ONE contract, documented in khms_paths.py: root discovery ($KHMS_ROOT, then
+# KHMS_ROOT in $KHMS_CONFIG_FILE, then ~/.config/khms/root, else an error), settings file selection,
+# env > file > default precedence, and the KEY=VALUE grammar with ${NAME} references. Cycles, unresolved
+# references, malformed lines, a missing explicitly selected file and a KHMS_READ_ONLY other than 0/1 fail
+# with rc 3. The file is parsed line by line and never sourced or evaluated.
+
+KHMS_CODE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+
+_KHMS_KEYS=(KHMS_ROOT KHMS_CONFIG_FILE KHMS_CONFIG_DIR KHMS_STATE KHMS_SHARED_STATE KHMS_READ_ONLY
+  KHMS_RECALL_LOG KHMS_RECALL_JSONL KHMS_INJECT_LOG KHMS_PRECHECK_LOG KHMS_CLAIM_LOG KHMS_HOOK_STATE
+  KHMS_HOOKS_OFF_FILE KHMS_LEN_CACHE KHMS_EXPERIMENT KHMS_GLOSSARY KHMS_DIRECTIVE KHMS_EMBED_DIR
+  KHMS_EMBED_PY KHMS_DENSE_SOCKET KHMS_HF_HOME KHMS_SNAPSHOT_ROOT KHMS_TRANSCRIPTS KHMS_MESSAGES KHMS_PATTERNS)
+declare -gA _KHMS_DEFAULT=(
+  [KHMS_CONFIG_FILE]="" [KHMS_CONFIG_DIR]='${KHMS_ROOT}/config' [KHMS_STATE]='${KHMS_ROOT}/state'
+  [KHMS_SHARED_STATE]='${KHMS_ROOT}/state/shared' [KHMS_READ_ONLY]="0"
+  [KHMS_RECALL_LOG]='${KHMS_STATE}/recall.log' [KHMS_RECALL_JSONL]='${KHMS_STATE}/recall.jsonl'
+  [KHMS_INJECT_LOG]='${KHMS_STATE}/inject.log' [KHMS_PRECHECK_LOG]='${KHMS_STATE}/precheck.log'
+  [KHMS_CLAIM_LOG]='${KHMS_STATE}/claim_gate.log' [KHMS_HOOK_STATE]='${KHMS_STATE}/hook-state'
+  [KHMS_HOOKS_OFF_FILE]='${KHMS_STATE}/hooks-off' [KHMS_LEN_CACHE]='${KHMS_STATE}/cardlen.json'
+  [KHMS_EXPERIMENT]='${KHMS_CONFIG_DIR}/khms_experiment.json' [KHMS_GLOSSARY]="" [KHMS_DIRECTIVE]=""
+  [KHMS_EMBED_DIR]='${KHMS_SHARED_STATE}/embed' [KHMS_EMBED_PY]="" [KHMS_DENSE_SOCKET]=""
+  [KHMS_HF_HOME]="" [KHMS_SNAPSHOT_ROOT]="" [KHMS_TRANSCRIPTS]=""
+  [KHMS_MESSAGES]='${KHMS_CONFIG_DIR}/messages.env' [KHMS_PATTERNS]='${KHMS_CONFIG_DIR}/patterns.env')
+declare -gA _KHMS_RAW=()
+_KHMS_ROOT_RESOLVED=""
+_KHMS_CFG_RESOLVED=""
+
+_khms_err() { echo "khms_paths: $*" >&2; return 3; }
+
+_khms_parse() {   # _khms_parse FILE -> fills _KHMS_RAW; rc 3 on a malformed line
+  local file="$1" line s v n=0
+  _KHMS_RAW=()
+  while IFS= read -r line || [ -n "$line" ]; do
+    n=$((n + 1))
+    s="${line#"${line%%[![:space:]]*}"}"; s="${s%"${s##*[![:space:]]}"}"
+    [ -z "$s" ] && continue
+    [ "${s:0:1}" = "#" ] && continue
+    [[ "$s" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]] \
+      || { _khms_err "malformed line $n in $file (expected KEY=VALUE)"; return 3; }
+    v="${BASH_REMATCH[2]}"
+    v="${v#"${v%%[![:space:]]*}"}"; v="${v%"${v##*[![:space:]]}"}"
+    if [ "${#v}" -ge 2 ] && [ "${v:0:1}" = "${v: -1}" ] && { [ "${v:0:1}" = '"' ] || [ "${v:0:1}" = "'" ]; }; then
+      v="${v:1:${#v}-2}"
+    fi
+    _KHMS_RAW["${BASH_REMATCH[1]}"]="$v"
+  done < "$file"
+}
+
+_khms_expand() {  # _khms_expand RAW STACK(space separated, first = requested key) -> expanded value
+  local raw="$1" stack="$2" out="" rest="$1" name sub
+  while [[ "$rest" =~ \$\{([A-Za-z_][A-Za-z0-9_]*)\} ]]; do
+    name="${BASH_REMATCH[1]}"
+    case " $stack " in *" $name "*)
+      local first="${stack%% *}"
+      _khms_err "$first refers to itself through ${stack// / -> } -> $name"; return 3 ;;
+    esac
+    out+="${rest%%"${BASH_REMATCH[0]}"*}"
+    sub="$(_khms_resolve "$name" "$stack $name")" || return 3
+    out+="$sub"
+    rest="${rest#*"${BASH_REMATCH[0]}"}"
+  done
+  printf '%s' "$out$rest"
+}
+
+_khms_resolve() { # _khms_resolve KEY STACK
+  local key="$1" stack="$2"
+  if [ "$key" = KHMS_ROOT ] && [ -n "$_KHMS_ROOT_RESOLVED" ]; then printf '%s' "$_KHMS_ROOT_RESOLVED"; return 0; fi
+  if [ "$key" = KHMS_CONFIG_FILE ] && [ -n "$_KHMS_ROOT_RESOLVED" ]; then printf '%s' "$_KHMS_CFG_RESOLVED"; return 0; fi
+  if [ -n "${!key:-}" ]; then printf '%s' "${!key}"; return 0; fi
+  if [ -n "${_KHMS_RAW[$key]:-}" ]; then _khms_expand "${_KHMS_RAW[$key]}" "$stack"; return $?; fi
+  if [ -n "${_KHMS_DEFAULT[$key]+x}" ] && [ "$key" != KHMS_ROOT ]; then
+    _khms_expand "${_KHMS_DEFAULT[$key]}" "$stack"; return $?
+  fi
+  _khms_err "${stack%% *} refers to \${$key}, which nothing defines"
+}
+
+khms_load() {     # discover root and settings file; rc 3 with a reason when impossible
+  local cfg="${KHMS_CONFIG_FILE:-}" root="${KHMS_ROOT:-}" reg other
+  _KHMS_RAW=(); _KHMS_ROOT_RESOLVED=""; _KHMS_CFG_RESOLVED=""
+  if [ -n "$cfg" ]; then
+    [ -f "$cfg" ] || { _khms_err "config file $cfg does not exist (named by KHMS_CONFIG_FILE)"; return 3; }
+    [ -r "$cfg" ] || { _khms_err "cannot read config file $cfg"; return 3; }
+    _khms_parse "$cfg" || return 3
+  fi
+  if [ -z "$root" ] && [ -n "$cfg" ] && [ -n "${_KHMS_RAW[KHMS_ROOT]:-}" ]; then
+    root="$(_khms_expand "${_KHMS_RAW[KHMS_ROOT]}" "KHMS_ROOT")" || return 3
+  fi
+  if [ -z "$root" ] && [ -n "${HOME:-}" ]; then
+    reg="$HOME/.config/khms/root"
+    if [ -f "$reg" ]; then
+      IFS= read -r root < "$reg" || true
+      root="${root#"${root%%[![:space:]]*}"}"; root="${root%"${root##*[![:space:]]}"}"
+    fi
+  fi
+  if [ -z "$root" ]; then
+    _khms_err "no KHMS data root -- set KHMS_ROOT, name a settings file with KHMS_CONFIG_FILE," \
+              "or create and register a base with: khms_init.sh --register <dir>"; return 3
+  fi
+  [ "${root:0:1}" = / ] || { _khms_err "KHMS_ROOT must be an absolute path, got: $root"; return 3; }
+  if [ -z "$cfg" ] && [ -f "$root/config/khms.env" ]; then
+    cfg="$root/config/khms.env"
+    _khms_parse "$cfg" || return 3
+    if [ -n "${_KHMS_RAW[KHMS_ROOT]:-}" ]; then
+      other="$(_khms_expand "${_KHMS_RAW[KHMS_ROOT]}" "KHMS_ROOT")" || return 3
+      local a="${other%"${other##*[!/]}"}" b="${root%"${root##*[!/]}"}"
+      [ "${a:-/}" = "${b:-/}" ] \
+        || { _khms_err "$cfg names KHMS_ROOT=$other but the discovered root is $root"; return 3; }
+    fi
+  fi
+  _KHMS_ROOT_RESOLVED="$root"; _KHMS_CFG_RESOLVED="$cfg"
+  local ro; ro="$(_khms_resolve KHMS_READ_ONLY KHMS_READ_ONLY)" || return 3
+  case "$ro" in 0|1) ;; *) _khms_err "KHMS_READ_ONLY must be 0 or 1, got: $ro"; return 3 ;; esac
+}
+
+khms_get() {      # khms_get KEY -> resolved value on stdout (khms_load first)
+  [ -n "${1:-}" ] || { _khms_err "khms_get needs a KEY"; return 2; }
+  [ -n "$_KHMS_ROOT_RESOLVED" ] || khms_load || return 3
+  _khms_resolve "$1" "$1"
+}
+
+khms_require_writable() {   # khms_require_writable "<what>" -> rc 4 and a message when read-only
+  local ro; ro="$(khms_get KHMS_READ_ONLY)" || return 3
+  if [ "$ro" = 1 ]; then
+    echo "khms: read-only deployment (KHMS_READ_ONLY=1): refusing to $1; nothing was written" >&2
+    return 4
+  fi
+}
+
+khms_may_write() {   # khms_may_write PATH -> rc 0 when this deployment may append to PATH (see khms_paths.py)
+  local ro p k b; ro="$(khms_get KHMS_READ_ONLY)" || return 3
+  [ "$ro" = 1 ] || return 0
+  p="$(realpath -m -- "$1")"
+  for k in KHMS_ROOT KHMS_CONFIG_DIR KHMS_SHARED_STATE; do
+    b="$(khms_get "$k")" || return 3; b="$(realpath -m -- "$b")"
+    [ "$p" = "$b" ] && return 1
+    case "$p" in "${b%/}/"*) return 1 ;; esac
+  done
+  return 0
+}
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  case "${1:-}" in
+    ""|-h|--help) sed -n '2,6p' "${BASH_SOURCE[0]}"; [ -n "${1:-}" ]; exit $? ;;
+  esac
+  khms_load || exit 3
+  case "$1" in
+    --all) for k in "${_KHMS_KEYS[@]}"; do v="$(khms_get "$k")" || exit 3; printf '%s=%s\n' "$k" "$v"; done ;;
+    --root) printf '%s\n' "$_KHMS_ROOT_RESOLVED" ;;
+    KHMS_*) v="$(khms_get "$1")" || exit 3; printf '%s\n' "$v" ;;
+    *) echo "khms_paths: unknown name $1" >&2; exit 2 ;;
+  esac
+fi

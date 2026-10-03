@@ -571,7 +571,11 @@ def handle_session_start():
     try:
         for f in sorted(os.listdir(P.INBOX)):
             m = re.match(r"^(\d{4}-\d{2}-\d{2})(-weekly)?\.md$", f)
-            if m and not os.path.exists(os.path.join(P.TOOLS_DIR, f".reviewed-{m.group(1)}")):
+            stem = f[:-3]
+            # A review is recorded per unit by approve_inbox.py (`.reviewed-<unit>-cards`); the plain
+            # `.reviewed-<date>` marker is still honoured.
+            if m and not any(os.path.exists(os.path.join(P.REVIEW_MARKERS, n))
+                             for n in (f".reviewed-{m.group(1)}", f".reviewed-{stem}-cards")):
                 unreviewed.append(f)
     except OSError:
         unreviewed = []      # no inbox yet; the directive below still goes in
@@ -580,7 +584,7 @@ def handle_session_start():
         parts.append(
             "KHMS: UNREVIEWED INBOX: " + ", ".join(unreviewed)
             + " — review it (approve_inbox.py, build_views.py, report to the operator) "
-              "BEFORE other work. Mark it done with: touch tools/.reviewed-<date>")
+              "BEFORE other work. Mark it done with: touch the review marker .reviewed-<date> in the shared state")
         log("SessionStart", "inbox-check", f"inject inbox={','.join(unreviewed)}")
     else:
         log("SessionStart", "inbox-check", "silent (inbox clean)")

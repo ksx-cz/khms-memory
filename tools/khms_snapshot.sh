@@ -1,80 +1,82 @@
 #!/usr/bin/env bash
-# Local, hardlinked snapshots of a KHMS base — version control for a base that is not
-# in git, and cannot be.
+# Local, hardlinked snapshots of a KHMS base — the version control a base is allowed to have.
 #
-# WHY THIS EXISTS. A base does not have to live in a repository, and in some deployments
-# it must not: the operator wants their knowledge on their own machine and their own
-# synced folder, with no remote and no history object anybody else can clone. What a
-# repository would have given is two concrete things, and neither of them needs git:
-# a way to see WHAT CHANGED since the last known-good state, and a way to GET A FILE BACK
-# after a tool wrote nonsense into it. (The incident behind this script: a bulk-edit tool
-# rewrote eleven cards, and the only reason it was recoverable was a copy somebody had
-# taken by hand that morning.)
+# WHY NOT GIT. The reference deployment's owner keeps the knowledge base out of every git
+# repository, private ones included: it lives on a synced drive and locally. So there is no
+# repository, no remote, no commits.
+# What the audit of 2026-09-02 actually asked for is the two things a repository would have
+# given: a way to see WHAT CHANGED since the last known-good state, and a way to GET A FILE
+# BACK after a tool wrote nonsense into it (that audit's own incident: khms_dedup.py rewrote
+# eleven cards, and the only reason it was recoverable was a snapshot somebody had taken by
+# hand that morning). Both are answerable without git.
 #
-# HOW. rsync --link-dest against the previous snapshot: unchanged files become hardlinks,
-# so a daily snapshot of a 90 MB base costs the bytes that actually changed, and every
-# snapshot is still a COMPLETE tree you can read, diff and copy from with cat and cp — no
-# tool needed to open it. That property is the point: a backup you need a working program
-# to read is a backup that fails exactly when the program is what broke.
+# HOW. rsync --link-dest against the previous snapshot: unchanged files become hardlinks, so a
+# daily snapshot of a 90 MB base costs the bytes that actually changed, and every snapshot is
+# still a COMPLETE tree you can read, diff and copy from with cat/cp — no tool needed to open
+# it. That property is the point: a backup you need a working program to read is a backup that
+# fails exactly when the program is what broke.
 #
-# WHERE. The snapshot root lives OUTSIDE the base, deliberately. A base that is
-# continuously synced to a cloud folder would otherwise multiply that payload by the
-# number of snapshots; outside it, snapshots are local, and the synced folder keeps its
-# own file versions.
-#
-# WHAT THIS IS NOT. It is not bisect and it is not blame. `git log -p` over a card's
-# history answers questions this cannot; `--list` and `--diff` answer "what changed since
-# when" and `--restore` answers "give me that file back", which is what a knowledge base
-# actually gets asked. Choose deliberately, and say which one you chose in your setup
-# notes — see AGENTS.md Step 1.
+# WHERE. SNAP_ROOT (KHMS_SNAPSHOT_ROOT, default ~/.khms-snapshots) is OUTSIDE the base,
+# deliberately: a base that is live-synced to a file-sync service would otherwise multiply the
+# sync payload by the number of snapshots; outside it, they are local only and the sync service
+# keeps its own file versions.
 #
 # COMMANDS
 #   khms_snapshot.sh [--tag LABEL]        take a snapshot  (the `git commit`)
 #   khms_snapshot.sh --list               one line per snapshot  (the `git log`)
-#   khms_snapshot.sh --diff [SNAP|latest] base vs a snapshot  (the `git status`)
+#   khms_snapshot.sh --diff [SNAP|latest] brain vs a snapshot  (the `git status`)
 #   khms_snapshot.sh --restore SNAP PATH  copy one file/dir back  (the `git checkout --`)
 #   khms_snapshot.sh --prune [--dry]      30 daily / 52 weekly / then monthly
 #
 # ENVIRONMENT (all optional; the tests use them, cron does not)
-#   KHMS_ROOT              the base to snapshot     (default: this script's parent directory)
-#   KHMS_SNAPSHOT_ROOT     where snapshots live     (default: ~/.khms-snapshots)
-#   KHMS_SNAPSHOT_KEEP     a tag --prune never removes, e.g. a pre-upgrade snapshot
-#   KHMS_SNAPSHOT_NOW      "now" for naming/prune   (any `date -d` string; default: real now)
+#   BRAIN_SNAPSHOT_BRAIN   base to snapshot         (default: KHMS_ROOT, see khms_paths.sh)
+#   BRAIN_SNAPSHOT_ROOT    where snapshots live     (default: KHMS_SNAPSHOT_ROOT, else ~/.khms-snapshots)
+#   BRAIN_SNAPSHOT_NOW     "now" for naming/prune   (any `date -d` string; default: real now)
 #
 # EXIT CODES: 0 ok · 2 usage · 3 refused (unsafe path) · 4 rsync failed
 set -uo pipefail
 
-SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DEFAULT_BASE="$(cd "$SELF_DIR/.." && pwd)"
-DEFAULT_ROOT="$HOME/.khms-snapshots"
-BASE="${KHMS_ROOT:-$DEFAULT_BASE}"
-SNAP_ROOT="${KHMS_SNAPSHOT_ROOT:-$DEFAULT_ROOT}"
-KEEP_TAG="${KHMS_SNAPSHOT_KEEP:-}"
+SELF_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+. "$SELF_DIR/khms_paths.sh"
+if [[ -n "${BRAIN_SNAPSHOT_BRAIN:-}" ]]; then
+  DEFAULT_BRAIN="$(khms_get KHMS_ROOT 2>/dev/null || true)"
+else
+  khms_load || exit 3
+  DEFAULT_BRAIN="$(khms_get KHMS_ROOT)"
+fi
+DEFAULT_ROOT="$(khms_get KHMS_SNAPSHOT_ROOT 2>/dev/null || true)"
+DEFAULT_ROOT="${DEFAULT_ROOT:-$HOME/.khms-snapshots}"
+BRAIN="${BRAIN_SNAPSHOT_BRAIN:-$DEFAULT_BRAIN}"
+SNAP_ROOT="${BRAIN_SNAPSHOT_ROOT:-$DEFAULT_ROOT}"
 
-# THE EXCLUDE LIST IS THE SPEC, not an optimisation. Every entry is either a log the
-# snapshot would otherwise duplicate on every run (.inject.log alone reaches megabytes and
-# grows on every tool call), a cache that regenerates itself, or a sync database that is
-# meaningless outside its own client. Session transcripts are NOT excluded on purpose where
-# you keep them under the base: they are the evidence record, and a version history of the
-# evidence is worth its bytes. Add your own entries; keep the comment honest about why.
+# THE EXCLUDE LIST IS THE SPEC, not an optimisation. Every entry is either a log the snapshot
+# would otherwise duplicate hourly (.inject.log alone is 6 MB and grows every tool call), a
+# cache that regenerates itself (__pycache__, .embed, .pytest_cache), a sync database that is
+# meaningless outside its own client (.sync_*.db*), or a payload that is not knowledge at all
+# (tools/chore-home is an npm cache). archive/transcripts is NOT here on purpose — it is the
+# evidence record, and a version history of the evidence is worth its bytes.
 EXCLUDES=(
   ".inject.log"
   ".recall.log"
   ".precheck.log"
-  ".claim_gate.log"
   ".hook-state/"
   ".sync_*.db*"
+  "tools/chore-home"
+  "tools/chore-runs"
+  "tools/chore-sandbox"
+  "archive/transcripts"
   "__pycache__"
   "memory/.embed"
   ".pytest_cache"
   "tools/*.log"
+  "logs"
 )
 
-usage() { awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "${BASH_SOURCE[0]}"; }
+usage() { sed -n '2,38p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 die()   { local msg="$1"; echo "khms_snapshot.sh: $msg" >&2; exit "${2:-2}"; }
 
 now_epoch() {
-  if [[ -n "${KHMS_SNAPSHOT_NOW:-}" ]]; then date -d "$KHMS_SNAPSHOT_NOW" +%s
+  if [[ -n "${BRAIN_SNAPSHOT_NOW:-}" ]]; then date -d "$BRAIN_SNAPSHOT_NOW" +%s
   else date +%s; fi
 }
 
@@ -97,7 +99,7 @@ list_snaps() {
 }
 newest_snap() { list_snaps | tail -1; }
 
-# Does a path relative to the base root fall under the exclude list? This is the ONE place
+# Does a path relative to the brain root fall under the exclude list? This is the ONE place
 # the rules live; --diff filters its output through it so "what the snapshot skipped" and
 # "what the diff ignores" cannot drift apart — a drift that would make --diff report
 # differences the snapshot was never going to hold.
@@ -134,19 +136,19 @@ write_meta() {
 # --------------------------------------------------------------------------- take
 cmd_take() {
   local tag="${1:-}" epoch stamp name prev dest rc
-  [[ -d "$BASE" ]] || die "base not found: $BASE"
-  # MEASURED in this script's own acceptance run: a --restore against a throwaway base
-  # wrote its pre-restore snapshot into the REAL snapshot root and moved `latest` onto a
-  # one-file tree. `latest` is what --diff compares against and what the next --link-dest
-  # uses, so that one stray snapshot would have made the next run a full copy and every
-  # --diff a lie. A foreign base therefore needs a foreign root, and says so.
-  if [[ "$BASE" != "$DEFAULT_BASE" && "$SNAP_ROOT" == "$DEFAULT_ROOT" ]]; then
-    die "refusing to snapshot $BASE into the default snapshot root; set KHMS_SNAPSHOT_ROOT too" 3
+  [[ -d "$BRAIN" ]] || die "brain not found: $BRAIN"
+  # MEASURED 2026-09-04, in this script's own acceptance run: a --restore against a throwaway
+  # brain wrote its pre-restore snapshot into the REAL snapshot root and moved `latest` onto a
+  # one-file tree. `latest` is what --diff compares against and what the next --link-dest uses,
+  # so that single stray snapshot would have made the next night's snapshot a full copy and
+  # every --diff a lie. A foreign brain therefore needs a foreign root, and says so.
+  if [[ "$BRAIN" != "$DEFAULT_BRAIN" && "$SNAP_ROOT" == "$DEFAULT_ROOT" ]]; then
+    die "refusing to snapshot $BRAIN into the real snapshot root; set BRAIN_SNAPSHOT_ROOT too" 3
   fi
   mkdir -p "$SNAP_ROOT" || die "cannot create $SNAP_ROOT"
 
-  # One snapshot at a time. The cron lines and the card writers can all fire within the
-  # same minute; two rsyncs into names derived from the same clock is how you get a
+  # One snapshot at a time. Cron (03:15, 06:30) and the two card writers can all fire within
+  # the same minute; two rsyncs into names derived from the same clock is how you get a
   # half-written "previous" tree used as the next --link-dest.
   exec 9>"$SNAP_ROOT/.lock"
   flock -w 900 9 || die "another snapshot is running (lock held >900 s)" 4
@@ -166,9 +168,9 @@ cmd_take() {
   local args=(-a --delete)
   [[ -n "$prev" ]] && args+=(--link-dest="$SNAP_ROOT/$prev")
   mapfile -t exc < <(rsync_excludes)
-  rsync "${args[@]}" "${exc[@]}" "$BASE/" "$dest/"
+  rsync "${args[@]}" "${exc[@]}" "$BRAIN/" "$dest/"
   rc=$?
-  # 23/24 = "some files vanished or could not be read while we copied". The base is LIVE:
+  # 23/24 = "some files vanished or could not be read while we copied". The brain is LIVE:
   # another agent's temp file disappearing mid-run is normal and is not a failed snapshot.
   # Anything else is.
   if [[ $rc -ne 0 && $rc -ne 23 && $rc -ne 24 ]]; then
@@ -179,7 +181,7 @@ cmd_take() {
 
   write_meta "$dest" "$tag" "$prev" "$(date -d "@$epoch" -Is)"
   ln -sfn "$name" "$SNAP_ROOT/latest"
-  echo "snapshot $name  <- $BASE  (prev: ${prev:-none})"
+  echo "snapshot $name  <- $BRAIN  (prev: ${prev:-none})"
   cat "$dest/.snapshot.json"
 }
 
@@ -215,7 +217,7 @@ PY
 }
 
 # --------------------------------------------------------------------------- diff
-# `git status`: what does the base hold now that the snapshot does not, and vice versa.
+# `git status`: what does the brain hold now that the snapshot does not, and vice versa.
 # diff -rq does not descend into a directory that exists on only one side, so the excluded
 # 1.1 GB never gets walked; its "Only in" line is dropped by is_excluded below.
 cmd_diff() {
@@ -231,8 +233,8 @@ cmd_diff() {
   local -a out=()
   while IFS= read -r line; do
     case "$line" in
-      "Only in $BASE"*|"Only in $BASE/"*)
-        rel="${line#Only in $BASE}"; rel="${rel#/}"; rel="${rel%%:*}/${line##*: }"
+      "Only in $BRAIN"*|"Only in $BRAIN/"*)
+        rel="${line#Only in $BRAIN}"; rel="${rel#/}"; rel="${rel%%:*}/${line##*: }"
         rel="${rel#/}"
         is_excluded "$rel" && continue
         added=$((added+1)); out+=("+ $rel") ;;
@@ -243,7 +245,7 @@ cmd_diff() {
         is_excluded "$rel" && continue
         removed=$((removed+1)); out+=("- $rel") ;;
       "Files "*" differ")
-        rel="${line#Files }"; rel="${rel%% and *}"; rel="${rel#$BASE/}"
+        rel="${line#Files }"; rel="${rel%% and *}"; rel="${rel#$BRAIN/}"
         is_excluded "$rel" && continue
         changed=$((changed+1)); out+=("M $rel") ;;
       *)
@@ -251,29 +253,30 @@ cmd_diff() {
         # compare them and says so. Counted, shown, never silently swallowed.
         special=$((special+1)); out+=("? $line") ;;
     esac
-  done < <(diff -rq "$BASE" "$snap" 2>/dev/null)
+  done < <(diff -rq "$BRAIN" "$snap" 2>/dev/null)
   printf '%s\n' "${out[@]}" | grep -v '^$' || true
-  echo "--- base vs $(basename "$snap"): added=$added removed=$removed changed=$changed special=$special"
+  echo "--- brain vs $(basename "$snap"): added=$added removed=$removed changed=$changed special=$special"
   return 0
 }
 
 # --------------------------------------------------------------------------- restore
-# `git checkout -- <path>`: one file or directory, out of one snapshot, back into the base.
+# `git checkout -- <path>`: one file or directory, out of one snapshot, back into the brain.
 # It takes a pre-restore snapshot FIRST, because a restore is itself a write that can be the
 # wrong one — restoring yesterday's card over today's correction is the same class of loss the
 # tool exists to undo, and the undo of the undo has to exist before the undo runs.
 cmd_restore() {
+  khms_require_writable "restore into the base" || exit 3
   local which="${1:-}" rel="${2:-}" snap src dst real
-  [[ -n "$which" && -n "$rel" ]] || die "usage: --restore <snapshot|latest> <path-relative-to-base>"
+  [[ -n "$which" && -n "$rel" ]] || die "usage: --restore <snapshot|latest> <path-relative-to-brain>"
   if [[ "$which" == latest ]]; then
     snap="$(readlink -f "$SNAP_ROOT/latest" 2>/dev/null)"
     [[ -n "$snap" && -d "$snap" ]] || die "no 'latest' snapshot in $SNAP_ROOT"
   else
     snap="$SNAP_ROOT/$which"; [[ -d "$snap" ]] || die "no such snapshot: $which"
   fi
-  # REFUSE ANYTHING THAT LEAVES THE BASE, before touching a byte. An absolute path or a `..`
+  # REFUSE ANYTHING THAT LEAVES THE BRAIN, before touching a byte. An absolute path or a `..`
   # would let a restore write into ~/.claude or /etc with the caller believing it was scoped
-  # to the base; the check is on the RESOLVED path, so a symlink inside the base cannot
+  # to the base; the check is on the RESOLVED path, so a symlink inside the brain cannot
   # smuggle the write out either.
   case "$rel" in
     /*)     die "refusing an absolute path: $rel" 3 ;;
@@ -281,9 +284,9 @@ cmd_restore() {
   esac
   src="$snap/$rel"
   [[ -e "$src" ]] || die "not in $(basename "$snap"): $rel"
-  dst="$BASE/$rel"
+  dst="$BRAIN/$rel"
   real="$(readlink -m "$dst")"
-  [[ "$real" == "$BASE/"* ]] || die "refusing to write outside the base: $real" 3
+  [[ "$real" == "$BRAIN/"* ]] || die "refusing to write outside the brain: $real" 3
 
   echo "pre-restore snapshot first:"
   ( cmd_take "pre-restore" ) || die "pre-restore snapshot failed — nothing restored" 4
@@ -293,7 +296,7 @@ cmd_restore() {
     rsync -a "$src/" "$dst/"
   else
     # --remove-destination unlinks the target before writing: without it, cp would write
-    # THROUGH the existing inode, and an inode the base shares with anything else would be
+    # THROUGH the existing inode, and an inode the brain shares with anything else would be
     # rewritten behind its back.
     cp -a --remove-destination "$src" "$dst"
   fi
@@ -304,8 +307,8 @@ cmd_restore() {
 # Keep everything for 30 days, then one per ISO week for a year, then one per month. The
 # tiers exist because the questions change with age: this week you ask "what did the nightly
 # do to this card last night", and a year out you ask "what did the base look like in March".
-# NEVER removed: whatever `latest` points at, and any snapshot whose tag equals
-# $KHMS_SNAPSHOT_KEEP — set that to the tag of a pre-upgrade tree you want kept forever.
+# NEVER removed: whatever `latest` points at, and the pre-audit-impl tag — the last tree from
+# before this whole implementation, which is the rollback point for it.
 cmd_prune() {
   local dry="${1:-}" now keep_reason latest_target
   now="$(now_epoch)"
@@ -321,7 +324,7 @@ cmd_prune() {
     label="$(snap_label "$s")"
     keep_reason=""
     if [[ "$s" == "$latest_target" ]]; then keep_reason="latest"
-    elif [[ -n "$KEEP_TAG" && "$label" == "$KEEP_TAG" ]]; then keep_reason="tagged-$KEEP_TAG"
+    elif [[ "$label" == "pre-audit-impl" ]]; then keep_reason="tagged-pre-audit-impl"
     elif (( age_d <= 30 )); then keep_reason="within-30d"
     fi
     if (( age_d <= 30 )); then

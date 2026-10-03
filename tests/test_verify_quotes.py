@@ -24,7 +24,7 @@ import sys
 import tempfile
 import unittest
 
-TOOLS = os.path.dirname(os.path.abspath(__file__))
+TOOLS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools")
 VERIFY = os.path.join(TOOLS, "verify_quotes.py")
 
 SOURCE = (

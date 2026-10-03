@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Acceptance tests for tools/nearest_cards.py.
 
-Run:  python3 -m pytest tools/test_nearest_cards.py
+Run:  python3 -m pytest tests/test_nearest_cards.py
 
 The mechanical half of "merge pressure": before the consolidate stage is asked which
 existing card a candidate supersedes or supports, it is TOLD which cards are nearest.
@@ -24,7 +24,7 @@ import sys
 import tempfile
 import unittest
 
-TOOLS = os.path.dirname(os.path.abspath(__file__))
+TOOLS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools")
 NEAREST = os.path.join(TOOLS, "nearest_cards.py")
 CARD_RE = re.compile(r"^#{2,3} +([A-Z]\d+[a-z]?):", re.M)
 NEAREST_RE = re.compile(r"^NEAREST: (.+)$", re.M)
@@ -81,7 +81,7 @@ def base(tmp):
     arch = os.path.join(tmp, "memory", "archive", "know")
     os.makedirs(know)
     os.makedirs(arch)
-    os.makedirs(os.path.join(tmp, "tools"))
+    os.makedirs(os.path.join(tmp, "state", "shared"), exist_ok=True)
     for cid, body in BODIES.items():
         open(os.path.join(know, cid + ".md"), "w").write(
             CARD % (cid, "problem→solution", "active", body))

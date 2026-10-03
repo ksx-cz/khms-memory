@@ -1,34 +1,29 @@
 #!/usr/bin/env python3
-"""injected → cited: was a card the hook injected ever actually used?
+"""injected → cited: was a card the hook injected ever used?
 
-The floor injects. Whether anything it injected was USED is a different question, and
-in the reference deployment it had never been asked: 2755 injections in 30 days (2044
-of them before tool calls, 502 on operator messages, 209 after tool results) and no
-measurement of what any of them changed. Injection is not free — it spends context on
-every message — so "does this event pay for itself?" has to be answerable per event
-before the budget can be tuned. This answers it per injection.
+Audit 2026-09-02, §5 and §6 A6: 2755 injections in 30 days (2044 PreToolUse,
+502 UserPromptSubmit, 209 PostToolUse/Failure) and whether ANY of them was used
+had never been measured — the audit's own number (15 of the 94 K-ids cited in a
+day's retrieval-claim lines were in that day's INJECT set) is a same-day proxy over one
+channel. This asks the question per injection.
 
-    inject_cited.py --since 14
-    inject_cited.py --since 14 --json
-    inject_cited.py --inject-log F --transcripts DIR --since 9999   # fixtures
-
-You need session transcripts for this: point `--transcripts` (or KHMS_TRANSCRIPTS) at
-the directory where your harness writes them, one JSON-lines file per session.
+    tools/inject_cited.py --since 14
+    tools/inject_cited.py --since 14 --json
+    tools/inject_cited.py --inject-log F --proj DIR --since 9999   # fixtures
 
 METHOD — and what it cannot know:
-  * .inject.log carries NO session id. A record is attributed to a transcript whose own
-    first/last timestamps bracket it (± COVER_MARGIN). When two sessions were live at
-    the same moment the record is `ambiguous` and counts as cited if it was cited in
-    ANY of them: the citation rate is therefore an UPPER bound. Records with no
-    covering transcript are `unattributed` and are NOT counted as uncited — they get
-    their own line, because folding "we could not tell" into "it was not used" is how
-    a measurement becomes an argument.
-  * cited = an injected card id appears in one of the next <=3 assistant messages of
-    that session (text, thinking or tool input — the whole JSON line is scanned). A
-    card that changed a decision without being named is invisible here, so the number
-    is a FLOOR on influence and a CEILING on nothing.
+  * .inject.log carries NO session id. A record is attributed to a transcript
+    whose own first/last timestamps bracket it (± COVER_MARGIN). When two main
+    sessions were live at the same moment the record is `ambiguous` and counts
+    as cited if it was cited in ANY of them: the citation rate is therefore an
+    UPPER bound. Records with no covering transcript are `unattributed` and are
+    NOT counted as uncited — they are reported on their own line.
+  * cited = an injected K-id appears in one of the next ≤3 assistant messages
+    of that session (text, thinking or tool_use input — the whole JSON line is
+    scanned). A card that changed a decision without being named is invisible
+    here, so the number is a FLOOR on influence and a CEILING on nothing.
   * transcripts run to 100 MB+; this streams them line by line and keeps only
-    (timestamp, card ids) per assistant message.
+    (timestamp, K-ids) per assistant message.
 """
 import argparse
 import collections
@@ -42,9 +37,8 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import khms_paths as P  # noqa: E402
 
-LOG = P.INJECT_LOG
-# Where your harness keeps session transcripts (JSON lines, one file per session).
-TRANSCRIPTS = os.environ.get("KHMS_TRANSCRIPTS", "")
+# Defaults resolve at run time: the agent's inject log (KHMS_INJECT_LOG) and the session transcript
+# directory (KHMS_TRANSCRIPTS, one JSON-lines file per session; unset = this report is off).
 LINE = re.compile(r"^(\S+) \| (\w+) \| q=(.*) \| nhits=(\d+) \| top=(\S+) \| (.*)$")
 KID = re.compile(r"K-\d{5}")
 COVER_MARGIN = 600.0        # s a session may start after / end before a record
@@ -60,14 +54,7 @@ def load_injects(path, since_days):
     cutoff = (datetime.date.today()
               - datetime.timedelta(days=since_days)).isoformat()
     out = []
-    try:
-        f = open(path, encoding="utf-8", errors="replace")
-    except OSError as exc:
-        # A missing audit log is a state, not a crash — but it is never "0 % of
-        # injections were used": say which file was not there.
-        print(f"no injection log to read: {exc}")
-        return out
-    with f:
+    with open(path, encoding="utf-8", errors="replace") as f:
         for ln in f:
             if "| INJECT [" not in ln:
                 continue
@@ -119,13 +106,17 @@ def scan_transcript(path, lo, hi):
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--since", type=int, default=14, help="days")
-    ap.add_argument("--inject-log", default=LOG)
-    ap.add_argument("--transcripts", default=TRANSCRIPTS,
-                    help="directory of session transcripts (JSON lines); "
-                         "defaults to $KHMS_TRANSCRIPTS")
+    ap.add_argument("--inject-log", default=None)
+    ap.add_argument("--proj", "--transcripts", dest="proj", default=None)
     ap.add_argument("--json", action="store_true")
     a = ap.parse_args(argv)
 
+    a.inject_log = a.inject_log or P.INJECT_LOG
+    a.proj = a.proj or P.get("KHMS_TRANSCRIPTS")
+    if not a.proj:
+        print("inject_cited: off -- no transcript directory (set KHMS_TRANSCRIPTS or pass --transcripts)",
+              file=sys.stderr)
+        return 2
     injects = load_injects(a.inject_log, a.since)
     if not injects:
         print("no INJECT records in the window")
@@ -134,12 +125,7 @@ def main(argv=None):
     hi = injects[-1][0] + 3600.0
 
     sessions = {}
-    if not a.transcripts:
-        print("no transcript directory: pass --transcripts DIR or set "
-              "KHMS_TRANSCRIPTS. Without transcripts there is nothing to check "
-              "the injections against.")
-        return 2
-    for p in sorted(glob.glob(os.path.join(a.transcripts, "*.jsonl"))):
+    for p in sorted(glob.glob(os.path.join(a.proj, "*.jsonl"))):
         if os.path.getmtime(p) < lo - 86400:
             continue
         msgs, first, last = scan_transcript(p, lo, hi)

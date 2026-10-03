@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Regression guard for the correction-edge mechanism.
 
-Run:  python3 tools/test_khms_lint.py   (or: python3 -m pytest tools/test_khms_lint.py)
+Run:  python3 tests/test_khms_lint.py   (or: python3 -m pytest tests/test_khms_lint.py)
 
 Two halves of one rule — a correction must be reachable from the card it
 corrects:
@@ -23,7 +23,7 @@ import sys
 import tempfile
 import unittest
 
-TOOLS = os.path.dirname(os.path.abspath(__file__))
+TOOLS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools")
 sys.path.insert(0, TOOLS)
 import khms_lint as L  # noqa: E402
 
@@ -116,8 +116,8 @@ class ApproveRefuses(unittest.TestCase):
         self.root = self.tmp.name
         self.know = os.path.join(self.root, "memory", "know")
         os.makedirs(self.know)
-        os.makedirs(os.path.join(self.root, "tools"))
-        self.counter = os.path.join(self.root, "tools", ".next_id")
+        os.makedirs(os.path.join(self.root, "state", "shared"), exist_ok=True)
+        self.counter = os.path.join(self.root, "state", "shared", "next_id")
         with open(self.counter, "w") as f:
             f.write("90500\n")
         with open(os.path.join(self.know, "K-90042.md"), "w") as f:
@@ -246,7 +246,7 @@ class HookProcess(unittest.TestCase):
     def test_empty_base_is_silent_and_clean(self):
         with tempfile.TemporaryDirectory() as d:
             os.makedirs(os.path.join(d, "memory", "know"))
-            os.makedirs(os.path.join(d, "tools"))
+            os.makedirs(os.path.join(d, "state", "shared"), exist_ok=True)
             r = self._run("a question about a sensor branch", d)
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertNotIn("Traceback", r.stderr)

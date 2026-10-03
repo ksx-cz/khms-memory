@@ -1,31 +1,26 @@
 #!/usr/bin/env python3
-"""Contradiction debt — what was FOUND against what the base actually records.
+"""Contradiction debt — what the triage stage found against what the base records.
 
-    khms_debt.py [--since DAYS] [--root DIR] [--cluster-min N]
+    khms_debt.py [--since DAYS] [--brain DIR] [--cluster-min N]
 
 WHY THIS EXISTS
 ---------------
-Measured in the reference deployment: a contradiction sweep judged 250 of 2951
-candidate pairs and confirmed 75 contradictions, while the whole base carried 8
-superseded + 7 refuted + 23 challenged cards (1.6 %). Contradictions were being FOUND
-and not being WRITTEN AS EDGES — and nothing printed that gap, so nothing acted on it.
-The same audit measured that 1041 of 2415 cards (43 %) had never been injected and had
-never been a recall top hit: a base growing faster than it is read.
+Measured 2026-09-02: the triage sweep judged 250 of 2951 candidate pairs and
+confirmed 75 contradictions; the whole base carries 8 superseded + 7 refuted +
+23 challenged cards (1.6 %).  Contradictions are being FOUND and not being
+WRITTEN AS EDGES — and nothing printed that gap, so nothing acted on it.  The
+same audit measured that 1041 of 2415 cards (43 %) had never been injected and
+had never been a recall top hit: a base that grows faster than it is read.
 
-This prints both, from artefacts that already exist (the cards themselves, the two
-retrieval logs, and — if you run one — the contradiction-triage proposals and their
-`.applied.md` ledgers). Zero model tokens, no writes anywhere. Wire it into your weekly
-report and run it by hand at review.
+This prints both, from the artefacts that already exist (triage proposals, their
+`.applied.md` ledgers, the cards, and the two retrieval logs).  Zero API tokens,
+no writes anywhere.  It is meant to be wired into the weekly report
+(`tools/token_weekly.sh`, owned elsewhere) and to be runnable by hand at review.
 
 A NUMBER THAT ONLY COUNTS DECISIONS WOULD LIE BY OMISSION, so three separate
-denominators are printed: pairs generated vs pairs judged (what the model budget never
-looked at), confirmed contradictions vs decided ones (what the review never reached),
-and cards vs cards ever touched (what retrieval never served).
-
-THE TRIAGE STAGE ITSELF IS NOT PART OF THIS REPOSITORY — it is a deployment-specific
-sweep that pairs cards and asks a model which of two contradicts the other. If you do
-not run one, the ledger section reports that it found none and the BASE and REACH
-sections stand on their own.
+denominators are printed: pairs generated vs pairs judged (what the LLM budget
+never looked at), confirmed contradictions vs decided ones (what the review
+never reached), and cards vs cards ever touched (what retrieval never served).
 """
 import argparse
 import datetime as dt
@@ -37,6 +32,8 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import khms_paths as P  # noqa: E402
 
+DEFAULT_BRAIN = None      # the base resolved by khms_paths when --brain is not given
+
 ROW_RE = re.compile(
     r"^###\s+(K-\d{5})\s*[—–-]\s*action\s+\*{0,2}([A-Z_]+)\*{0,2}"
     r"[^\n]*?\(contradicted by\s+(K-\d{5})", re.M)
@@ -44,6 +41,18 @@ VERDICT_RE = re.compile(r"^ROW\s+(\d+):\s*(APPLY|REJECT|SKIP)\b", re.M)
 GEN_RE = re.compile(r"candidate pairs generated:\s*\*{0,2}(\d+)", re.I)
 SENT_RE = re.compile(r"sent to the model:\s*\*{0,2}(\d+)", re.I)
 NOTADJ_RE = re.compile(r"not adjudicated:\s*\*{0,2}(\d+)", re.I)
+# "sent to the model" IS THE PLAN, NOT THE RESULT (corrected 2026-09-20, #149). Selection
+# happens before the first model call, so on the night of 2026-09-20 — endpoint hung, every
+# pair UNANSWERED or never sent — this column would have reported 12 pairs judged where the
+# true number was 0. The proposal has carried its own judgement census since that morning
+# (`khms_triage_report.judgement_census`); these two regexes read it, and a file that does
+# not carry it leaves `judged` UNKNOWN rather than borrowing the plan's number.
+JUDGED_RE = re.compile(
+    r"^Sweep:\s*\*{0,2}(\d+)\s+of\s+(\d+)\s+planned pairs were actually judged", re.M | re.I)
+CAMEBACK_RE = re.compile(r"\*{0,2}(\d+)\s+came back judged", re.I)
+# The pre-census header: `Sweep: 250 pairs adjudicated · …`, which is len(results) — pairs
+# RECORDED. Kept only so the report can say what the old number was and what it was not.
+LEGACY_SWEEP_RE = re.compile(r"^Sweep:\s*(\d+)\s+pairs adjudicated", re.M | re.I)
 CLUSTER_RE = re.compile(r"^-\s+\*\*(.+?)\*\*\s*[—–-]\s*(K-\d{5}.*)$", re.M)
 DATE_RE = re.compile(r"(\d{4}-\d{2}-\d{2})")
 CARD_ID_RE = re.compile(r"K-\d{5}")
@@ -61,13 +70,12 @@ def read(path):
         return ""
 
 
-def triage_files(root, since_days):
+def triage_files(brain, since_days):
     """-> (proposals {date: [paths]}, applied {date: [paths]}, n_preview)."""
-    pats = [os.path.join(root, "memory", "inbox", "*-triage*.md"),
-            # a deployment may move processed inboxes into the archive; both
-            # shapes are supported so this tool does not go blind the day that
-            # happens.
-            os.path.join(root, "memory", "archive", "inbox", "**",
+    pats = [os.path.join(brain, "memory", "inbox", "*-triage*.md"),
+            # package A may move processed inboxes into the archive; both shapes
+            # are supported so this tool does not go blind the day that lands.
+            os.path.join(brain, "memory", "archive", "inbox", "**",
                          "*-triage*.md")]
     proposals, applied, preview = {}, {}, 0
     cutoff = None
@@ -91,7 +99,8 @@ def triage_files(root, since_days):
 
 def scan_triage(proposals, applied):
     out = {"rows": 0, "applied": 0, "rejected": 0, "skipped": 0,
-           "generated": 0, "judged": 0, "unjudged": 0, "cov_date": "-",
+           "generated": 0, "sent": 0, "judged": None, "recorded": None,
+           "unjudged": 0, "cov_date": "-",
            "clusters": {}, "undecided_dates": []}
     for date, paths in sorted(proposals.items()):
         rows = 0
@@ -104,11 +113,24 @@ def scan_triage(proposals, applied):
             # the backlog by the number of files.  The newest file IS the
             # current backlog; older ones are its history.
             cov = {}
-            for rx, key in ((GEN_RE, "generated"), (SENT_RE, "judged"),
+            for rx, key in ((GEN_RE, "generated"), (SENT_RE, "sent"),
                             (NOTADJ_RE, "unjudged")):
                 m = rx.search(text)
                 if m:
                     cov[key] = int(m.group(1))
+            # THE JUDGED COLUMN COMES FROM THE CENSUS OR FROM NOWHERE.  Three sources, in
+            # falling order of directness; none of them is the selection line.
+            jm = JUDGED_RE.search(text)
+            if jm:
+                cov["judged"], cov["sent"] = int(jm.group(1)), int(jm.group(2))
+            else:
+                cm = CAMEBACK_RE.search(text)
+                if cm:
+                    cov["judged"] = int(cm.group(1))
+                else:
+                    cov["judged"] = None        # unknown is printed as unknown
+            lm = LEGACY_SWEEP_RE.search(text)
+            cov["recorded"] = int(lm.group(1)) if lm else None
             if cov and date >= out["cov_date"]:
                 out["cov_date"] = date
                 out.update(cov)
@@ -130,12 +152,12 @@ def scan_triage(proposals, applied):
     return out
 
 
-def scan_base(root):
+def scan_base(brain):
     statuses, edges, ids = {}, {"supersedes": 0, "refuted_by": 0,
                                "contradicts": 0}, set()
     fog = 0
     for sub in (("memory", "know"), ("memory", "archive", "know")):
-        for path in sorted(glob.glob(os.path.join(root, *sub, "K-*.md"))):
+        for path in sorted(glob.glob(os.path.join(brain, *sub, "K-*.md"))):
             text = read(path)
             cid = os.path.basename(path)[:-3]
             ids.add(cid)
@@ -152,23 +174,22 @@ def scan_base(root):
     return statuses, edges, ids, fog
 
 
-def scan_reach(root, ids):
+def scan_reach(brain, ids):
     """The audit's definition: a card is TOUCHED if it was ever injected or was
     ever a recall top hit."""
     touched = set()
-    inj = read(os.path.join(root, "tools", ".inject.log"))
+    inj = read(os.path.join(brain, "tools", ".inject.log"))
     for blob in INJECT_RE.findall(inj):
         touched |= set(CARD_ID_RE.findall(blob))
     touched |= set(TOP_RE.findall(inj))
-    touched |= set(TOP_RE.findall(read(os.path.join(root, "tools",
+    touched |= set(TOP_RE.findall(read(os.path.join(brain, "tools",
                                                     ".recall.log"))))
     return touched & ids
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--root", default=P.ROOT,
-                    help="KHMS base to report on (default: $KHMS_ROOT)")
+    ap.add_argument("--brain", default=DEFAULT_BRAIN)
     ap.add_argument("--since", type=int, default=0,
                     metavar="DAYS", help="only triage files this recent "
                                          "(0 = all of them)")
@@ -176,10 +197,11 @@ def main(argv=None):
                     help="report a subject cluster from this many cards up")
     a = ap.parse_args(argv)
 
-    proposals, applied, n_preview = triage_files(a.root, a.since)
+    a.brain = a.brain or P.ROOT
+    proposals, applied, n_preview = triage_files(a.brain, a.since)
     t = scan_triage(proposals, applied)
-    statuses, edges, ids, fog = scan_base(a.root)
-    touched = scan_reach(a.root, ids)
+    statuses, edges, ids, fog = scan_base(a.brain)
+    touched = scan_reach(a.brain, ids)
     n_files = sum(len(v) for v in proposals.values())
     n_app = sum(len(v) for v in applied.values())
 
@@ -187,10 +209,6 @@ def main(argv=None):
     print(f"KHMS contradiction debt — {dt.date.today().isoformat()} ({window})")
     print()
     print("TRIAGE LEDGER (memory/inbox + memory/archive/inbox)")
-    if not n_files:
-        print("  no triage files found — either you do not run a contradiction "
-              "sweep (it is not part of this repository) or its proposals live "
-              "elsewhere. The two sections below do not depend on it.")
     print(f"  files: {n_files} triage · {n_app} applied"
           f"{f' · {n_preview} preview (ignored)' if n_preview else ''}")
     print(f"  confirmed contradictions: {t['rows']}")
@@ -200,9 +218,25 @@ def main(argv=None):
     print(f"    never decided: {t['undecided']}"
           + (f"  ({', '.join(f'{d}:{n}' for d, n in t['undecided_dates'][:6])})"
              if t["undecided_dates"] else ""))
-    print(f"  pairs judged: {t['judged']} · unjudged: {t['unjudged']} "
-          f"(generated: {t['generated']}) — newest sweep {t['cov_date']}")
-    print("  a pair that was not adjudicated is NOT a pair that was cleared")
+    # THREE DIFFERENT NUMBERS, NAMED APART (corrected 2026-09-20, #149): what was generated,
+    # what was PLANNED for the model, and what actually came back with a verdict.
+    if t["judged"] is None:
+        rec = (f"; its pre-census header says {t['recorded']} pairs recorded, which counts "
+               f"rows in the file, not verdicts" if t["recorded"] is not None else "")
+        judged_txt = (f"came back judged: UNKNOWN (this proposal carries no judgement "
+                      f"census{rec})")
+    else:
+        judged_txt = f"came back judged: {t['judged']}"
+    print(f"  pairs: {t['generated']} generated · {t['sent']} sent to the model · "
+          f"{judged_txt} — newest sweep {t['cov_date']}")
+    print(f"  candidate pairs never sent to the model: {t['unjudged']}")
+    if t["judged"] is not None and t["sent"] and t["judged"] < t["sent"]:
+        gap = t["sent"] - t["judged"]
+        print(f"  ** {gap} of the {t['sent']} pairs sent to the model carry NO judgement"
+              + ("  — that sweep decided NOTHING; it is a record of a night that did not "
+                 "happen" if t["judged"] == 0 else ""))
+    print("  a pair that was not adjudicated is NOT a pair that was cleared, and a pair that "
+          "was sent is not a pair that was judged")
     print()
     print(f"BASE ({len(ids) - fog} in memory/know + {fog} in "
           f"memory/archive/know — the fog)")

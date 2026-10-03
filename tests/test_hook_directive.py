@@ -25,7 +25,7 @@ import sys
 import tempfile
 import unittest
 
-TOOLS = os.path.dirname(os.path.abspath(__file__))
+TOOLS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools")
 HOOK = os.path.join(TOOLS, "khms_hook.py")
 INIT = os.path.join(TOOLS, "khms_init.sh")
 REPLY_TOOL = "mcp__chat__reply"        # matched by KHMS_REPORT_TOOL below
@@ -61,12 +61,12 @@ class HookCase(unittest.TestCase):
                 "tool_input": {"text": text}, "session_id": session}
 
     def experiment(self, cfg):
-        with open(os.path.join(self.root, "tools", "khms_experiment.json"),
+        with open(os.path.join(self.root, "config", "khms_experiment.json"),
                   "w", encoding="utf-8") as f:
             json.dump(cfg, f)
 
     def log(self):
-        p = os.path.join(self.root, "tools", ".inject.log")
+        p = os.path.join(self.root, "state", "inject.log")
         return open(p, encoding="utf-8").read() if os.path.exists(p) else ""
 
 
@@ -86,8 +86,10 @@ class Directive(HookCase):
                         "a prompt must not carry the whole directive again")
 
     def test_a_missing_directive_file_degrades_to_the_one_liner(self):
-        os.remove(os.path.join(self.root, "tools", "prompts", "report_directive.md"))
-        ctx = self.context({"hook_event_name": "SessionStart", "session_id": "s2"})
+        # The directive ships with the code; a deployment points KHMS_DIRECTIVE elsewhere. A path that
+        # does not exist must degrade, not crash.
+        ctx = self.context({"hook_event_name": "SessionStart", "session_id": "s2"},
+                           KHMS_DIRECTIVE=os.path.join(self.root, "no-such-directive.md"))
         self.assertIn("base:", ctx)
         self.assertIn("report_directive.md", ctx)
 
@@ -106,7 +108,7 @@ class ExperimentSwitch(HookCase):
         self.assertIn("base:", ctx, "the directive is not part of the experiment")
 
     def test_a_broken_config_fails_open(self):
-        with open(os.path.join(self.root, "tools", "khms_experiment.json"),
+        with open(os.path.join(self.root, "config", "khms_experiment.json"),
                   "w", encoding="utf-8") as f:
             f.write("{ this is not json")
         self.context(self.prompt("why do the checksums keep failing on the link"))
@@ -150,7 +152,7 @@ class ClaimGate(HookCase):
 
     def test_a_matching_recall_in_this_turn_allows_the_citation(self):
         self.open_turn()
-        subprocess.run([os.path.join(self.root, "tools", "recall.sh"),
+        subprocess.run([os.path.join(TOOLS, "recall.sh"),
                         "humidity", "gaps"], capture_output=True, text=True,
                        env=dict(os.environ, KHMS_ROOT=self.root))
         self.assertIsNone(
@@ -164,7 +166,7 @@ class ClaimGate(HookCase):
     def test_every_verdict_is_logged(self):
         self.open_turn()
         self.fire(self.report("x" * 300))
-        log = open(os.path.join(self.root, "tools", ".claim_gate.log"),
+        log = open(os.path.join(self.root, "state", "claim_gate.log"),
                    encoding="utf-8").read()
         self.assertIn("DENY", log)
 

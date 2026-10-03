@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Acceptance tests for tools/verify_relations.py.
 
-Run:  python3 tools/test_verify_relations.py
-      python3 -m pytest tools/test_verify_relations.py
+Run:  python3 tests/test_verify_relations.py
+      python3 -m pytest tests/test_verify_relations.py
 
 WHAT IS GUARDED
 ---------------
@@ -26,7 +26,7 @@ import sys
 import tempfile
 import unittest
 
-TOOLS = os.path.dirname(os.path.abspath(__file__))
+TOOLS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools")
 VERIFY = os.path.join(TOOLS, "verify_relations.py")
 
 

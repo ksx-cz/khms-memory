@@ -1,0 +1,3 @@
+# Runtime dependencies of the KHMS core. The dense (embedding) channel is optional and has its own
+# environment (KHMS_EMBED_PY: numpy, torch, sentence-transformers); without it recall is lexical.
+pyyaml>=6

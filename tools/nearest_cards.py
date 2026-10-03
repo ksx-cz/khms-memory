@@ -5,39 +5,35 @@
 
 WHY THIS EXISTS
 ---------------
-The nightly pipeline PRODUCES; nothing in it MERGES. Measured in the reference
-deployment: 17 cards about one measured parameter, 14 about another, 8 about a
-third — against 8 superseded and 7 refuted edges in the whole base. The consolidate
-stage WAS asked to "link candidates to existing cards", but it was handed only topic
-views, so "which card does this replace?" was a question it could answer only from
-whatever it happened to read — the same shape as the grounding failure
-verify_quotes.py exists to close.
+Measured 2026-09-02: the base holds 17 cards about "SVD48V bus voltage", 14 (+3)
+about "minimum turning radius", 8 about "wheel radius" — and 8 superseded +
+7 refuted edges in the whole base.  The nightly pipeline PRODUCES; nothing in it
+MERGES.  The consolidate stage was asked to "link candidates to existing cards"
+while being handed only topic views, so the question "which card does this
+replace?" was one it could only answer from whatever it happened to read — the
+same shape as the grounding failure verify_quotes.py exists to close.
 
-This tool answers the mechanical half BEFORE the model is asked the editorial half:
-for every `### C<n>` candidate it runs the SAME retrieval the recall layer uses over
-the candidate's own title and body, and writes back
+This tool answers the mechanical half BEFORE the model is asked the editorial
+half: for every `### C<n>` candidate it runs the SAME retrieval the recall layer
+uses (khms_search, plus the dense channel when the daemon answers) over the
+candidate's own title and body, and writes back
 
-    NEAREST: K-NNNNN (41.2), K-NNNNN (33.8), K-NNNNN (28.1)
+    NEAREST: K-01234 (41.2), K-00987 (33.8), K-02201 (28.1)
 
-as the last line of the candidate. Zero model tokens. The consolidate prompt then
-requires exactly one RELATION line naming one of these ids (or another existing id
-it can justify), and tools/verify_relations.py enforces that mechanically.
+as the last line of the candidate.  0 API tokens.  The consolidate prompt then
+requires exactly one RELATION line naming one of these ids (or another existing
+id it can justify), and tools/verify_relations.py enforces that mechanically.
 
-IDEMPOTENT. Re-running replaces the line it wrote, so a re-run in the pipeline or by
-hand during the morning review cannot pile lines up. `--only-missing` leaves an
-existing NEAREST line alone and computes one only where none exists — that is the
-mode for the CONSOLIDATE output, where a line the model carried through from the
-sweep is the one verify_relations must judge `RELATION: new` against.
+IDEMPOTENT.  Re-running replaces the line it wrote, so a re-run in the pipeline
+or by hand during the morning review cannot pile lines up (`cmp` clean).
+`--only-missing` leaves an existing NEAREST line alone and computes one only
+where none exists — that is the mode used on the CONSOLIDATE output, where a
+line the model carried through from the sweep is the one verify_relations must
+judge `RELATION: new` against.
 
-ONLY ACTIVE, NON-FOG CARDS ARE PROPOSED: pointing a supersedes edge at a card that is
-already superseded chains onto a dead end, and the archive is where retired cards
-live.
-
-OPTIONAL DENSE CHANNEL. If a module named `khms_recall_hybrid` is importable next to
-this one and exposes `dense_query()` / `hybrid_rank()`, it is probed once and used for
-the whole file; otherwise the lexical channel alone does the work, silently. That
-fail-back is deliberate: a half-installed embedding daemon must never cost the nightly
-its NEAREST lines.
+ONLY ACTIVE, NON-FOG CARDS are proposed: pointing a supersedes edge at a card
+that is already superseded chains onto a dead end, and the fog (archive) is
+where retired cards live.
 """
 import argparse
 import os
@@ -46,10 +42,11 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import khms_search as ks  # noqa: E402
+import khms_paths as P  # noqa: E402
 
 # Same label grammar as verify_quotes.py: a big day's sweep numbers its chunks
-# A1.., B1.., C1.., so a regex hardcoded to C matches nothing exactly on the
-# biggest nights.
+# A1.., B1.., C1.., so a regex hardcoded to C matches nothing exactly when the
+# night is biggest.
 CARD_RE = re.compile(r"^#{2,3}\s+([A-Z]\d+[a-z]?)\b.*$", re.M)
 NEAREST_RE = re.compile(r"^NEAREST:.*$\n?", re.M)
 FENCE_RE = re.compile(r"```(?:ya?ml)?\n.*?```\n?", re.S)
@@ -57,7 +54,7 @@ SRC_RE = re.compile(r"^\s*-\s*src=[\w-]+\s*::\s*", re.M)
 RELATION_RE = re.compile(r"^\s*\*{0,2}RELATION:.*$\n?", re.M)
 # Query terms are capped: khms_search scores every token against every card, and
 # a 4 kB candidate carries several hundred tokens of prose whose tail adds noise,
-# not signal.  Measured on a 54-candidate sweep over a 2510-card base.
+# not signal.  Measured on the 2026-09-03 sweep (54 candidates, 2510 cards).
 MAX_QUERY_TOKENS = 220
 
 
@@ -98,13 +95,13 @@ def fmt(score):
 def open_dense(timeout_ms):
     """-> the hybrid module when the dense daemon really answers, else None.
 
-    PROBED ONCE, not per candidate.  Measured: with the hook's interactive 150 ms
-    budget the daemon lost the race on the first run and won it on the second, so
-    two runs of the same file produced two different NEAREST lines — an idempotence
-    failure caused entirely by the timeout, not by the ranking.  A nightly batch is
-    not an interactive hook: one probe with a generous budget decides the channel
-    for the whole file, so a run is internally consistent and a re-run is
-    byte-identical.
+    PROBED ONCE, not per candidate.  Measured 2026-09-04 on the 09-03 sweep: with
+    the interactive 150 ms budget the daemon lost the race on the first run and
+    won it on the second, so two runs of the same file produced two different
+    NEAREST lines — an idempotence failure caused entirely by the timeout, not by
+    the ranking.  A nightly batch is not an interactive hook: one probe with a
+    generous budget decides the channel for the whole file, so a run is internally
+    consistent and a re-run is byte-identical.
     """
     try:
         import khms_recall_hybrid as hy
@@ -115,8 +112,8 @@ def open_dense(timeout_ms):
     except Exception:
         return None
     # FAIL-BACK IS SILENT BY DESIGN (same contract as recall.sh): a half-installed
-    # experiment must never cost the nightly its NEAREST lines, and the lexical
-    # channel is the one every base has.
+    # experiment must never cost the nightly its NEAREST lines, and lexical alone
+    # is the channel this base was built on.
     return None if (err or not hits) else hy
 
 
@@ -197,6 +194,8 @@ def main(argv=None):
               file=sys.stderr)
         return 2
     if new != text:
+        if not P.may_write(a.file):
+            P.require_writable(f"rewrite {a.file}")
         # Atomic: a half-written candidate file would be handed to the
         # consolidate stage as if it were whole.
         tmp = a.file + ".nearest.tmp"

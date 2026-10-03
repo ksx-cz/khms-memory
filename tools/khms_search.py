@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
 """KHMS search core — ONE scoring implementation, two consumers:
+  - recall.sh (manual CLI, contract unchanged: free text in, ranked cards out)
+  - khms_hook.py (harness hook layer: injects cards into the main session)
 
-  - recall.sh      the manual CLI: free text in, ranked cards out
-  - khms_hook.py   the harness hook layer: injects cards into the live session
+Usage: python3 tools/khms_search.py <query ...>   (normally through tools/recall.sh; imported by khms_hook)
 
-They share this module on purpose. When the CLI and the automatic injection score
-differently, the automation quietly develops its own idea of what is relevant and
-nobody notices until a card that "was right there" never appeared.
-
-Scoring: idf per query token, first line ×3, tag ×1.5, whole-phrase bonus +10,
-archived ("fog") card ×0.6. A stateless scan over a few thousand cards costs
-~0.1 s and needs no index that can go stale; swap the internals for SQLite FTS5
-when the base outgrows that, without changing the habit. Zero model tokens.
+Extracted 2026-08-04 from recall.sh's embedded python so the hook layer and the
+CLI cannot drift apart. Scoring is IDENTICAL to the original: idf per token,
+first-line x3, tag x1.5, phrase +10, fog x0.6. Additions are structural only:
+frontmatter links/level are parsed, and a reverse index answers "which card
+corrects this one" (supersedes/contradicts/refuted_by) so a consumer never
+serves a refuted card without its refuter.
 """
 import glob
 import math
@@ -23,6 +22,8 @@ import unicodedata
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import khms_paths as P  # noqa: E402
 
+BRAIN = P.soft("ROOT")          # None when no base resolves; load_cards then raises the clean error
+MEM = P.soft("MEM")
 TOPN = 8
 
 _WORD = re.compile(r"[a-z0-9_/.\-]+")
@@ -30,14 +31,10 @@ _LINK_KEYS = ("derived_from", "supports", "contradicts", "refuted_by")
 
 
 def norm(s):
-    """Lowercase, strip diacritics, normalise fancy punctuation. Diacritics are
-    stripped so that a query typed without them still matches text that has
-    them — the common case whenever the operator's language is not English."""
     s = unicodedata.normalize("NFKD", s)
     s = "".join(c for c in s if not unicodedata.combining(c))
-    for a, b in (("’", "'"), ("‘", "'"), ("‚", "'"),
-                 ("“", '"'), ("”", '"'), ("„", '"'),
-                 ("—", "-"), ("–", "-")):
+    for a, b in (("’", "'"), ("‘", "'"), ("‚", "'"), ("“", '"'), ("”", '"'),
+                 ("„", '"'), ("—", "-"), ("–", "-")):
         s = s.replace(a, b)
     return s.lower()
 
@@ -58,6 +55,24 @@ def _parse_links(front):
         km = re.search(rf"^\s+{k}:\s*\[([^\]]*)\]", block, re.M)
         if km:
             links[k] = [x.strip() for x in km.group(1).split(",") if x.strip()]
+    # `supersedes` is written BOTH ways in this base: scalar (`supersedes: K-x`,
+    # what approve_inbox emits) and flow sequence (`supersedes: [K-x]`, what
+    # convert_inbox2's LINK_KEYS emits, and what 49 cards carry). The scalar
+    # branch below used to be the only one, so the bracket form parsed to the
+    # literal string "[K-x]": a target id that matches no card. The forward line
+    # then rendered `supersedes [K-x]: (not in the base)` and — the part that costs
+    # something — `reverse_correctors`/`link_maps` keyed the reverse edge on that
+    # same bogus string, so the SUPERSEDED card never learned what replaced it.
+    # 16 live edges were affected (measured 2026-09-19). Bracket form first, the
+    # scalar form unchanged; consumers already accept either shape.
+    sm = re.search(r"^\s+supersedes:\s*\[([^\]]*)\]", block, re.M)
+    if sm:
+        ids = [x.strip() for x in sm.group(1).split(",") if x.strip()]
+        if ids:
+            links["supersedes"] = ids
+        # `supersedes: []` keeps the None default it has always had — the
+        # bracket branch must change the EMPTY forms' behaviour in no way.
+        return links
     sm = re.search(r"^\s+supersedes:\s*(\S+)", block, re.M)
     if sm and sm.group(1) not in ("null", "~", "[]"):
         links["supersedes"] = sm.group(1)
@@ -65,16 +80,13 @@ def _parse_links(front):
 
 
 def load_cards():
-    """Live cards first, then the archive ("fog"). Archived cards are searchable
-    on purpose: a superseded or condensed card is still the cheapest way to find
-    out that something was already tried."""
     cards = []
-    for path in sorted(glob.glob(os.path.join(P.KNOW, "K-*.md"))) + \
-            sorted(glob.glob(os.path.join(P.ARCHIVE_KNOW, "K-*.md"))):
-        fog = os.sep + "archive" + os.sep in path
+    mem = MEM or P.MEM
+    for path in sorted(glob.glob(f"{mem}/know/K-*.md")) + \
+            sorted(glob.glob(f"{mem}/archive/know/K-*.md")):
+        fog = "/archive/" in path
         try:
-            with open(path, encoding="utf-8", errors="replace") as f:
-                text = f.read()
+            text = open(path, encoding="utf-8", errors="replace").read()
         except OSError:
             continue
         m = re.match(r"^---\n(.*?)\n---\n(.*)$", text, re.S)
@@ -82,8 +94,8 @@ def load_cards():
             continue
         front, body = m.groups()
 
-        def fm(key, default="", _front=front):
-            mm = re.search(rf"^{key}:\s*(.+)$", _front, re.M)
+        def fm(key, default=""):
+            mm = re.search(rf"^{key}:\s*(.+)$", front, re.M)
             return mm.group(1).strip() if mm else default
 
         tg = re.search(r"^tags:\s*\[([^\]]*)\]", front, re.M)
@@ -95,6 +107,9 @@ def load_cards():
             "tags": [t.strip() for t in (tg.group(1) if tg else "").split(",") if t.strip()],
             "ntags": norm(tg.group(1)) if tg else "",
             "links": _parse_links(front),
+            # errata: [{ts: TS-nnnnn, …}] entries (khms_erratum.py) — a count, so the
+            # renderers can flag a card whose text was corrected in place
+            "errata": len(re.findall(r"^\s+-\s*\{?\s*ts:\s*TS-\d{5}", front, re.M)),
             "body": body,
             "nbody": norm(body),
             "first": body.splitlines()[0] if body else "",
@@ -105,15 +120,14 @@ def load_cards():
 
 
 def reverse_correctors(cards):
-    """card id -> [cards that supersede or contradict it]. Consumers merge this
-    with the card's own links.refuted_by, so that a refuted card is never served
-    without whatever corrected it."""
+    """kid -> [cards that supersede/contradict/… it]. The old card itself also
+    names refuters in links.refuted_by; both directions are merged by callers."""
     rev = {}
     for c in cards:
         links = c.get("links") or {}
-        # .get, not [], because this map is now consulted for EVERY served card,
-        # on the live hook path: one card with a link block this parser did not
-        # fill must not cost the whole injection.
+        # .get, not [], because this map is now consulted for EVERY served card
+        # (2026-08-28), including on the live hook path: one card with a link
+        # block this parser did not fill must not cost the whole injection.
         for tgt in (links.get("contradicts") or []):
             rev.setdefault(tgt, []).append(c)
         sup = links.get("supersedes")
@@ -123,43 +137,40 @@ def reverse_correctors(cards):
 
 
 def load_glossary(path=None):
-    """OPTIONAL bridge for a base written in one language and queried in another
-    (spec P7 / §4.11). Lines: '<query-language stem, no diacritics><TAB><base-language words>'.
-    '#' starts a comment. Absent file = no expansion, which is the default."""
+    """Lines: '<stem-without-diacritics><TAB><english words>'. '#' comments.
+    The glossary is a private resource (KHMS_GLOSSARY); unset or absent means no glossary."""
     gl = {}
+    path = path or P.GLOSSARY
+    if not path:
+        return gl
     try:
-        with open(path or P.GLOSSARY, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#") or "\t" not in line:
-                    continue
-                src, dst = line.split("\t", 1)
-                gl[norm(src.strip())] = dst.strip()
+        for line in open(path, encoding="utf-8"):
+            line = line.strip()
+            if not line or line.startswith("#") or "\t" not in line:
+                continue
+            cz, en = line.split("\t", 1)
+            gl[norm(cz.strip())] = en.strip()
     except OSError:
         pass
     return gl
 
 
 def expand_query(query_raw, glossary):
-    """Append base-language equivalents for stems found in the query. Stem match:
-    a glossary key that a query token starts with, so inflected forms all hit the
-    same key. Returns (expanded_query, added_terms)."""
+    """Append English equivalents for Czech stems found in the query.
+    Stem match: a glossary key matching the start of a query token (>=3 chars),
+    so 'otocky'/'otocka' both hit key 'otock'. Returns (expanded, added_terms)."""
     if not glossary:
         return query_raw, []
     added = []
     for t in set(tokens(query_raw)):
-        for key, dst in glossary.items():
-            if t.startswith(key) and dst not in added:
-                added.append(dst)
+        for key, en in glossary.items():
+            if t.startswith(key) and en not in added:
+                added.append(en)
     return (query_raw + " " + " ".join(added)).strip() if added else query_raw, added
 
 
 def search(query_raw, cards=None, exclude_meta=False, topn=TOPN):
-    """Returns (results, cards); results are (score, matched_tokens, card).
-
-    exclude_meta drops the base's cards ABOUT ITSELF (tags khms/core) unless the
-    query is itself about the memory system — otherwise every question about the
-    work gets answered with the memory system's own documentation."""
+    """Returns (results, cards). results: list of (score, matched_tokens, card)."""
     if cards is None:
         cards = load_cards()
     q_tokens = tokens(query_raw)
@@ -167,14 +178,14 @@ def search(query_raw, cards=None, exclude_meta=False, topn=TOPN):
     if not q_tokens:
         return [], cards
 
-    meta_ok = bool(re.search(r"khms|memory|card|recall|remember", norm(query_raw)))
+    meta_ok = bool(re.search(r"khms|memory|karta|card|baze|recall", norm(query_raw)))
     pool = cards
     if exclude_meta and not meta_ok:
         pool = [c for c in cards if not ({"khms", "core"} & set(c["tags"]))]
 
     df = {t: sum(1 for c in cards if t in c["nbody"]) for t in set(q_tokens)}
-    n = len(cards)
-    idf = {t: math.log((n + 1) / (df[t] + 1)) + 0.1 for t in df}
+    N = len(cards)
+    idf = {t: math.log((N + 1) / (df[t] + 1)) + 0.1 for t in df}
 
     results = []
     for c in pool:
@@ -200,47 +211,81 @@ def search(query_raw, cards=None, exclude_meta=False, topn=TOPN):
 
 
 def recall_log_path():
-    """The retrieval record. KHMS_RECALL_LOG redirects it, so a test can never
-    write into the live log — and so the retrieval-claim gate, which READS this
-    file from khms_hook.py, has exactly one path to read."""
-    return os.environ.get("KHMS_RECALL_LOG", P.RECALL_LOG)
+    """The retrieval record. KHMS_RECALL_LOG redirects it, so a test (and the
+    retrieval-claim gate's own tests) can never write into the live log — and so the
+    gate that READS this file in khms_hook.py has exactly one path to read."""
+    return P.RECALL_LOG
+
+
+def recall_jsonl_path():
+    """The STRUCTURED retrieval record (review finding P1-1): one JSON line per
+    CLI recall with its RESULT (hit count, card ids) and the session it ran in. The
+    proposal gate binds a recall to a reply through this file plus the hook's own
+    PreToolUse record of who issued the command — never by time alone. Follows
+    KHMS_RECALL_LOG when that is redirected, so a test never writes the live file."""
+    r = P.resolved()
+    if r.env.get("KHMS_RECALL_JSONL") or r.raw.get("KHMS_RECALL_JSONL"):
+        return P.RECALL_JSONL
+    if r.env.get("KHMS_RECALL_LOG") or r.raw.get("KHMS_RECALL_LOG"):
+        return P.RECALL_LOG + ".jsonl"
+    return P.RECALL_JSONL
 
 
 def log_query(query_raw, results, src="cli"):
-    """Every query is logged. This is what makes "the base was consulted" an
-    auditable fact rather than a claim in a reply."""
     import datetime
+    import json
+    import time
     top = f"{results[0][2]['id']}:{results[0][0]:.1f}" if results else "-"
+    if not P.may_write(recall_log_path()):
+        print("recall: read-only deployment and the recall log points into the shared base -- "
+              "not logged (set KHMS_STATE outside KHMS_ROOT)", file=sys.stderr)
+        return
+    os.makedirs(os.path.dirname(recall_log_path()), exist_ok=True)
+    with open(recall_log_path(), "a", encoding="utf-8") as lf:
+        lf.write(f"{datetime.datetime.now().astimezone().isoformat(timespec='seconds')}"
+                 f" | {query_raw} | nhits={len(results)} | top={top} | src={src}\n")
+    if not str(src).startswith("cli"):
+        return
     try:
-        with open(recall_log_path(), "a", encoding="utf-8") as lf:
-            lf.write(f"{datetime.datetime.now().astimezone().isoformat(timespec='seconds')}"
-                     f" | {query_raw} | nhits={len(results)} | top={top} | src={src}\n")
-    except OSError:
-        pass
+        rec = {"ts": round(time.time(), 3),
+               "sid": os.environ.get("CLAUDE_CODE_SESSION_ID", ""),
+               "query": query_raw, "nhits": len(results),
+               "top": [r[2].get("id") for r in results[:10] if isinstance(r[2], dict)],
+               "src": src}
+        if not P.may_write(recall_jsonl_path()):
+            return
+        with open(recall_jsonl_path(), "a", encoding="utf-8") as jf:
+            jf.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:                                              # noqa: BLE001
+        pass          # the plain log line above is written; a recall never fails on this
 
 
 def main_cli(argv):
     query_raw = " ".join(argv)
     expanded, added = expand_query(query_raw, load_glossary())
-    results, cards = search(expanded)          # CLI keeps the FULL pool
+    results, cards = search(expanded)           # CLI keeps FULL pool (no meta filter)
     log_query(query_raw, results, src="cli")
     if added:
-        print(f"(glossary: +{' '.join(added)[:120]})")
+        import khms_messages as M
+        print(M.msg("GLOSSARY_LABEL", terms=" ".join(added)[:120]))
     if not tokens(query_raw):
         print("recall: query has no searchable tokens")
         return 2
     if not results:
         print(f"recall: nothing on record for: {query_raw}")
         return 1
-    df = {t: sum(1 for c in cards if t in c["nbody"]) for r in results for t in r[1]}
+    df = {t: sum(1 for c in cards if t in c["nbody"])
+          for r in results for t in r[1]}
     for score, matched, c in results:
         flags = []
         if c["status"] in ("refuted", "challenged"):
-            flags.append("!" + c["status"].upper())
+            flags.append("⛔" + c["status"].upper())
         elif c["status"] != "active":
             flags.append(c["status"])
         if "gotcha" in c["tags"]:
-            flags.append("gotcha")
+            flags.append("⚠gotcha")
+        if c.get("errata"):
+            flags.append("✎ERRATUM")
         if c["fog"]:
             flags.append("fog")
         flag = (" [" + ",".join(flags) + "]") if flags else ""
@@ -249,7 +294,7 @@ def main_cli(argv):
         if rare:
             for line in c["body"].splitlines()[1:]:
                 if rare in norm(line):
-                    print(f"    -> {line.strip()[:150]}")
+                    print(f"    ↳ {line.strip()[:150]}")
                     break
     return 0
 

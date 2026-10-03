@@ -1,41 +1,342 @@
 #!/usr/bin/env python3
-"""Single place where every KHMS script learns where the base lives.
+"""khms_paths.py -- the one place a KHMS tool learns where code, data, state and settings live.
 
-Resolution order:
-  1. $KHMS_ROOT                       — set this in your shell profile
-  2. the parent directory of tools/   — so a copied tools/ dir works unconfigured
+Usage:
+  import khms_paths as P; P.KNOW; P.get("KHMS_STATE"); P.require_writable("approve cards")
+  python3 khms_paths.py KEY       print one resolved value (rc 3 and a reason on stderr when it cannot)
+  python3 khms_paths.py --all     KEY=value for every documented key
+  python3 khms_paths.py --root    the resolved data root (same as `KHMS_ROOT`)
 
-Nothing else in this repository contains an absolute path.
+Five kinds of location, never derived from one another by accident:
+  code          the directory of this file -- a clone of the KHMS repository. Nothing is written here.
+  data          KHMS_ROOT: memory/, journal/, plans/, archive/, reports/. Shared by every agent of a base.
+  config        KHMS_CONFIG_FILE (settings) and KHMS_CONFIG_DIR (private resources such as a glossary).
+  agent state   KHMS_STATE: this agent's logs, hook state and local caches.
+  shared state  KHMS_SHARED_STATE: the card allocator, writer locks and night/week checkpoints.
+
+Root discovery, first match wins (there is NO fallback to a checkout or its parent):
+  1. $KHMS_ROOT
+  2. KHMS_ROOT inside the file named by $KHMS_CONFIG_FILE (the file must exist)
+  3. the first line of ~/.config/khms/root (written only by `khms_init.sh --register`)
+  otherwise: an error that names khms_init.sh.
+Settings file: $KHMS_CONFIG_FILE when set, else ${KHMS_ROOT}/config/khms.env when it exists. A KHMS_ROOT in
+that default file that disagrees with the discovered root is an error.
+
+Value precedence for every key: the environment (when set and non-empty), then the settings file, then the
+documented default below. An empty value counts as unset.
+
+File grammar (khms_paths.sh reads the same file with the same rules; tests/test_paths.py runs both readers
+over the same cases): one KEY=VALUE per line; blank lines and lines starting with `#` are ignored; one
+optional pair of surrounding quotes is removed; `${NAME}` is replaced by the RESOLVED value of NAME (env,
+file, default). Any other line is malformed. A reference cycle, a reference to a name nothing defines, a
+missing explicitly selected file and a KHMS_READ_ONLY other than 0/1 are errors. The file is never sourced
+or evaluated.
 """
 import os
+import re
+import sys
 
-TOOLS = os.path.dirname(os.path.abspath(__file__))
-ROOT = os.environ.get("KHMS_ROOT") or os.path.dirname(TOOLS)
+CODE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(CODE)
 
-MEM = os.path.join(ROOT, "memory")
-KNOW = os.path.join(MEM, "know")
-VIEWS = os.path.join(MEM, "views")
-INBOX = os.path.join(MEM, "inbox")
-STAGING = os.path.join(INBOX, ".staging")
-ARCHIVE_KNOW = os.path.join(MEM, "archive", "know")
-JOURNAL = os.path.join(ROOT, "journal")
-TOOLS_DIR = os.path.join(ROOT, "tools")
+_LINE_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
+_REF_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
-COUNTER = os.path.join(TOOLS_DIR, ".next_id")
-RECALL_LOG = os.path.join(TOOLS_DIR, ".recall.log")
-INJECT_LOG = os.path.join(TOOLS_DIR, ".inject.log")
-PRECHECK_LOG = os.path.join(TOOLS_DIR, ".precheck.log")
-HOOK_STATE = os.path.join(TOOLS_DIR, ".hook-state")
-HOOKS_OFF = os.path.join(TOOLS_DIR, ".hooks-off")
-LEN_CACHE = os.path.join(TOOLS_DIR, ".cardlen.json")
-GLOSSARY = os.path.join(TOOLS_DIR, "glossary.txt")
-MEMORY_MD = os.path.join(ROOT, "MEMORY.md")
+# (key, default template). Order matters only for --all output. An empty default means "disabled / not
+# configured" for that optional resource; every reader treats it that way.
+DEFAULTS = [
+    ("KHMS_ROOT", None),                                    # discovered, see above
+    ("KHMS_CONFIG_FILE", ""),                               # the selected settings file ("" = none)
+    ("KHMS_CONFIG_DIR", "${KHMS_ROOT}/config"),
+    ("KHMS_STATE", "${KHMS_ROOT}/state"),
+    ("KHMS_SHARED_STATE", "${KHMS_ROOT}/state/shared"),
+    ("KHMS_READ_ONLY", "0"),
+    ("KHMS_RECALL_LOG", "${KHMS_STATE}/recall.log"),
+    ("KHMS_RECALL_JSONL", "${KHMS_STATE}/recall.jsonl"),
+    ("KHMS_INJECT_LOG", "${KHMS_STATE}/inject.log"),
+    ("KHMS_PRECHECK_LOG", "${KHMS_STATE}/precheck.log"),
+    ("KHMS_CLAIM_LOG", "${KHMS_STATE}/claim_gate.log"),
+    ("KHMS_HOOK_STATE", "${KHMS_STATE}/hook-state"),
+    ("KHMS_HOOKS_OFF_FILE", "${KHMS_STATE}/hooks-off"),
+    ("KHMS_LEN_CACHE", "${KHMS_STATE}/cardlen.json"),
+    ("KHMS_EXPERIMENT", "${KHMS_CONFIG_DIR}/khms_experiment.json"),
+    ("KHMS_GLOSSARY", ""),
+    ("KHMS_DIRECTIVE", ""),
+    ("KHMS_EMBED_DIR", "${KHMS_SHARED_STATE}/embed"),
+    ("KHMS_EMBED_PY", ""),
+    ("KHMS_DENSE_SOCKET", ""),
+    ("KHMS_HF_HOME", ""),
+    ("KHMS_SNAPSHOT_ROOT", ""),
+    ("KHMS_TRANSCRIPTS", ""),
+    ("KHMS_MESSAGES", "${KHMS_CONFIG_DIR}/messages.env"),
+    ("KHMS_PATTERNS", "${KHMS_CONFIG_DIR}/patterns.env"),
+]
+KEYS = [k for k, _ in DEFAULTS]
+_DEFAULT = dict(DEFAULTS)
 
-# Added 2026-09: the retrieval experiment's switch, the audit log of the
-# retrieval-claim gate, and the single source of the reply directive. All three
-# are optional — every reader of them degrades to "as before" when absent.
-EXPERIMENT = os.environ.get("KHMS_EXPERIMENT",
-                            os.path.join(TOOLS_DIR, "khms_experiment.json"))
-CLAIM_LOG = os.environ.get("KHMS_CLAIM_LOG",
-                           os.path.join(TOOLS_DIR, ".claim_gate.log"))
-DIRECTIVE_FILE = os.path.join(TOOLS_DIR, "prompts", "report_directive.md")
+
+class KhmsPathError(LookupError):
+    """A location that cannot be resolved; the message says which and why."""
+
+
+def registered_root_file(env=None):
+    env = os.environ if env is None else env
+    home = env.get("HOME") or ""
+    return os.path.join(home, ".config", "khms", "root") if home else ""
+
+
+def parse_config(text, origin="<config>"):
+    """[(key, raw value)] in file order; KhmsPathError on a malformed line."""
+    out = []
+    for n, line in enumerate(text.splitlines(), 1):
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        m = _LINE_RE.match(s)
+        if not m:
+            raise KhmsPathError(f"khms_paths: malformed line {n} in {origin} (expected KEY=VALUE)")
+        val = m.group(2).strip()
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in "\"'":
+            val = val[1:-1]
+        out.append((m.group(1), val))
+    return out
+
+
+def _read_file(path, required):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return parse_config(fh.read(), path)
+    except FileNotFoundError:
+        if required:
+            raise KhmsPathError(f"khms_paths: config file {path} does not exist (named by KHMS_CONFIG_FILE)")
+        return []
+    except OSError as exc:
+        raise KhmsPathError(f"khms_paths: cannot read config file {path}: {exc.strerror}")
+
+
+def _norm(p):
+    return p.rstrip("/") or "/"
+
+
+class Resolved:
+    """All locations for one environment. Built once per process (see `resolved()`)."""
+
+    def __init__(self, env=None):
+        self.env = dict(os.environ if env is None else env)
+        cfg = self.env.get("KHMS_CONFIG_FILE") or ""
+        self.raw = dict(_read_file(cfg, True)) if cfg else {}
+        self.cache = {}
+        root = self.env.get("KHMS_ROOT") or ""
+        if not root and cfg and self.raw.get("KHMS_ROOT"):
+            root = self._expand("KHMS_ROOT", self.raw["KHMS_ROOT"], ("KHMS_ROOT",))
+        if not root:
+            reg = registered_root_file(self.env)
+            if reg and os.path.isfile(reg):
+                with open(reg, encoding="utf-8") as fh:
+                    root = (fh.readline() or "").strip()
+        if not root:
+            raise KhmsPathError(
+                "khms_paths: no KHMS data root -- set KHMS_ROOT, name a settings file with KHMS_CONFIG_FILE, "
+                "or create and register a base with: khms_init.sh --register <dir>")
+        if not os.path.isabs(root):
+            raise KhmsPathError(f"khms_paths: KHMS_ROOT must be an absolute path, got: {root}")
+        self.cache["KHMS_ROOT"] = root
+        if not cfg:
+            default_cfg = os.path.join(root, "config", "khms.env")
+            if os.path.isfile(default_cfg):
+                cfg = default_cfg
+                self.raw = dict(_read_file(cfg, False))
+                if self.raw.get("KHMS_ROOT"):
+                    other = self._expand("KHMS_ROOT", self.raw["KHMS_ROOT"], ("KHMS_ROOT",))
+                    if _norm(other) != _norm(root):
+                        raise KhmsPathError(
+                            f"khms_paths: {cfg} names KHMS_ROOT={other} but the discovered root is {root}")
+        self.cache["KHMS_CONFIG_FILE"] = cfg
+        ro = self.get("KHMS_READ_ONLY")
+        if ro not in ("0", "1"):
+            raise KhmsPathError(f"khms_paths: KHMS_READ_ONLY must be 0 or 1, got: {ro}")
+
+    def _expand(self, key, raw, stack):
+        def sub(m):
+            name = m.group(1)
+            if name in stack:
+                raise KhmsPathError(
+                    f"khms_paths: {stack[0]} refers to itself through {' -> '.join(stack + (name,))}")
+            return self._resolve(name, stack + (name,))
+        return _REF_RE.sub(sub, raw)
+
+    def _resolve(self, key, stack):
+        if key in self.cache:
+            return self.cache[key]
+        val = self.env.get(key)
+        if not val:
+            if self.raw.get(key):
+                val = self._expand(key, self.raw[key], stack)
+            elif key in _DEFAULT and _DEFAULT[key] is not None:
+                val = self._expand(key, _DEFAULT[key], stack)
+            else:
+                raise KhmsPathError(
+                    f"khms_paths: {stack[0]} refers to ${{{key}}}, which nothing defines")
+        self.cache[key] = val
+        return val
+
+    def get(self, key):
+        return self._resolve(key, (key,))
+
+    @property
+    def read_only(self):
+        return self.get("KHMS_READ_ONLY") == "1"
+
+
+_RESOLVED = None
+
+
+def resolved():
+    global _RESOLVED
+    if _RESOLVED is None:
+        _RESOLVED = Resolved()
+    return _RESOLVED
+
+
+def reset():
+    """Forget the cached resolution (tests that change os.environ in-process)."""
+    global _RESOLVED
+    _RESOLVED = None
+
+
+def get(key):
+    return resolved().get(key)
+
+
+def read_only():
+    """Is this a reader deployment? Without a resolvable base (a tool run on explicit paths only) the
+    environment alone decides."""
+    try:
+        return resolved().read_only
+    except KhmsPathError:
+        return os.environ.get("KHMS_READ_ONLY") == "1"
+
+
+EXIT_READ_ONLY = 4
+
+
+def require_writable(what):
+    """Refuse a data/shared-state mutation BEFORE any write when this deployment is a reader."""
+    if read_only():
+        print(f"khms: read-only deployment (KHMS_READ_ONLY=1): refusing to {what}; nothing was written",
+              file=sys.stderr)
+        sys.exit(EXIT_READ_ONLY)
+
+
+def may_write(path):
+    """May this process append to `path` (a log, a cache)? Always on a writer deployment. On a reader
+    (KHMS_READ_ONLY=1) only outside the data root, the config dir and the shared state: a reader keeps its
+    logs and caches in its own KHMS_STATE, which must then live outside the shared base."""
+    if not read_only():
+        return True
+    try:
+        r = resolved()
+    except KhmsPathError:
+        return False
+    return not any(under(path, r.get(k)) for k in ("KHMS_ROOT", "KHMS_CONFIG_DIR", "KHMS_SHARED_STATE"))
+
+
+def under(path, base):
+    """True when `path` is `base` or inside it (both made absolute, symlinks resolved)."""
+    p, b = os.path.realpath(path), os.path.realpath(base)
+    return p == b or p.startswith(b.rstrip("/") + "/")
+
+
+# --- the fixed layout beneath the roots: a key names a root, not every file ---------------------------------
+_DERIVED = {
+    "ROOT": lambda r: r.get("KHMS_ROOT"),
+    "MEM": lambda r: os.path.join(r.get("KHMS_ROOT"), "memory"),
+    "KNOW": lambda r: os.path.join(r.get("KHMS_ROOT"), "memory", "know"),
+    "VIEWS": lambda r: os.path.join(r.get("KHMS_ROOT"), "memory", "views"),
+    "INBOX": lambda r: os.path.join(r.get("KHMS_ROOT"), "memory", "inbox"),
+    "STAGING": lambda r: os.path.join(r.get("KHMS_ROOT"), "memory", "inbox", ".staging"),
+    "ARCHIVE_KNOW": lambda r: os.path.join(r.get("KHMS_ROOT"), "memory", "archive", "know"),
+    "TOMBSTONES": lambda r: os.path.join(r.get("KHMS_ROOT"), "memory", "tombstones"),
+    "MEMORY_MD": lambda r: os.path.join(r.get("KHMS_ROOT"), "memory", "MEMORY.md"),
+    "JOURNAL": lambda r: os.path.join(r.get("KHMS_ROOT"), "journal"),
+    "PLANS": lambda r: os.path.join(r.get("KHMS_ROOT"), "plans"),
+    "CONFIG_DIR": lambda r: r.get("KHMS_CONFIG_DIR"),
+    "STATE": lambda r: r.get("KHMS_STATE"),
+    "SHARED_STATE": lambda r: r.get("KHMS_SHARED_STATE"),
+    "COUNTER": lambda r: os.path.join(r.get("KHMS_SHARED_STATE"), "next_id"),
+    "ALLOC_LOCK": lambda r: os.path.join(r.get("KHMS_SHARED_STATE"), "alloc.lock"),
+    "REVIEW_MARKERS": lambda r: os.path.join(r.get("KHMS_SHARED_STATE"), "reviewed"),
+    "RECALL_LOG": lambda r: r.get("KHMS_RECALL_LOG"),
+    "RECALL_JSONL": lambda r: r.get("KHMS_RECALL_JSONL"),
+    "INJECT_LOG": lambda r: r.get("KHMS_INJECT_LOG"),
+    "PRECHECK_LOG": lambda r: r.get("KHMS_PRECHECK_LOG"),
+    "CLAIM_LOG": lambda r: r.get("KHMS_CLAIM_LOG"),
+    "HOOK_STATE": lambda r: r.get("KHMS_HOOK_STATE"),
+    "HOOKS_OFF": lambda r: r.get("KHMS_HOOKS_OFF_FILE"),
+    "LEN_CACHE": lambda r: r.get("KHMS_LEN_CACHE"),
+    "EXPERIMENT": lambda r: r.get("KHMS_EXPERIMENT"),
+    "GLOSSARY": lambda r: r.get("KHMS_GLOSSARY"),
+    "EMBED_DIR": lambda r: r.get("KHMS_EMBED_DIR"),
+    "DIRECTIVE_FILE": lambda r: (r.get("KHMS_DIRECTIVE")
+                                 or os.path.join(CODE, "prompts", "report_directive.md")),
+    # Before the split this was "<root>/tools", which held code and state at once. Its remaining users locate
+    # CODE (scripts beside this module); state has its own keys above.
+    "TOOLS_DIR": lambda r: CODE,
+    "TOOLS": lambda r: CODE,
+}
+
+
+def _excepthook(etype, value, tb, _orig=sys.excepthook):
+    """An unresolvable location is a configuration answer, not a crash: one line and rc 3."""
+    if issubclass(etype, KhmsPathError):
+        sys.stdout.flush()
+        print(str(value), file=sys.stderr)
+        sys.stderr.flush()
+        os._exit(3)
+    _orig(etype, value, tb)
+
+
+sys.excepthook = _excepthook
+
+
+def soft(name, default=None):
+    """P.<name> (a derived location or a KHMS_* key), or `default` when no base can be resolved. For
+    module-level defaults of library modules that must stay importable without a base; any real use of the
+    base still fails with the explanatory error."""
+    try:
+        return get(name) if name.startswith("KHMS_") else _DERIVED[name](resolved())
+    except KhmsPathError:
+        return default
+
+
+def __getattr__(name):           # PEP 562: P.KNOW etc. resolve on first use, not at import
+    if name in _DERIVED:
+        return _DERIVED[name](resolved())
+    raise AttributeError(f"module 'khms_paths' has no attribute {name!r}")
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__.strip().split("\n\n")[0])
+        return 0 if argv else 2
+    try:
+        r = resolved()
+        if argv[0] == "--all":
+            for k in KEYS:
+                print(f"{k}={r.get(k)}")
+            return 0
+        if argv[0] == "--root":
+            print(r.get("KHMS_ROOT"))
+            return 0
+        print(r.get(argv[0]) if argv[0].startswith("KHMS_") else _DERIVED[argv[0]](r))
+        return 0
+    except KeyError:
+        print(f"khms_paths: unknown name {argv[0]}", file=sys.stderr)
+        return 2
+    except KhmsPathError as exc:
+        print(str(exc), file=sys.stderr)
+        return 3
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
