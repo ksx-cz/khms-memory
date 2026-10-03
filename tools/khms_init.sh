@@ -3,13 +3,19 @@
 #
 # Usage: khms_init.sh [--register] <base-dir>        (or: KHMS_ROOT=<base-dir> khms_init.sh [--register])
 #
-# What it does, and nothing else:
-#   * creates the data directories (memory/, journal/, plans/, archive/, reports/), the config directory
-#     and the state directories beneath <base-dir>;
-#   * creates the card counter in the shared state ONLY when there is none -- an existing counter, existing
-#     cards, settings, tag registry and journal are never touched; a new counter starts above the highest
-#     card id already on disk;
-#   * writes a commented settings template to <base-dir>/config/khms.env only when that file is absent;
+# First it resolves the effective configuration exactly as every tool will (khms_paths.sh: the environment,
+# an explicit KHMS_CONFIG_FILE, the base's own config/khms.env), with <base-dir> as the root. A reader
+# deployment (KHMS_READ_ONLY=1 from any of them) is refused with rc 4 and an unresolvable configuration with
+# rc 3 -- both before a single write. Without <base-dir> the root is the one the configuration names.
+# What it does then, and nothing else:
+#   * creates the data directories (memory/, journal/, plans/, archive/, reports/) beneath <base-dir> and
+#     the CONFIGURED config, agent-state and shared-state directories (KHMS_CONFIG_DIR, KHMS_STATE,
+#     KHMS_SHARED_STATE), wherever the configuration puts them;
+#   * creates the card counter in the configured shared state -- the one the allocator reads -- ONLY when
+#     there is none; an existing counter, existing cards, settings, tag registry and journal are never
+#     touched; a new counter starts above the highest card id already on disk;
+#   * writes a commented settings template to <base-dir>/config/khms.env only when that file is absent and
+#     no other settings file is selected by KHMS_CONFIG_FILE;
 #   * with --register, records <base-dir> in ~/.config/khms/root so tools find it without KHMS_ROOT. An
 #     existing registration of a DIFFERENT base is refused, never replaced.
 # It never copies code: every tool runs from this checkout and finds the base through khms_paths.
@@ -22,26 +28,54 @@ ROOT=""
 for a in "$@"; do
   case "$a" in
     --register) REGISTER=1 ;;
-    -h|--help) sed -n '2,17p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,23p' "$0"; exit 0 ;;
     -*) echo "khms_init: unknown option $a" >&2; exit 2 ;;
     *) [ -z "$ROOT" ] || { echo "khms_init: one base directory, please" >&2; exit 2; }; ROOT="$a" ;;
   esac
 done
 ROOT="${ROOT:-${KHMS_ROOT:-}}"
-[ -n "$ROOT" ] || { echo "khms_init: name the base directory (argument or KHMS_ROOT)" >&2; exit 2; }
-[ "${KHMS_READ_ONLY:-0}" = 1 ] && { echo "khms_init: refusing on a read-only deployment (KHMS_READ_ONLY=1)" >&2; exit 4; }
-ROOT="$(realpath -m -- "$ROOT")"
+[ -n "$ROOT" ] || [ -n "${KHMS_CONFIG_FILE:-}" ] \
+  || { echo "khms_init: name the base directory (argument, KHMS_ROOT, or KHMS_ROOT in KHMS_CONFIG_FILE)" >&2
+       exit 2; }
+
+# Resolve the configuration BEFORE any write; nothing below may touch the filesystem until this passed.
+# shellcheck source=khms_paths.sh
+. "$CODE/khms_paths.sh"
+if [ -n "$ROOT" ]; then
+  ROOT="$(realpath -m -- "$ROOT")"
+  export KHMS_ROOT="$ROOT"
+fi
+khms_load || exit 3
+khms_require_writable "initialize the base" || exit $?
+if [ -n "${KHMS_CONFIG_FILE:-}" ] && [ -n "${_KHMS_RAW[KHMS_ROOT]:-}" ]; then
+  # An explicitly selected settings file that names a DIFFERENT root would send every later tool without
+  # KHMS_ROOT to that other base while this one is initialized: refuse instead of preparing a layout nobody
+  # reads. The file's own KHMS_ROOT must resolve, too.
+  named="$(unset KHMS_ROOT; khms_load && khms_get KHMS_ROOT)" || exit 3
+  if [ "$(realpath -m -- "$named")" != "$(realpath -m -- "$(khms_get KHMS_ROOT)")" ]; then
+    echo "khms_init: $KHMS_CONFIG_FILE names KHMS_ROOT=$named, not $(khms_get KHMS_ROOT) -- refusing" >&2
+    exit 3
+  fi
+fi
+resolve_dir() { local v; v="$(khms_get "$1")" || exit 3; realpath -m -- "$v"; }
+ROOT="$(resolve_dir KHMS_ROOT)"
+CONFIG_DIR="$(resolve_dir KHMS_CONFIG_DIR)"
+STATE="$(resolve_dir KHMS_STATE)"
+SHARED="$(resolve_dir KHMS_SHARED_STATE)"
+
 REPO="$(dirname "$CODE")"
-case "$ROOT/" in "$REPO/"*)
-  echo "khms_init: refusing to put a base inside the code checkout ($REPO); data never lives in a clone" >&2
-  exit 3 ;;
-esac
+for d in "$ROOT" "$CONFIG_DIR" "$STATE" "$SHARED"; do
+  case "$d/" in "$REPO/"*)
+    echo "khms_init: refusing to put $d inside the code checkout ($REPO); data never lives in a clone" >&2
+    exit 3 ;;
+  esac
+done
 
 mkdir -p "$ROOT"/memory/{know,views/topics,views/by-type,inbox/.staging,archive/know,tombstones} \
-         "$ROOT"/{journal,plans,archive,reports,config} "$ROOT"/state/shared
+         "$ROOT"/{journal,plans,archive,reports} "$CONFIG_DIR" "$STATE" "$SHARED"
 
 created=()
-COUNTER="$ROOT/state/shared/next_id"
+COUNTER="$SHARED/next_id"
 if [ ! -e "$COUNTER" ]; then
   hi=0
   for f in "$ROOT"/memory/know/K-*.md "$ROOT"/memory/archive/know/K-*.md; do
@@ -66,7 +100,8 @@ EOF
   created+=("tag registry")
 fi
 
-if [ ! -e "$ROOT/config/khms.env" ]; then
+if [ -z "${KHMS_CONFIG_FILE:-}" ] && [ ! -e "$ROOT/config/khms.env" ]; then
+  mkdir -p "$ROOT/config"
   cat > "$ROOT/config/khms.env" <<'EOF'
 # KHMS settings for this base. KEY=VALUE, `#` comments, ${NAME} references; never sourced by a shell.
 # Every key is optional: the documented default applies when a key is absent or empty

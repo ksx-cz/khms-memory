@@ -31,6 +31,12 @@ optional pair of surrounding quotes is removed; `${NAME}` is replaced by the RES
 file, default). Any other line is malformed. A reference cycle, a reference to a name nothing defines, a
 missing explicitly selected file and a KHMS_READ_ONLY other than 0/1 are errors. The file is never sourced
 or evaluated.
+
+Two resolution failures are NOT alike. When nothing selects a base at all -- no KHMS_ROOT, no
+KHMS_CONFIG_FILE, no registration -- the error is KhmsNoBaseError, and a tool run on explicit paths only may
+proceed: its write policy is then the environment's KHMS_READ_ONLY alone (0 or 1; anything else is an error).
+Every other failure is a configuration that WAS selected and cannot be resolved; it stays an error at every
+write-policy boundary (read_only, may_write, require_writable) and never implies writer mode.
 """
 import os
 import re
@@ -77,6 +83,11 @@ _DEFAULT = dict(DEFAULTS)
 
 class KhmsPathError(LookupError):
     """A location that cannot be resolved; the message says which and why."""
+
+
+class KhmsNoBaseError(KhmsPathError):
+    """Nothing selects a base (no KHMS_ROOT, no KHMS_CONFIG_FILE, no registration). The one resolution
+    failure that is not a configuration error: explicit-path library use is intentionally unconfigured."""
 
 
 def registered_root_file(env=None):
@@ -129,13 +140,23 @@ class Resolved:
         root = self.env.get("KHMS_ROOT") or ""
         if not root and cfg and self.raw.get("KHMS_ROOT"):
             root = self._expand("KHMS_ROOT", self.raw["KHMS_ROOT"], ("KHMS_ROOT",))
+        registered = False
         if not root:
             reg = registered_root_file(self.env)
             if reg and os.path.isfile(reg):
+                registered = True
                 with open(reg, encoding="utf-8") as fh:
                     root = (fh.readline() or "").strip()
         if not root:
-            raise KhmsPathError(
+            if cfg:
+                raise KhmsPathError(
+                    f"khms_paths: the settings file {cfg} (KHMS_CONFIG_FILE) names no KHMS_ROOT and no base is "
+                    "registered -- add KHMS_ROOT to it, set KHMS_ROOT, or create and register a base with: "
+                    "khms_init.sh --register <dir>")
+            if registered:
+                raise KhmsPathError(
+                    f"khms_paths: the registration {reg} is empty -- run khms_init.sh --register <dir>")
+            raise KhmsNoBaseError(
                 "khms_paths: no KHMS data root -- set KHMS_ROOT, name a settings file with KHMS_CONFIG_FILE, "
                 "or create and register a base with: khms_init.sh --register <dir>")
         if not os.path.isabs(root):
@@ -209,12 +230,16 @@ def get(key):
 
 
 def read_only():
-    """Is this a reader deployment? Without a resolvable base (a tool run on explicit paths only) the
-    environment alone decides."""
+    """Is this a reader deployment? When nothing selects a base (a tool run on explicit paths only) the
+    environment alone decides. A selected configuration that cannot be resolved raises KhmsPathError: an
+    invalid deployment is never a writer."""
     try:
         return resolved().read_only
-    except KhmsPathError:
-        return os.environ.get("KHMS_READ_ONLY") == "1"
+    except KhmsNoBaseError:
+        ro = os.environ.get("KHMS_READ_ONLY") or "0"
+        if ro not in ("0", "1"):
+            raise KhmsPathError(f"khms_paths: KHMS_READ_ONLY must be 0 or 1, got: {ro}")
+        return ro == "1"
 
 
 EXIT_READ_ONLY = 4
@@ -236,7 +261,7 @@ def may_write(path):
         return True
     try:
         r = resolved()
-    except KhmsPathError:
+    except KhmsNoBaseError:          # an environment-only reader with no base: nothing is shared, write nothing
         return False
     return not any(under(path, r.get(k)) for k in ("KHMS_ROOT", "KHMS_CONFIG_DIR", "KHMS_SHARED_STATE"))
 
@@ -300,12 +325,12 @@ sys.excepthook = _excepthook
 
 
 def soft(name, default=None):
-    """P.<name> (a derived location or a KHMS_* key), or `default` when no base can be resolved. For
+    """P.<name> (a derived location or a KHMS_* key), or `default` when no base is selected. For
     module-level defaults of library modules that must stay importable without a base; any real use of the
-    base still fails with the explanatory error."""
+    base still fails with the explanatory error, and a selected but invalid configuration fails here."""
     try:
         return get(name) if name.startswith("KHMS_") else _DERIVED[name](resolved())
-    except KhmsPathError:
+    except KhmsNoBaseError:
         return default
 
 

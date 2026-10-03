@@ -99,6 +99,12 @@ khms_load() {     # discover root and settings file; rc 3 with a reason when imp
       root="${root#"${root%%[![:space:]]*}"}"; root="${root%"${root##*[![:space:]]}"}"
     fi
   fi
+  if [ -z "$root" ] && [ -n "$cfg" ]; then
+    _khms_err "the settings file $cfg (KHMS_CONFIG_FILE) names no KHMS_ROOT and no base is registered" \
+              "-- add KHMS_ROOT to it, set KHMS_ROOT, or create and register a base with:" \
+              "khms_init.sh --register <dir>"
+    return 3
+  fi
   if [ -z "$root" ]; then
     _khms_err "no KHMS data root -- set KHMS_ROOT, name a settings file with KHMS_CONFIG_FILE," \
               "or create and register a base with: khms_init.sh --register <dir>"; return 3

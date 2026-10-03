@@ -24,15 +24,17 @@ and falls back to its own parent directory, so a copied `tools/` directory works
 export KHMS_ROOT="$HOME/.agent-memory"      # put this in your shell profile too
 ```
 
-Create the layout and copy the tooling:
+Create the layout; the tools stay in the clone and find the base through `khms_paths`:
 
 ```bash
-git clone <this-repo> /tmp/khms && /tmp/khms/tools/khms_init.sh "$KHMS_ROOT"
+git clone <this-repo> ~/khms && ~/khms/tools/khms_init.sh "$KHMS_ROOT"
 ```
 
-`khms_init.sh` is idempotent: it creates the directories, the ID counter, an empty tag
-registry, and copies `tools/` and `tools/prompts/` into `$KHMS_ROOT`. It writes nothing into
-`memory/know/`.
+`khms_init.sh` is idempotent and copies no code: it resolves the configuration every tool will
+use (environment, `KHMS_CONFIG_FILE`, `$KHMS_ROOT/config/khms.env`), refuses a reader
+deployment (`KHMS_READ_ONLY=1`, rc 4) or an invalid configuration (rc 3) before writing, then
+creates the directories, the ID counter in the configured shared state and an empty tag
+registry. It writes nothing into `memory/know/`.
 
 **Decide now how the base is versioned, and write the choice down.** Two options, and they
 are not equivalent:

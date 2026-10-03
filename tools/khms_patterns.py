@@ -29,7 +29,7 @@ def _load():
         _ITEMS = []
         try:
             path = P.get("KHMS_PATTERNS")
-        except P.KhmsPathError:          # a library import with no base (lint of explicit files): defaults
+        except P.KhmsNoBaseError:        # no base selected (lint of explicit files): defaults
             path = os.environ.get("KHMS_PATTERNS") or ""
         if path and os.path.isfile(path):
             with open(path, encoding="utf-8") as fh:

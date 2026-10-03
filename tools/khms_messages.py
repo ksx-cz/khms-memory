@@ -37,7 +37,7 @@ def _load():
         _LOADED = dict(DEFAULTS)
         try:
             path = P.get("KHMS_MESSAGES")
-        except P.KhmsPathError:          # a library import with no base: English defaults
+        except P.KhmsNoBaseError:        # a library import with no base selected: English defaults
             path = os.environ.get("KHMS_MESSAGES") or ""
         if path and os.path.isfile(path):
             with open(path, encoding="utf-8") as fh:
