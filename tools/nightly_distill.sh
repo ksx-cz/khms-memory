@@ -244,6 +244,23 @@ ledger() {
   python3 "$LEDGER_TOOL" --root "$ROOT" "$@"
 }
 SINCE=$(cat "$STAMP" 2>/dev/null || echo "1970-01-01")
+# THE TRIAGE STAGE'S SEED (review F7). The triage keeps its own watermark (KHMS_TRIAGE_STAMP, written by
+# nightly_triage.sh only over a window it judged in full); this driver's stamp moves to tonight's start
+# as soon as the sweep's candidates are safe, which says nothing about the triage. A base that has no
+# triage watermark yet starts its triage window where the night's stamp stood BEFORE tonight touched it
+# (read here, before the committed-window catch-up below may move it) -- never at tonight's start.
+TRIAGE_SEED_VALUE=$(head -n1 "$STAMP" 2>/dev/null || true)
+# run_triage_stage: the optional standing-base triage (KHMS_NIGHT_TRIAGE), non-fatal, said in the log
+# either way. Called on EVERY real night that reaches its end -- the quiet one included (see 4b below).
+run_triage_stage() {
+  if [ ${#TRIAGE_CMD[@]} -gt 0 ]; then
+    TRIAGE_SEED="$TRIAGE_SEED_VALUE" "${TRIAGE_CMD[@]}" >> "$LOG" 2>&1 \
+      || echo "$(date -Is) triage stage FAILED (non-fatal) — cards proposal is unaffected; the triage window is kept for the next run" >> "$LOG"
+  else
+    echo "$(date -Is) triage stage: OFF (KHMS_NIGHT_TRIAGE not configured)" >> "$LOG"
+  fi
+  return 0
+}
 # A run directory in the carry queue holds the WINDOW its candidates came from (written inside
 # the same atomic rename that commits the split, review P1-4): a run killed after that commit
 # but before it could write the stamp must not have its window swept a second time.
@@ -441,8 +458,15 @@ SIZE=$(stat -c%s "$DIGEST")
 NO_WINDOW=0
 if [ "$SIZE" -lt 200 ] && [ ! -s "$GITLOG" ] && [ ! -s "$JSRC" ]; then
   if [ "$QUEUE_N" -eq 0 ] && [ "$CARRY_N" -eq 0 ] && [ -z "$SOURCE_FAILED" ]; then
-    echo "$(date -Is) nothing new (digest ${SIZE}B), queue empty, carry empty, exit" >> "$LOG"
-    [ "$DRYRUN" = "1" ] || date -Is > "$STAMP"
+    echo "$(date -Is) nothing new (digest ${SIZE}B), queue empty, carry empty — nothing to distil" >> "$LOG"
+    if [ "$DRYRUN" != "1" ]; then
+      date -Is > "$STAMP"
+      # A quiet night is quiet for DISTILLATION only: cards change without a journal line, and the
+      # triage compares the standing base with itself (the Sunday run compares old cards too). A
+      # configured triage runs here exactly as on a busy night (review F7).
+      run_triage_stage
+    fi
+    echo "$(date -Is) nightly done (nothing to distil)" >> "$LOG"
     exit 0
   fi
   # Nothing new to SWEEP, but the queue or the carry is not empty: that work is the night.
@@ -652,7 +676,7 @@ EOF
   echo "--- agent: ${AGENT_BIN:-NOT EXECUTABLE ($AGENT) — the model stages would FAIL}; models sweep=$SWEEP_MODEL marks=$MARK_MODEL consolidate=$CONS_MODEL"
   echo "--- TRIAGE stage (step 4b) — delegated dry run ---"
   if [ ${#TRIAGE_CMD[@]} -gt 0 ]; then
-    NIGHTLY_DRYRUN=1 "${TRIAGE_CMD[@]}" || true
+    TRIAGE_SEED="$TRIAGE_SEED_VALUE" NIGHTLY_DRYRUN=1 "${TRIAGE_CMD[@]}" || true
   else
     echo "  OFF (KHMS_NIGHT_TRIAGE not configured)"
   fi
@@ -1116,14 +1140,10 @@ ledger sync >> "$LOG" 2>&1 || echo "$(date -Is) mark ledger sync (post) FAILED (
 # ALWAYS ATTEMPTED when configured, even when sweep or consolidate exhausted their retries above:
 # it compares the STANDING base against itself, not against tonight's candidates, so a failure
 # upstream must not stop it. It runs BEFORE the final verdict so a triage failure cannot cost the
-# night: it writes its own file (memory/inbox/DATE-triage.md), takes no lock, and `|| ...` keeps
-# it non-fatal under `set -euo pipefail`. Unconfigured, the log says so.
-if [ ${#TRIAGE_CMD[@]} -gt 0 ]; then
-  "${TRIAGE_CMD[@]}" >> "$LOG" 2>&1 \
-    || echo "$(date -Is) triage stage FAILED (non-fatal) — cards proposal is unaffected" >> "$LOG"
-else
-  echo "$(date -Is) triage stage: OFF (KHMS_NIGHT_TRIAGE not configured)" >> "$LOG"
-fi
+# night: it writes its own file (memory/inbox/DATE-triage.md), takes no night lock (it holds the
+# clone's code-use lock, nested in this run's), and run_triage_stage keeps it non-fatal under
+# `set -euo pipefail`. Unconfigured, the log says so. A quiet night runs it too (above).
+run_triage_stage
 
 # THE STAMP (board #209): written right after the sweep's candidates were persisted in the carry
 # queue (step 2e), never when the SWEEP failed — then the window stays open so the NEXT run's

@@ -86,6 +86,7 @@ DEFAULTS = [
     ("KHMS_WEEKLY_LOCK", "${KHMS_SHARED_STATE}/weekly.lock"),     # one weekly at a time
     ("KHMS_NIGHT_STAMP", "${KHMS_SHARED_STATE}/last-nightly"),    # start of the last stamped night window
     ("KHMS_WEEK_STAMP", "${KHMS_SHARED_STATE}/last-weekly"),      # completion of the last weekly
+    ("KHMS_TRIAGE_STAMP", "${KHMS_SHARED_STATE}/last-triage"),    # start of the last fully judged triage window
     ("KHMS_SWEEP_FAILED", "${KHMS_SHARED_STATE}/sweep-failed"),   # one line per failed sweep, cleared on success
     ("KHMS_NIGHT_LOG", "${KHMS_STATE}/nightly.log"),              # night AND week log
     ("KHMS_AGENT", "claude"),                                     # headless agent CLI (argv[0])
@@ -303,6 +304,26 @@ def may_write(path):
     except KhmsNoBaseError:          # an environment-only reader with no base: nothing is shared, write nothing
         return False
     return not any(under(path, r.get(k)) for k in ("KHMS_ROOT", "KHMS_CONFIG_DIR", "KHMS_SHARED_STATE"))
+
+
+def require_may_write(paths, what):
+    """Refuse (rc 4, before any write) when this deployment may not write one of `paths`.
+
+    For a tool that is not a base mutator but writes files a caller names (a report, a preview, a
+    checkpoint): a writer may write anywhere; a reader only outside the data root, the config dir and the
+    shared state (`may_write`, real paths -- an alias of a protected path is that path). Every output of
+    the run is checked here, not only the main one. Empty/None entries are skipped."""
+    for p in paths:
+        if p and not may_write(p):
+            print(f"khms: read-only deployment (KHMS_READ_ONLY=1): refusing to {what}: {p} is inside the "
+                  "base, its configuration or its shared state; nothing was written", file=sys.stderr)
+            sys.exit(EXIT_READ_ONLY)
+
+
+def same_path(a, b):
+    """Do `a` and `b` name the same location (real paths)? A path is compared by what it names, never as
+    text: `<base>/.` or a symlink to the base IS the base."""
+    return bool(a) and bool(b) and os.path.realpath(a) == os.path.realpath(b)
 
 
 def under(path, base):

@@ -24,6 +24,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import khms_triage as T  # noqa: E402
 import khms_search as ks  # noqa: E402
 import khms_triage_gate as G  # noqa: E402  (deterministic row gate, issue #208)
+import khms_paths as P  # noqa: E402  (the write policy of the report's output)
 import khms_contradict as kc  # noqa: E402  (the settings reader)
 import khms_patterns as KP  # noqa: E402
 import khms_messages as KM  # noqa: E402
@@ -438,6 +439,11 @@ def main():
                          "handed to a second error; point both of these at a scratch "
                          "directory for a dry re-render.")
     args = ap.parse_args()
+    # The morning file is a detached report: a reader may write it outside the base only. Checked before
+    # the first computation, so a reader never depends on a later refusal (the tombstone reservation) to
+    # keep its output out of the base. The tombstone counter itself is reserved by khms_alloc, which
+    # refuses a reader on its own.
+    P.require_may_write([args.out], "write the triage report")
 
     raw = json.load(open(args.sweep_json, encoding="utf-8"))
     # Envelope since 2026-08-31 ({"meta":…, "results":[…]}); a bare list is the older shape.

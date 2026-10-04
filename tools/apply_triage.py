@@ -71,7 +71,7 @@ def snapshot_first(brain, tag):
     throwaway and gets nothing) and never when KHMS_NO_SNAPSHOT=1. A failed snapshot warns
     loudly and does not block the apply — refusing to write would be the worse failure.
     """
-    if os.environ.get("KHMS_NO_SNAPSHOT") == "1" or brain != DEFAULT_BRAIN:
+    if os.environ.get("KHMS_NO_SNAPSHOT") == "1" or not P.same_path(brain, DEFAULT_BRAIN):
         return
     script = os.path.join(P.CODE, "khms_snapshot.sh")
     if not os.path.exists(script):
@@ -329,8 +329,25 @@ def main():
         print("REFUSED: no base selected (KHMS_ROOT) and no --brain", file=sys.stderr)
         sys.exit(2)
     write = args.apply and not args.dry_run
-    if write and args.brain == DEFAULT_BRAIN:
-        P.require_writable("apply triage verdicts")
+    # THE WRITE POLICY, BEFORE ANYTHING IS READ OR WRITTEN. `--brain` is compared with the selected base
+    # by what it names (real path), never as text: `<base>/.` or a symlink to the base IS the selected base
+    # and gets its policy, its snapshot and its shared review marker. Every output of the run is checked,
+    # the preview's report included -- a dry run is a promise not to change the base, not an exemption
+    # from the reader boundary.
+    selected = P.same_path(args.brain, DEFAULT_BRAIN)
+    rp = re.sub(r"\.md$", ".preview.md" if args.assume_apply else ".applied.md", args.triage_file)
+    if rp == args.triage_file:
+        rp = args.triage_file + (".preview.md" if args.assume_apply else ".applied.md")
+    markers = (P.REVIEW_MARKERS if selected
+               else os.path.join(args.brain, "state", "shared", "reviewed"))
+    if write:
+        if selected:
+            P.require_writable("apply triage verdicts")
+        P.require_may_write([os.path.join(args.brain, "memory", "know"),
+                             os.path.join(args.brain, "memory", "archive", "know"), markers, rp],
+                            "apply triage verdicts")
+    else:
+        P.require_may_write([rp], "write the apply preview")
     if args.assume_apply and write:
         print("REFUSED: --assume-apply is a preview and cannot write. Write the REVIEW "
               "VERDICT lines first.", file=sys.stderr)
@@ -396,8 +413,6 @@ def main():
         if m:
             # The review marker the morning ping reads: the shared markers dir of the selected base;
             # a throwaway --brain keeps its own under <brain>/state/shared/reviewed.
-            markers = (P.REVIEW_MARKERS if args.brain == DEFAULT_BRAIN
-                       else os.path.join(args.brain, "state", "shared", "reviewed"))
             os.makedirs(markers, exist_ok=True)
             open(os.path.join(markers, f".reviewed-{m.group(1)}-triage"), "a").close()
     elif any(c["archive"] for c in edits.values()):
@@ -408,8 +423,6 @@ def main():
 
     out = "\n".join(report) + "\n"
     print(out)
-    rp = re.sub(r"\.md$", ".preview.md" if args.assume_apply else ".applied.md",
-                args.triage_file)
     open(rp, "w", encoding="utf-8").write(out)
     print(f"report -> {rp}", file=sys.stderr)
 

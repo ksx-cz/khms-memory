@@ -25,20 +25,31 @@ for _a in "$@"; do
 done
 
 # WHERE THINGS ARE (khms_paths.sh): data under KHMS_ROOT (memory/know read, memory/inbox written),
-# the night's stamp KHMS_NIGHT_STAMP (read: the incremental window), log NIGHTLY_LOG / TRIAGE_LOG else
-# KHMS_NIGHT_LOG, the tools beside this script. TRIAGE_OUT / NIGHTLY_STAGING / NIGHTLY_DATE stay
-# overridable so a test can run the stage for real against a throwaway base.
+# the stage's OWN watermark KHMS_TRIAGE_STAMP (read: the incremental window; written: only after a run
+# that judged its whole plan), log NIGHTLY_LOG / TRIAGE_LOG else KHMS_NIGHT_LOG, the tools beside this
+# script. TRIAGE_OUT / NIGHTLY_STAGING / NIGHTLY_DATE stay overridable so a test can run the stage for
+# real against a throwaway base.
 . "$(dirname "$(readlink -f "$0")")/khms_paths.sh"
 khms_load || exit 3
+DRYRUN=${NIGHTLY_DRYRUN:-0}
+# A REAL RUN IS A BASE MUTATOR (it writes memory/inbox/, the staging files and the shared watermark), so a
+# reader deployment is refused before anything else -- the same rc 4 as every other mutator. And it is a
+# LONG user of this clone's code (up to two hours, starting further tools from the clone as it goes), so it
+# holds the clone's code-use lock (shared) for its whole life: an updater holding it refuses this run with
+# rc 5 before any work, and an update attempted while it runs is refused. Under the night driver, which
+# already holds the same lock, the nested shared lock cannot deadlock. A dry run writes nothing in the base
+# and takes neither.
+if [ "$DRYRUN" != "1" ]; then
+  khms_require_writable "run the triage stage" || exit $?
+  khms_code_lock || exit $?
+fi
 CODE=$KHMS_CODE
 BRAIN=$(khms_get KHMS_ROOT)
 DATE=${NIGHTLY_DATE:-$(date +%F)}
-STAMP=$(khms_get KHMS_NIGHT_STAMP)
+TSTAMP=$(khms_get KHMS_TRIAGE_STAMP)
 LOG=${TRIAGE_LOG:-${NIGHTLY_LOG:-$(khms_get KHMS_NIGHT_LOG)}}
-mkdir -p "$(dirname "$LOG")"
 STAGING=${NIGHTLY_STAGING:-$BRAIN/memory/inbox/.staging}
 OUT=${TRIAGE_OUT:-$BRAIN/memory/inbox/$DATE-triage.md}
-DRYRUN=${NIGHTLY_DRYRUN:-0}
 # Full sweep on Sundays (the weekly window), incremental on the other six nights: an
 # incremental run still compares the touched cards against the WHOLE base, which is the
 # property that matters; the weekly full run is what catches conflicts between two cards that
@@ -70,10 +81,28 @@ if [ -n "$KHMS_LLM_URL" ] && [ "$KHMS_JUDGE" != local ]; then FALLBACK_JUDGE=loc
 export KHMS_CLAUDE_BIN=${KHMS_CLAUDE_BIN:-${NIGHTLY_CLAUDE_BIN:-$(khms_get KHMS_AGENT)}}
 # The shadow judge of the reference deployment (a second judge evaluated on the same pairs) is an
 # evaluation pilot, not part of KHMS: it ran only while the judge of record was the local model.
-SINCE=$(cat "$STAMP" 2>/dev/null || echo "1970-01-01")
+# THE STAGE'S OWN WINDOW (review F7). Until this was split, the stage read the NIGHT's stamp, which the
+# night driver had already moved to tonight's start once the sweep's candidates were safe -- so a weekday
+# triage never looked at the cards changed between the last night and this one, and a failed triage had no
+# window of its own to retry. Now:
+#   * the window starts at KHMS_TRIAGE_STAMP, the start of the last run that judged its WHOLE plan;
+#   * absent (a base that has never had this watermark), it starts where the caller says the uncovered time
+#     starts -- TRIAGE_SEED, which the night driver sets to its stamp as it was BEFORE tonight moved it --
+#     else at the beginning (every card). The start is written to the watermark at once, so a run that dies
+#     keeps it for the retry;
+#   * RUN_START is taken before any card is read; only a run whose plan was judged in full (no pair left
+#     without a judgement, the sweep not partial) moves the watermark to it. A failed, partial or empty-handed
+#     run (budget, deadline, judge errors) leaves it where it was: the next run covers the same window again.
+# Pairs the --limit ranking leaves out are not "uncovered" in this sense: that is the configured size of a
+# night, the morning file lists them as never sent, and the Sunday full sweep ranks the whole base again.
+RUN_START=$(date -Is)
+if [ -s "$TSTAMP" ]; then
+  SINCE=$(head -n1 "$TSTAMP")
+else
+  SINCE=${TRIAGE_SEED:-1970-01-01}
+fi
 if [ "$(date +%u)" = "7" ] || [ "${TRIAGE_FULL:-0}" = "1" ]; then MODE=(); else MODE=(--since "$SINCE"); fi
 
-mkdir -p "$STAGING"
 SWEEP_JSON=$STAGING/triage-$DATE-sweep.json
 JUDGE_LEDGER=$STAGING/triage-$DATE-judge-spend.jsonl
 SWEEP_MD=$STAGING/triage-$DATE-sweep.md
@@ -84,7 +113,7 @@ if [ "$DRYRUN" = "1" ]; then
   echo "  brain          : $BRAIN"
   echo "  date           : $DATE"
   echo "  mode           : ${MODE[*]:-full sweep (all cards)}"
-  echo "  since stamp    : $SINCE"
+  echo "  since stamp    : $SINCE ($([ -s "$TSTAMP" ] && echo "triage watermark $TSTAMP" || { [ -n "${TRIAGE_SEED:-}" ] && echo "no triage watermark yet: the night driver's seed" || echo "no triage watermark yet: every card"; }))"
   echo "  cards in know/ : $(ls "$BRAIN"/memory/know/K-*.md | wc -l)"
   echo "  embed index    : $(ls -la "$BRAIN"/memory/.embed/bge.npz 2>/dev/null | awk '{print $5" B, "$6" "$7" "$8}')"
   echo "  adjudicate top : $LIMIT pairs"
@@ -112,9 +141,7 @@ except Exception as e:
   echo "  shadow judge   : not part of KHMS"
   echo
   echo "--- blocking only (deterministic, zero tokens) ---"
-  python3 "$CODE/khms_contradict.py" --pairs-only --limit 3 "${MODE[@]}" \
-    >/dev/null 2>"$STAGING/triage-$DATE-dryrun.err" || true
-  cat "$STAGING/triage-$DATE-dryrun.err"
+  python3 "$CODE/khms_contradict.py" --pairs-only --limit 3 "${MODE[@]}" 2>&1 >/dev/null || true
   echo
   echo "--- provenance flags (deterministic, zero tokens) ---"
   python3 "$CODE/khms_contradict.py" --provenance --limit 5 2>/dev/null | head -20
@@ -123,6 +150,11 @@ except Exception as e:
   exit 0
 fi
 
+mkdir -p "$(dirname "$LOG")" "$STAGING" "$(dirname "$TSTAMP")"
+if [ ! -s "$TSTAMP" ]; then
+  echo "$SINCE" > "$TSTAMP.tmp" && mv -f "$TSTAMP.tmp" "$TSTAMP"
+  echo "$(date -Is) triage watermark: none yet -- the window starts at $SINCE ($([ -n "${TRIAGE_SEED:-}" ] && echo "the night's stamp before tonight" || echo "every card")), kept in $TSTAMP" >> "$LOG"
+fi
 echo "$(date -Is) triage start (mode=${MODE[*]:-full}, limit=$LIMIT, judge=$KHMS_JUDGE$([ "$KHMS_JUDGE" = local ] || echo ", bound \$$TRIAGE_JUDGE_MAX_USD/night estimated, ledger $JUDGE_LEDGER"))" >> "$LOG"
 
 python3 "$CODE/khms_contradict.py" --provenance --limit 60 > "$PROV_MD" 2>>"$LOG" || true
@@ -147,9 +179,10 @@ try:
     import khms_triage_report as R
     d = json.load(open(sys.argv[1]))
     c = R.judgement_census(d["results"], d.get("meta", {}))
-    print(f"{c['judged']} {c['planned']}")
+    complete = int(c["judged"] == c["planned"] and not c["partial"])
+    print(f"{c['judged']} {c['planned']} {complete}")
 except Exception:                                           # noqa: BLE001
-    print("? ?")
+    print("? ? 0")
 PY
 }
 run_sweep() {   # run_sweep <judge>
@@ -163,8 +196,8 @@ run_sweep() {   # run_sweep <judge>
 JUDGE_USED=$KHMS_JUDGE
 run_sweep "$KHMS_JUDGE" || rc=$?
 if [ "$KHMS_JUDGE" != "local" ]; then
-  if [ -s "$SWEEP_JSON" ]; then CEN=$(census "$SWEEP_JSON"); else CEN="? ?"; fi
-  read -r C_JUDGED C_PLANNED <<< "$CEN"
+  if [ -s "$SWEEP_JSON" ]; then CEN=$(census "$SWEEP_JSON"); else CEN="? ? 0"; fi
+  read -r C_JUDGED C_PLANNED _ <<< "$CEN"
   if [ -z "$FALLBACK_JUDGE" ]; then
     :   # no local model configured: whatever the Claude judge left is the night (judged or FAILED below)
   elif [ "$rc" -ne 0 ] || [ ! -s "$SWEEP_JSON" ] || { [ "$C_JUDGED" = "0" ] && [ "$C_PLANNED" != "0" ]; }; then
@@ -226,11 +259,19 @@ python3 "$CODE/khms_triage_report.py" "$SWEEP_JSON" \
 # planned, 0 judged, rc=0. The proposal now says so on its own first screen; this line puts
 # the same fact in nightly.log, because "triage done" next to an empty night is the defect
 # this whole file exists to stop.
-read -r N_JUDGED N_PLANNED <<< "$(census "$SWEEP_JSON")"
+read -r N_JUDGED N_PLANNED N_COMPLETE <<< "$(census "$SWEEP_JSON")"
 if [ "$N_JUDGED" = "0" ] && [ "${N_PLANNED:-0}" != "0" ]; then
   echo "$(date -Is) triage WARNING: the sweep judged NOTHING — 0 of $N_PLANNED planned pairs" \
        "came back judged. $OUT is a record of a night that did not happen, not of a base" \
        "without contradictions." >> "$LOG"
+fi
+# THE WATERMARK MOVES ONLY OVER A WINDOW THAT WAS JUDGED IN FULL (see "THE STAGE'S OWN WINDOW" above).
+if [ "$N_COMPLETE" = "1" ]; then
+  echo "$RUN_START" > "$TSTAMP.tmp" && mv -f "$TSTAMP.tmp" "$TSTAMP"
+  echo "$(date -Is) triage watermark -> $RUN_START (the whole plan was judged)" >> "$LOG"
+else
+  echo "$(date -Is) triage watermark KEPT at $SINCE: $N_JUDGED of $N_PLANNED planned pairs judged" \
+       "-- the next run covers this window again" >> "$LOG"
 fi
 
 echo "$(date -Is) triage done ($N_JUDGED of $N_PLANNED planned pairs judged, judge $JUDGE_USED$([ "$JUDGE_USED" = "$KHMS_JUDGE" ] || echo " = FALLBACK from $KHMS_JUDGE")) -> $OUT" >> "$LOG"

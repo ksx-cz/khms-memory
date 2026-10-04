@@ -1803,6 +1803,10 @@ def main():
     ap.add_argument("--provenance", action="store_true",
                     help="report cards asserting machine-checkable numbers on doc evidence")
     args = ap.parse_args()
+    # Every file this run can write -- the report, the JSON checkpoint, the judge's spend ledger -- is checked
+    # against the write policy before the first card is read: a reader may sweep into a detached directory,
+    # never into the base, its configuration or its shared state.
+    P.require_may_write([args.out, args.json, args.spend_ledger], "write the sweep's outputs")
 
     cards = [c for c in ks.load_cards() if not c["fog"]]
     by_id = {c["id"]: c for c in cards}

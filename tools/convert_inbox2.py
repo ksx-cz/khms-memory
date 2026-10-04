@@ -1166,6 +1166,10 @@ def main(argv=None):
 
     dst = a.dst or re.sub(r"\.md$", "", a.src) + ".approve.md"
     report_path = a.report or re.sub(r"\.md$", "", dst) + ".report.txt"
+    # The converter is a READER that writes two files beside its input by default. On a reader deployment
+    # (KHMS_READ_ONLY=1) both must lie outside the base, its configuration and its shared state -- checked
+    # before anything is written; a conversion into a detached directory stays allowed.
+    P.require_may_write([dst, report_path], "write the converted inbox file and its report")
 
     date = a.date
     if not date:
