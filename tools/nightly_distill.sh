@@ -209,6 +209,32 @@ RUN_START=$(date -Is)
 RUN_START_EPOCH=$(date +%s)
 # Only the holder writes the lock file (see THE LOCK above); the night key follows once claimed.
 [ "$DRYRUN" = "1" ] || printf 'nightly %s pid=%s\n' "$RUN_START" "$$" > "$LOCK"
+# THE FIRST TRIAGE WINDOW IS PERSISTED HERE (review F7a), under the night lock and before anything below can
+# move the night's stamp (the committed-window catch-up, the sweep's commit, the quiet path). A base with a
+# configured triage but no triage watermark yet has exactly one durable copy of where its uncovered triage time
+# starts: the night's stamp as it stands now. Until this block existed that copy lived only in a shell variable
+# until the child seeded itself, so a night that died (or whose triage failed to start) after its sweep moved
+# the stamp lost the window for good. Written atomically (tmp + rename), only when no watermark exists -- an
+# existing one is never replaced by the newer night stamp; a race with a standalone triage can at worst replace
+# its watermark with this OLDER start, which re-covers time and loses none. A base with neither stamp seeds
+# 1970-01-01 (every card), the child's own default. A seed that cannot be written stops the night HERE, before
+# the night stamp moves: nothing is lost, the next night tries again. Triage OFF seeds nothing: a triage turned
+# on later starts at the night stamp of the night it first runs (its explicit start horizon).
+if [ "$DRYRUN" != "1" ] && [ -n "$(khms_get KHMS_NIGHT_TRIAGE)" ]; then
+  TSTAMP=$(khms_get KHMS_TRIAGE_STAMP)
+  if [ ! -s "$TSTAMP" ]; then
+    _seed=$(head -n1 "$STAMP" 2>/dev/null || true)
+    _seed=${_seed:-1970-01-01}
+    if mkdir -p "$(dirname "$TSTAMP")" 2>>"$LOG" && printf '%s\n' "$_seed" > "$TSTAMP.tmp.$$" 2>>"$LOG" \
+       && mv -f "$TSTAMP.tmp.$$" "$TSTAMP" 2>>"$LOG"; then
+      echo "$(date -Is) triage watermark: none yet -- the first triage window starts at $_seed (the night's stamp before tonight), kept in $TSTAMP" >> "$LOG"
+    else
+      rm -f "$TSTAMP.tmp.$$" 2>/dev/null
+      echo "$(date -Is) nightly FAILED: the triage watermark could not be written ($TSTAMP) -- nothing run, nothing stamped; the night's stamp $_seed still holds the triage window's start" >> "$LOG"
+      exit 1
+    fi
+  fi
+fi
 MARK_DEADLINE=$((RUN_START_EPOCH + MARK_BUDGET_MIN * 60))
 SWEEP_DEADLINE=$((RUN_START_EPOCH + ${SWEEP_BUDGET_S:-$((SWEEP_BUDGET_MIN * 60))}))   # _S: test seam
 CARD_DEADLINE=$((RUN_START_EPOCH + CARD_BUDGET_MIN * 60))
@@ -244,18 +270,19 @@ ledger() {
   python3 "$LEDGER_TOOL" --root "$ROOT" "$@"
 }
 SINCE=$(cat "$STAMP" 2>/dev/null || echo "1970-01-01")
-# THE TRIAGE STAGE'S SEED (review F7). The triage keeps its own watermark (KHMS_TRIAGE_STAMP, written by
+# THE TRIAGE STAGE'S SEED (review F7, F7a). The triage keeps its own watermark (KHMS_TRIAGE_STAMP, written by
 # nightly_triage.sh only over a window it judged in full); this driver's stamp moves to tonight's start
 # as soon as the sweep's candidates are safe, which says nothing about the triage. A base that has no
-# triage watermark yet starts its triage window where the night's stamp stood BEFORE tonight touched it
-# (read here, before the committed-window catch-up below may move it) -- never at tonight's start.
+# triage watermark yet starts its triage window where the night's stamp stood BEFORE tonight touched it --
+# never at tonight's start. With the triage configured that start is already PERSISTED in the watermark
+# (above, right after the lock); TRIAGE_SEED only repeats it to the child, which prefers its watermark.
 TRIAGE_SEED_VALUE=$(head -n1 "$STAMP" 2>/dev/null || true)
 # run_triage_stage: the optional standing-base triage (KHMS_NIGHT_TRIAGE), non-fatal, said in the log
 # either way. Called on EVERY real night that reaches its end -- the quiet one included (see 4b below).
 run_triage_stage() {
   if [ ${#TRIAGE_CMD[@]} -gt 0 ]; then
     TRIAGE_SEED="$TRIAGE_SEED_VALUE" "${TRIAGE_CMD[@]}" >> "$LOG" 2>&1 \
-      || echo "$(date -Is) triage stage FAILED (non-fatal) — cards proposal is unaffected; the triage window is kept for the next run" >> "$LOG"
+      || echo "$(date -Is) triage stage FAILED (non-fatal) — cards proposal is unaffected; the triage window is kept for the next run ($(khms_get KHMS_TRIAGE_STAMP): $(head -n1 "$(khms_get KHMS_TRIAGE_STAMP)" 2>/dev/null || echo MISSING))" >> "$LOG"
   else
     echo "$(date -Is) triage stage: OFF (KHMS_NIGHT_TRIAGE not configured)" >> "$LOG"
   fi

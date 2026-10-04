@@ -395,6 +395,21 @@ def main():
     if noop:
         report += ["", f"already in the target state (no-op): {', '.join(noop)}", ""]
 
+    # THE PLAN'S OWN OUTPUTS, BY REAL PATH, BEFORE THE FIRST WRITE (review F5a). The guard above checked the
+    # DIRECTORIES; the real path of a directory says nothing about the files in it -- a card in a detached
+    # `--brain` can be a symlink into the protected base, and `open(path, "w")` follows it. So every file this
+    # run is about to write, move or create is checked here (an archive move also removes its source entry),
+    # all of them before any of them: a refusal of a later card must not come after an earlier one changed.
+    m_date = re.search(r"(\d{4}-\d{2}-\d{2})", os.path.basename(args.triage_file))
+    marker = os.path.join(markers, f".reviewed-{m_date.group(1)}-triage") if m_date else None
+    if write:
+        outputs = [c["path"] for _, c, _ in changed_files]
+        if args.archive:
+            for cid, c in sorted(edits.items()):
+                if c["archive"]:
+                    outputs += [c["path"], os.path.join(args.brain, "memory", "archive", "know", f"{cid}.md")]
+        P.require_may_write(outputs + [marker, rp], "apply triage verdicts")
+
     archived = []
     if write:
         snapshot_first(args.brain, "pre-triage")
@@ -409,12 +424,11 @@ def main():
                 os.makedirs(os.path.dirname(dst), exist_ok=True)
                 shutil.move(c["path"], dst)
                 archived.append(cid)
-        m = re.search(r"(\d{4}-\d{2}-\d{2})", os.path.basename(args.triage_file))
-        if m:
+        if marker:
             # The review marker the morning ping reads: the shared markers dir of the selected base;
             # a throwaway --brain keeps its own under <brain>/state/shared/reviewed.
             os.makedirs(markers, exist_ok=True)
-            open(os.path.join(markers, f".reviewed-{m.group(1)}-triage"), "a").close()
+            open(marker, "a").close()
     elif any(c["archive"] for c in edits.values()):
         report.append("archive moves pending (--apply --archive): "
                       + ", ".join(cid for cid, c in edits.items() if c["archive"]))

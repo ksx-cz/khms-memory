@@ -7,7 +7,13 @@
     before any work, and a writer without an updater runs normally;
   * the triage has its own progress watermark: a full night hands it the window it has not covered yet (not the
     sweep's freshly advanced stamp), a failed triage keeps that window for the retry, a successful one advances
-    only its own watermark, and a quiet night (no new distillation input) still runs a configured triage.
+    only its own watermark, and a quiet night (no new distillation input) still runs a configured triage;
+  * (F5a) apply_triage checks the real path of every file of its plan -- each card, archive target, review
+    marker, report -- before its first write: a detached base whose card files are symlinks into the protected
+    base is refused (rc 4) with nothing changed, the earlier cards of the plan included;
+  * (F7a) the first triage window is persisted by the night driver, under its lock, before anything can move
+    the night's stamp: a triage that fails before it could seed itself keeps the window, an existing watermark
+    is never replaced, and a seed that cannot be written stops the night with its stamp unmoved.
 
 Isolated: a temporary base, a copy of the tools with fake judge/report children. No model, no network, no
 scheduler.
@@ -284,3 +290,148 @@ def test_quiet_full_night_still_runs_configured_triage(tmp_path):
     r = run(["bash", str(TOOLS / "nightly_distill.sh")], night_env(tmp_path, root, fake, code))
     assert r.returncode == 0, r.stderr
     assert (root / "memory/inbox/2099-01-02-triage.md").exists(), night.log_of(root)
+
+
+# --- F5a: apply_triage checks the real path of EVERY file it writes, before the first write ---------
+APPLY_IDS = ["K-%05d" % n for n in (90001, 90002)]
+APPLY_QUOTES = ["The test device runs at ten frames each second.",
+                "The test device runs at twenty frames each second."]
+
+
+def apply_case(tmp_path, root, links):
+    """A detached base (`--brain`, a regular directory outside the protected one) whose two cards are each a
+    regular file (`links[i]` False) or a symlink to a card inside the protected base (True), and a review with
+    one valid APPLY challenge row over the pair. Returns (detached base, the real card files, the triage)."""
+    other = tmp_path / "detached"
+    know = other / "memory/know"
+    know.mkdir(parents=True)
+    files = []
+    for cid, quote, link in zip(APPLY_IDS, APPLY_QUOTES, links):
+        target = (root / "memory/know" if link else know) / (cid + ".md")
+        target.write_text("---\nid: %s\nstatus: active\nlevel: observation\nevidence: measured\n"
+                          "links:\n  contradicts: []\n---\n%s\n" % (cid, quote))
+        files.append(target)
+        if link:
+            (know / target.name).symlink_to(target)
+    triage = tmp_path / "2099-01-01-triage.md"
+    triage.write_text("# triage\n\n### %s — action **MARK_CONJECTURE** (contradicted by %s, severity 4)\n"
+                      '- offending quote: "%s"\n- winning quote (%s): "%s"\n\n'
+                      "## REVIEW VERDICT\nROW 1: APPLY challenge — offline test\n"
+                      % (APPLY_IDS[0], APPLY_IDS[1], APPLY_QUOTES[0], APPLY_IDS[1], APPLY_QUOTES[1]))
+    return other, files, triage
+
+
+@pytest.mark.parametrize("protected", [False, True])
+def test_apply_checks_actual_card_outputs(tmp_path, protected):
+    """Diblin F5a: the directory guard is not a guard of the files in it. A detached base whose card files are
+    symlinks into the protected base must not change the protected cards (rc 4); the same apply over regular
+    detached files is the positive control (rc 0, the cards change)."""
+    root, env = base(tmp_path)
+    other, files, triage = apply_case(tmp_path, root, [protected, protected])
+    before = [f.read_bytes() for f in files]
+    r = run([sys.executable, str(TOOLS / "apply_triage.py"), str(triage), "--apply", "--brain", str(other)], env)
+    if protected:
+        assert [f.read_bytes() for f in files] == before, (r.returncode, r.stdout, r.stderr)
+        assert r.returncode == 4, (r.returncode, r.stdout, r.stderr)
+    else:
+        assert r.returncode == 0 and [f.read_bytes() for f in files] != before, (r.stdout, r.stderr)
+
+
+def test_apply_checks_the_whole_plan_before_the_first_write(tmp_path):
+    """The plan is checked as a whole: the first card (a regular detached file, written first) must not change
+    when a LATER card of the same plan resolves into the protected base -- no half-applied review."""
+    root, env = base(tmp_path)
+    other, files, triage = apply_case(tmp_path, root, [False, True])
+    before = [f.read_bytes() for f in files]
+    r = run([sys.executable, str(TOOLS / "apply_triage.py"), str(triage), "--apply", "--brain", str(other)], env)
+    assert r.returncode == 4, (r.returncode, r.stdout, r.stderr)
+    assert [f.read_bytes() for f in files] == before, "a card changed before the refusal"
+    assert not (other / "state").exists() and not triage.with_name("2099-01-01-triage.applied.md").exists()
+
+
+def test_apply_checks_the_review_marker_file(tmp_path):
+    """The review marker is a file the run writes too: a marker in the detached markers dir that is a symlink to
+    a file inside the protected base is refused before anything is written."""
+    root, env = base(tmp_path)
+    other, files, triage = apply_case(tmp_path, root, [False, False])
+    markers = other / "state/shared/reviewed"
+    markers.mkdir(parents=True)
+    protected_marker = root / "state/shared/protected-marker"
+    (markers / ".reviewed-2099-01-01-triage").symlink_to(protected_marker)
+    before = [f.read_bytes() for f in files]
+    r = run([sys.executable, str(TOOLS / "apply_triage.py"), str(triage), "--apply", "--brain", str(other)], env)
+    assert r.returncode == 4, (r.returncode, r.stdout, r.stderr)
+    assert [f.read_bytes() for f in files] == before and not protected_marker.exists()
+
+
+# --- F7a: the first triage window is persisted before the night moves its own stamp ---------------
+OLD = "2001-01-01T00:00:00+00:00"
+
+
+@pytest.mark.parametrize("seeded", [False, True])
+def test_failure_before_first_stage_preserves_window(tmp_path, seeded):
+    """Diblin F7a: the stage entry fails before nightly_triage.sh could seed itself (a start failure, rc 17);
+    the night moves its own stamp; the next night must still hand the triage the ORIGINAL window. `seeded` is
+    the positive control: a triage watermark that already existed."""
+    root, fake = night.make_base(tmp_path, n_marks=1)
+    stamp = root / "state/shared/last-nightly"
+    stamp.write_text(OLD + "\n")
+    if seeded:
+        (root / "state/shared/last-triage").write_text(OLD + "\n")
+    code = stage_code(tmp_path)
+    fail = tmp_path / "triage-entry.sh"
+    fail.write_text("#!/bin/bash\nexit 17\n")
+    env = night_env(tmp_path, root, fake, code, KHMS_NIGHT_TRIAGE="bash " + str(fail))
+    first = run(["bash", str(TOOLS / "nightly_distill.sh")], env)
+    assert first.returncode == 0 and "triage stage FAILED" in night.log_of(root), first.stderr
+    assert stamp.read_text().strip() != OLD
+    (root / "journal/2099-01-01.md").unlink()
+    second = run(["bash", str(TOOLS / "nightly_distill.sh")], night_env(tmp_path, root, fake, code))
+    assert second.returncode == 0, second.stderr
+    assert sinces(tmp_path) == [OLD], (OLD, sinces(tmp_path), night.log_of(root))
+
+
+def test_the_night_never_overwrites_an_existing_triage_watermark(tmp_path):
+    """The seed is written only where no triage watermark exists: an older watermark (an uncovered triage
+    window that started before the night's stamp) is kept, never replaced by the newer night stamp."""
+    root, fake = night.make_base(tmp_path, n_marks=1)
+    (root / "state/shared/last-nightly").write_text(OLD + "\n")
+    older = "1999-01-01T00:00:00+00:00"
+    (root / "state/shared/last-triage").write_text(older + "\n")
+    code = stage_code(tmp_path)
+    fail = tmp_path / "triage-entry.sh"
+    fail.write_text("#!/bin/bash\nexit 17\n")
+    run(["bash", str(TOOLS / "nightly_distill.sh")],
+        night_env(tmp_path, root, fake, code, KHMS_NIGHT_TRIAGE="bash " + str(fail)))
+    assert (root / "state/shared/last-triage").read_text().strip() == older
+    (root / "journal/2099-01-01.md").unlink()
+    r = run(["bash", str(TOOLS / "nightly_distill.sh")], night_env(tmp_path, root, fake, code))
+    assert r.returncode == 0, r.stderr
+    assert sinces(tmp_path) == [older], sinces(tmp_path)
+
+
+def test_a_seed_that_cannot_be_persisted_stops_the_night_before_its_stamp_moves(tmp_path):
+    """When the first triage window cannot be written, the night stops before anything moves the only other copy
+    of its start (the night stamp): rc != 0, a FAILED line, the night stamp untouched. The retry with a writable
+    watermark then hands the triage the original window (positive control)."""
+    if os.geteuid() == 0:
+        pytest.skip("a read-only directory does not stop root")
+    root, fake = night.make_base(tmp_path, n_marks=1)
+    stamp = root / "state/shared/last-nightly"
+    stamp.write_text(OLD + "\n")
+    code = stage_code(tmp_path)
+    ro = tmp_path / "ro"
+    ro.mkdir()
+    ro.chmod(0o555)
+    try:
+        r = run(["bash", str(TOOLS / "nightly_distill.sh")],
+                night_env(tmp_path, root, fake, code, KHMS_TRIAGE_STAMP=ro / "sub/last-triage"))
+    finally:
+        ro.chmod(0o755)
+    assert r.returncode != 0, night.log_of(root)
+    assert "triage watermark could not be written" in night.log_of(root), night.log_of(root)
+    assert stamp.read_text().strip() == OLD
+    assert sinces(tmp_path) == []
+    r = run(["bash", str(TOOLS / "nightly_distill.sh")], night_env(tmp_path, root, fake, code))
+    assert r.returncode == 0, r.stderr + night.log_of(root)
+    assert sinces(tmp_path) == [OLD], sinces(tmp_path)

@@ -52,8 +52,9 @@ STAGING=${NIGHTLY_STAGING:-$BRAIN/memory/inbox/.staging}
 OUT=${TRIAGE_OUT:-$BRAIN/memory/inbox/$DATE-triage.md}
 # Full sweep on Sundays (the weekly window), incremental on the other six nights: an
 # incremental run still compares the touched cards against the WHOLE base, which is the
-# property that matters; the weekly full run is what catches conflicts between two cards that
-# are both old.
+# property that matters; the weekly full run puts pairs of two OLD cards back into the ranking.
+# It is not a promise to judge them: the Sunday run keeps the same --limit below, so a pair that
+# ranks under the limit can stay unselected on Sunday too (review 173 step 3d, clarification 1).
 LIMIT=${TRIAGE_LIMIT:-250}
 # THE JUDGE: who adjudicates the pairs -- a Claude model through the agent CLI (`claude -p --model
 # sonnet|haiku`) or the LOCAL model (KHMS_LLM_URL, $0). In the reference deployment a measured gate over
@@ -94,7 +95,11 @@ export KHMS_CLAUDE_BIN=${KHMS_CLAUDE_BIN:-${NIGHTLY_CLAUDE_BIN:-$(khms_get KHMS_
 #     without a judgement, the sweep not partial) moves the watermark to it. A failed, partial or empty-handed
 #     run (budget, deadline, judge errors) leaves it where it was: the next run covers the same window again.
 # Pairs the --limit ranking leaves out are not "uncovered" in this sense: that is the configured size of a
-# night, the morning file lists them as never sent, and the Sunday full sweep ranks the whole base again.
+# night, the morning file lists them as never sent, and the Sunday full sweep ranks the whole base again --
+# with the same limit, so it does not guarantee they are ever judged. THE WATERMARK MEANS "THE SELECTED PLAN
+# OVER THIS WINDOW WAS JUDGED IN FULL", not "every contradiction in the base was checked" (review 173 step
+# 3d, clarification 1). Likewise the first seed is the START HORIZON of this watermark, not evidence that
+# anything before it was ever triaged (clarification 2); the night driver logs the seed it persisted.
 RUN_START=$(date -Is)
 if [ -s "$TSTAMP" ]; then
   SINCE=$(head -n1 "$TSTAMP")
