@@ -89,8 +89,10 @@ export KHMS_CLAUDE_BIN=${KHMS_CLAUDE_BIN:-${NIGHTLY_CLAUDE_BIN:-$(khms_get KHMS_
 #   * the window starts at KHMS_TRIAGE_STAMP, the start of the last run that judged its WHOLE plan;
 #   * absent (a base that has never had this watermark), it starts where the caller says the uncovered time
 #     starts -- TRIAGE_SEED, which the night driver sets to its stamp as it was BEFORE tonight moved it --
-#     else at the beginning (every card). The start is written to the watermark at once, so a run that dies
-#     keeps it for the retry;
+#     else at the beginning (every card). The start is stored at once through khms_triage_seed (khms_paths.sh),
+#     the ONE create-if-absent initialiser the night driver uses too, so a run that dies keeps it for the
+#     retry; when another initialiser stored a start first, this run takes THAT stored value as its window,
+#     never the seed it computed here (review 173 F7b);
 #   * RUN_START is taken before any card is read; only a run whose plan was judged in full (no pair left
 #     without a judgement, the sweep not partial) moves the watermark to it. A failed, partial or empty-handed
 #     run (budget, deadline, judge errors) leaves it where it was: the next run covers the same window again.
@@ -155,11 +157,21 @@ except Exception as e:
   exit 0
 fi
 
-mkdir -p "$(dirname "$LOG")" "$STAGING" "$(dirname "$TSTAMP")"
-if [ ! -s "$TSTAMP" ]; then
-  echo "$SINCE" > "$TSTAMP.tmp" && mv -f "$TSTAMP.tmp" "$TSTAMP"
-  echo "$(date -Is) triage watermark: none yet -- the window starts at $SINCE ($([ -n "${TRIAGE_SEED:-}" ] && echo "the night's stamp before tonight" || echo "every card")), kept in $TSTAMP" >> "$LOG"
+mkdir -p "$(dirname "$LOG")" "$STAGING"
+# The window start this run judges from is the STORED one (khms_triage_seed): the existing watermark, or the
+# seed above if this call created it, or the start another initialiser stored first. No start stored = no run.
+if ! khms_triage_seed "$SINCE" 2>>"$LOG"; then
+  echo "$(date -Is) triage FAILED: no triage window start is stored in $TSTAMP -- nothing judged, nothing written" >> "$LOG"
+  echo "nightly_triage: no triage window start is stored in $TSTAMP (see $LOG)" >&2
+  exit 1
 fi
+if [ "$KHMS_TRIAGE_SEEDED" = 1 ]; then
+  echo "$(date -Is) triage watermark: none yet -- the window starts at $KHMS_TRIAGE_SINCE ($([ -n "${TRIAGE_SEED:-}" ] && echo "the night's stamp before tonight" || echo "every card")), kept in $TSTAMP" >> "$LOG"
+elif [ "$KHMS_TRIAGE_SINCE" != "$SINCE" ]; then
+  echo "$(date -Is) triage watermark: another initialiser stored $KHMS_TRIAGE_SINCE first -- the window starts there, not at $SINCE" >> "$LOG"
+fi
+SINCE=$KHMS_TRIAGE_SINCE
+if [ ${#MODE[@]} -gt 0 ]; then MODE=(--since "$SINCE"); fi
 echo "$(date -Is) triage start (mode=${MODE[*]:-full}, limit=$LIMIT, judge=$KHMS_JUDGE$([ "$KHMS_JUDGE" = local ] || echo ", bound \$$TRIAGE_JUDGE_MAX_USD/night estimated, ledger $JUDGE_LEDGER"))" >> "$LOG"
 
 python3 "$CODE/khms_contradict.py" --provenance --limit 60 > "$PROV_MD" 2>>"$LOG" || true

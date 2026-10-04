@@ -214,25 +214,26 @@ RUN_START_EPOCH=$(date +%s)
 # configured triage but no triage watermark yet has exactly one durable copy of where its uncovered triage time
 # starts: the night's stamp as it stands now. Until this block existed that copy lived only in a shell variable
 # until the child seeded itself, so a night that died (or whose triage failed to start) after its sweep moved
-# the stamp lost the window for good. Written atomically (tmp + rename), only when no watermark exists -- an
-# existing one is never replaced by the newer night stamp; a race with a standalone triage can at worst replace
-# its watermark with this OLDER start, which re-covers time and loses none. A base with neither stamp seeds
-# 1970-01-01 (every card), the child's own default. A seed that cannot be written stops the night HERE, before
-# the night stamp moves: nothing is lost, the next night tries again. Triage OFF seeds nothing: a triage turned
-# on later starts at the night stamp of the night it first runs (its explicit start horizon).
+# the stamp lost the window for good. The write goes through khms_triage_seed (khms_paths.sh), the ONE
+# create-if-absent initialiser the standalone triage uses too (review F7b): the night lock does not exclude a
+# standalone triage, which may store its own -- possibly OLDER -- start at any moment, so an existing watermark is
+# never replaced, not even one stored between this night's look and its write; when another initialiser won, its
+# stored start stands and the night logs it. A base with neither stamp seeds 1970-01-01 (every card), the
+# child's own default. A start that cannot be stored stops the night HERE, before the night stamp moves: nothing
+# is lost, the next night tries again. Triage OFF seeds nothing: a triage turned on later starts at the night
+# stamp of the night it first runs (its explicit start horizon).
 if [ "$DRYRUN" != "1" ] && [ -n "$(khms_get KHMS_NIGHT_TRIAGE)" ]; then
   TSTAMP=$(khms_get KHMS_TRIAGE_STAMP)
-  if [ ! -s "$TSTAMP" ]; then
-    _seed=$(head -n1 "$STAMP" 2>/dev/null || true)
-    _seed=${_seed:-1970-01-01}
-    if mkdir -p "$(dirname "$TSTAMP")" 2>>"$LOG" && printf '%s\n' "$_seed" > "$TSTAMP.tmp.$$" 2>>"$LOG" \
-       && mv -f "$TSTAMP.tmp.$$" "$TSTAMP" 2>>"$LOG"; then
-      echo "$(date -Is) triage watermark: none yet -- the first triage window starts at $_seed (the night's stamp before tonight), kept in $TSTAMP" >> "$LOG"
-    else
-      rm -f "$TSTAMP.tmp.$$" 2>/dev/null
-      echo "$(date -Is) nightly FAILED: the triage watermark could not be written ($TSTAMP) -- nothing run, nothing stamped; the night's stamp $_seed still holds the triage window's start" >> "$LOG"
-      exit 1
-    fi
+  _seed=$(head -n1 "$STAMP" 2>/dev/null || true)
+  _seed=${_seed:-1970-01-01}
+  if ! khms_triage_seed "$_seed" 2>>"$LOG"; then
+    echo "$(date -Is) nightly FAILED: the triage watermark could not be written or holds no start ($TSTAMP) -- nothing run, nothing stamped; the night's stamp $_seed still holds the triage window's start" >> "$LOG"
+    exit 1
+  fi
+  if [ "$KHMS_TRIAGE_SEEDED" = 1 ]; then
+    echo "$(date -Is) triage watermark: none yet -- the first triage window starts at $_seed (the night's stamp before tonight), kept in $TSTAMP" >> "$LOG"
+  elif [ "$KHMS_TRIAGE_SINCE" != "$_seed" ]; then
+    echo "$(date -Is) triage watermark: kept -- the triage window starts at $KHMS_TRIAGE_SINCE ($TSTAMP), not at the night's stamp $_seed" >> "$LOG"
   fi
 fi
 MARK_DEADLINE=$((RUN_START_EPOCH + MARK_BUDGET_MIN * 60))

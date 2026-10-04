@@ -205,6 +205,43 @@ khms_code_lock() {
   }
 }
 
+# khms_triage_seed SEED: THE ONE INITIALISER of the triage watermark (KHMS_TRIAGE_STAMP). The night driver and
+# the standalone triage both call it -- there is no second way to write a first triage window (review 173 F7b).
+# The seed is published by link(2) (`ln -T tmp stamp`), which creates the name only when it does not exist yet,
+# atomically: of two initialisers racing, exactly one creates it and the other fails to. A check followed by a
+# rename (`[ ! -s ]` ... `mv -f`) is NOT this: the rename replaces whatever another writer stored in between,
+# which let a night overwrite a standalone triage's older uncovered window (1970) with its newer stamp (2001).
+# Whoever wins, every caller then READS THE STORED VALUE and uses that as its window start, never the seed it
+# computed before it knew whether it won. Sets KHMS_TRIAGE_SINCE (the stored start) and KHMS_TRIAGE_SEEDED (1 =
+# this call created the watermark, 0 = it existed or another initialiser won). rc 1 with a reason on stderr when
+# no start is stored -- the directory or file cannot be written, or a watermark exists but is EMPTY (no writer
+# stores an empty one, and replacing it would be a check-then-replace again); the caller then stops before
+# anything moves the other copy of the window's start. The watermark's ADVANCE (a run that judged its whole plan
+# moves it to that run's start) is a replacement, not an initialisation, and stays a plain rename in its writer.
+khms_triage_seed() {
+  local seed="${1:-}" ts tmp=""
+  KHMS_TRIAGE_SINCE=""; KHMS_TRIAGE_SEEDED=0
+  [ -n "$seed" ] || { _khms_err "khms_triage_seed needs a SEED"; return 2; }
+  ts="$(khms_get KHMS_TRIAGE_STAMP)" || return 3
+  if [ ! -e "$ts" ] && [ ! -L "$ts" ]; then
+    if mkdir -p -- "$(dirname -- "$ts")" && tmp="$(mktemp -- "$ts.tmp.XXXXXX")"; then
+      printf '%s\n' "$seed" > "$tmp" && ln -T -- "$tmp" "$ts" 2>/dev/null && KHMS_TRIAGE_SEEDED=1
+      rm -f -- "$tmp"
+    fi
+  fi
+  if [ -s "$ts" ]; then
+    KHMS_TRIAGE_SINCE="$(head -n1 -- "$ts")"
+    [ -n "$KHMS_TRIAGE_SINCE" ] && return 0
+  fi
+  KHMS_TRIAGE_SEEDED=0
+  if [ -e "$ts" ]; then
+    echo "khms: the triage watermark $ts exists but holds no start (empty first line) -- refusing to guess one" >&2
+  else
+    echo "khms: the triage watermark $ts could not be written -- no triage window start is stored" >&2
+  fi
+  return 1
+}
+
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
   case "${1:-}" in
     ""|-h|--help) sed -n '2,6p' "${BASH_SOURCE[0]}"; [ -n "${1:-}" ]; exit $? ;;
