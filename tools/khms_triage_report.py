@@ -479,6 +479,10 @@ def main():
                f"${jb.get('max_usd', 0):.2f} (not a guaranteed hard cap)"
                + (f" · **stopped: {jb['stop']}**" if jb.get("stop") else ""))
     L += [jl, ""]
+    # WHICH POPULATION (#208 P208F): the night's mode as the sweep recorded it — "full" every
+    # night since 2026-10-05. A JSON from before that has no field and says so; its `focus: null`
+    # is NOT proof of a full sweep (an empty --since window also wrote null, handoff-PD.md).
+    L += [f"Mode: **{meta.get('mode') or 'not recorded (sweep predates the mode field)'}**", ""]
     if getattr(args, "fallback_from", None):
         L += [f"> ⚠️ **FALLBACK: the judge of record `{args.fallback_from}` judged nothing "
               f"tonight** (see nightly.log and the kept `*.{args.fallback_from}.json`), so "
@@ -501,6 +505,10 @@ def main():
         L += ["## Coverage — what this sweep did NOT look at", "",
               f"- candidate pairs generated: **{sel.get('candidate_pairs','?')}**",
               f"- sent to the model: **{sel.get('adjudicated','?')}**",
+              *([f"- skipped, judged in the last {sk['nights']} nights and unchanged since: "
+                 f"**{sk.get('skipped', 0)}** (already left out of the candidate count above; "
+                 f"{sk['card_changed_since']} pairs judged then are eligible again because "
+                 f"a card changed)"] if (sk := sel.get("skipped_recently_judged")) else []),
               f"- **not adjudicated: {sel.get('not_adjudicated','?')}** — {sel.get('reason','')}",
               "",
               "A pair that was not adjudicated is **not** a pair that was cleared. Counts by "

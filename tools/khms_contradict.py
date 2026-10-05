@@ -690,7 +690,10 @@ def build_candidates(cards, focus_ids=None, dense_k=DENSE_K, verbose=True):
     # 3 shapes, on the blocked pairs only
     out = []
     for (x, y), e in pairs.items():
-        if focus_ids and x not in focus_ids and y not in focus_ids:
+        # `is not None`, not truthiness (#208 PD): an EMPTY focus is an incremental window that
+        # holds no card, so no pair touches it. Read as falsy it silently became a FULL sweep
+        # (2026-10-03, 2026-10-05: 0 cards in the window -> 53k pairs, morning file still `--since`).
+        if focus_ids is not None and x not in focus_ids and y not in focus_ids:
             continue
         a, b = by_id[x], by_id[y]
         shapes = lexical_shapes(a, b, e["keys"], key_class=key_class)
@@ -813,6 +816,67 @@ def select_for_adjudication(pairs, limit):
                        for cls, _ in SHAPE_QUOTA},
     }
     return picked, acc
+
+
+# ------------------------------------------------- do not re-judge last nights' pairs
+# WHY (#208 P208F, 2026-10-05): the owner made every night a FULL sweep. The candidate set and its
+# ranking are a deterministic function of the base, so consecutive full nights pick nearly the
+# same top `--limit` pairs: measured on the staging JSONs, 10-03 ⇄ 10-04 shared 220 of 250 pairs
+# and 10-04 ⇄ 10-05 215 of 250. A re-judged unchanged pair returns the same verdict (13 of 13
+# identical across 10-02/10-03, handoff-PD.md), so the repeat buys nothing and the budget never
+# reaches rank 251+. A pair JUDGED (outcome OK — the one definition, `judged_count`) in one of the
+# last N nights' sweep JSONs is skipped, UNLESS one of its two cards changed after that night's
+# run started (then the old verdict is about other text and the pair is eligible again). Pairs
+# that were planned and never judged (DEADLINE, BUDGET, LLM-ERROR …) are NOT skipped. Today's own
+# files are ignored, so a same-day rerun or the qwen fallback plans the same pairs again.
+_SWEEP_FILE = re.compile(r"^triage-(\d{4}-\d{2}-\d{2})-sweep(?:\.[\w-]+)?\.json$")
+
+
+def recently_judged(staging, nights, today, mtime_of):
+    """{(a, b) sorted: judged-at epoch} for pairs judged OK in the sweep JSONs of the `nights`
+    nights before `today` (ISO date) in `staging`; `mtime_of(card_id)` -> epoch or None.
+    Returns (skip, accounting)."""
+    import datetime
+    t = datetime.date.fromisoformat(today)
+    lo = (t - datetime.timedelta(days=nights)).isoformat()
+    files, judged, unreadable = [], {}, []
+    for name in sorted(os.listdir(staging)) if os.path.isdir(staging) else []:
+        m = _SWEEP_FILE.match(name)
+        if not m or not (lo <= m.group(1) < today):
+            continue
+        path = os.path.join(staging, name)
+        try:
+            d = json.load(open(path, encoding="utf-8"))
+        except Exception as e:                              # noqa: BLE001
+            unreadable.append(f"{name}: {type(e).__name__}")
+            continue
+        rows = d["results"] if isinstance(d, dict) else d
+        prog = (d.get("meta") or {}).get("progress") or {} if isinstance(d, dict) else {}
+        try:
+            when = datetime.datetime.fromisoformat(prog["started"]).timestamp()
+        except Exception:                                   # noqa: BLE001  (older JSONs)
+            when = os.path.getmtime(path) - (RUN_DEADLINE_S + 600)
+        files.append(name)
+        for r in rows:
+            if ((r.get("verdict") or {}).get("outcome") or OUTCOME_OK) != OUTCOME_OK:
+                continue
+            k = tuple(sorted((r["a"], r["b"])))
+            judged[k] = max(judged.get(k, 0), when)
+    skip, changed = set(), 0
+    for k, when in judged.items():
+        mt = [mtime_of(x) for x in k]
+        if any(m is None or m >= when for m in mt):
+            changed += 1                                    # a card changed (or is gone)
+            continue
+        skip.add(k)
+    return skip, {"nights": nights, "files": files, "unreadable": unreadable,
+                  "judged_in_window": len(judged), "card_changed_since": changed}
+
+
+def skip_recently_judged(pairs, skip):
+    """(kept, n_skipped), order preserved."""
+    kept = [p for p in pairs if tuple(sorted((p["a"], p["b"]))) not in skip]
+    return kept, len(pairs) - len(kept)
 
 
 def gate_before_model(pairs, by_id, rules=None):
@@ -1800,6 +1864,15 @@ def main():
     ap.add_argument("--spend-ledger", default=os.environ.get("KHMS_JUDGE_LEDGER"),
                     help="JSONL of every paid attempt of the night; earlier runs of the same "
                          "night count against --max-usd")
+    ap.add_argument("--skip-judged-dir", metavar="STAGING",
+                    help="skip pairs judged (outcome OK) in the triage-<date>-sweep*.json files "
+                         "of the last --skip-nights nights in this directory, unless a card of "
+                         "the pair changed since that run started (#208: full nights must not "
+                         "re-judge the same top pairs)")
+    ap.add_argument("--skip-nights", type=int, default=0,
+                    help="how many nights before --today the skip looks back (0 = off)")
+    ap.add_argument("--today", help="ISO date of this night (default: today); files of this "
+                                    "date are never read by the skip")
     ap.add_argument("--provenance", action="store_true",
                     help="report cards asserting machine-checkable numbers on doc evidence")
     args = ap.parse_args()
@@ -1828,14 +1901,23 @@ def main():
                   f"{','.join(r['families'])}) — {r['first']}\n  source: {r['source']}")
         return
 
+    # WHICH POPULATION this run judges, stated in the JSON (#208 P208F): the morning file printed
+    # nothing and the log said `--since` on the nights the run silently swept the whole base.
     focus = None
+    mode = "full"
     if args.cards:
         focus = {x.strip() for x in args.cards.split(",") if x.strip()}
+        mode = f"cards ({len(focus)} named)"
     elif args.since:
         import datetime
         cut = datetime.datetime.fromisoformat(args.since).timestamp()
         focus = {c["id"] for c in cards if os.path.getmtime(c["path"]) >= cut}
         print(f"incremental: {len(focus)} cards touched since {args.since}", file=sys.stderr)
+        mode = f"since {args.since} ({len(focus)} cards touched)"
+        if not focus:
+            print("incremental: the window holds no card -> no pair to judge (an empty "
+                  "window is NOT widened to a full sweep; a full sweep is a run without --since)",
+                  file=sys.stderr)
 
     pairs = build_candidates(cards, focus_ids=focus)
     # Deterministic findings read the WHOLE candidate set, gate or no gate: a correction
@@ -1845,14 +1927,31 @@ def main():
     print(f"  triage gate before the model: refused {gate_acc['refused']} of "
           f"{gate_acc['of']} candidate pairs (rules {gate_acc['rules_in_force']}; "
           f"by rule {gate_acc['by_rule']})", file=sys.stderr)
+    print(f"mode: {mode}", file=sys.stderr)
+    skip_acc = None
+    if args.skip_judged_dir and args.skip_nights > 0:
+        import datetime
+        mtimes = {c["id"]: os.path.getmtime(c["path"]) for c in cards}
+        skip, skip_acc = recently_judged(args.skip_judged_dir, args.skip_nights,
+                                         args.today or datetime.date.today().isoformat(),
+                                         mtimes.get)
+        pairs, skip_acc["skipped"] = skip_recently_judged(pairs, skip)
+        print(f"  judged in the last {args.skip_nights} nights and unchanged since: skipped "
+              f"{skip_acc['skipped']} candidate pairs ({skip_acc['judged_in_window']} judged in "
+              f"{len(skip_acc['files'])} sweep files, {skip_acc['card_changed_since']} eligible "
+              f"again because a card changed"
+              + (f"; UNREADABLE {skip_acc['unreadable']}" if skip_acc["unreadable"] else "")
+              + ")", file=sys.stderr)
     if args.pairs_only:
         todo, acc = select_for_adjudication(pairs, args.limit)
         acc["gated_before_model"] = gate_acc
+        acc["skipped_recently_judged"] = skip_acc
         print(f"  would adjudicate {len(todo)}; {acc['not_adjudicated']} not adjudicated; "
               f"{det['total_groups']} deterministic strong correction-orphan groups",
               file=sys.stderr)
         if args.json:
-            json.dump({"meta": {"cards": len(cards), "limit": args.limit,
+            json.dump({"meta": {"cards": len(cards), "limit": args.limit, "mode": mode,
+                                "focus": sorted(focus) if focus is not None else None,
                                 "selection": acc, "deterministic": det},
                        "results": []},
                       open(args.json, "w", encoding="utf-8"), indent=1, default=str)
@@ -1862,6 +1961,7 @@ def main():
 
     todo, acc = select_for_adjudication(pairs, args.limit)
     acc["gated_before_model"] = gate_acc
+    acc["skipped_recently_judged"] = skip_acc
     print(f"adjudicating {len(todo)} of {len(pairs)} pairs "
           f"(quota {acc['quota_used']}); {acc['not_adjudicated']} not adjudicated",
           file=sys.stderr)
@@ -1869,8 +1969,8 @@ def main():
     # from the first write. A consumer that only sees the surviving verdicts cannot tell a
     # clean base from an exhausted budget, and that is precisely how a confirmed finding
     # disappeared between the detector and the proposal.
-    meta = {"cards": len(cards), "limit": args.limit,
-            "focus": sorted(focus) if focus else None,
+    meta = {"cards": len(cards), "limit": args.limit, "mode": mode,
+            "focus": sorted(focus) if focus is not None else None,
             "selection": acc, "deterministic": det,
             "bounds": {"llm_timeout_s": LLM_TIMEOUT, "llm_attempts": LLM_ATTEMPTS,
                        "run_deadline_s": args.deadline, "llm_url": LLM_URL,

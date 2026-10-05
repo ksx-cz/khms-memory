@@ -86,7 +86,6 @@ DEFAULTS = [
     ("KHMS_WEEKLY_LOCK", "${KHMS_SHARED_STATE}/weekly.lock"),     # one weekly at a time
     ("KHMS_NIGHT_STAMP", "${KHMS_SHARED_STATE}/last-nightly"),    # start of the last stamped night window
     ("KHMS_WEEK_STAMP", "${KHMS_SHARED_STATE}/last-weekly"),      # completion of the last weekly
-    ("KHMS_TRIAGE_STAMP", "${KHMS_SHARED_STATE}/last-triage"),    # start of the last triage window whose SELECTED plan was judged in full
     ("KHMS_SWEEP_FAILED", "${KHMS_SHARED_STATE}/sweep-failed"),   # one line per failed sweep, cleared on success
     ("KHMS_NIGHT_LOG", "${KHMS_STATE}/nightly.log"),              # night AND week log
     ("KHMS_AGENT", "claude"),                                     # headless agent CLI (argv[0])

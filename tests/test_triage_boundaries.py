@@ -5,18 +5,12 @@
     it may still write a detached report outside the base (positive controls);
   * the standalone triage holds the clone's code-use lock: an updater holding it exclusively stops it (rc 5)
     before any work, and a writer without an updater runs normally;
-  * the triage has its own progress watermark: a full night hands it the window it has not covered yet (not the
-    sweep's freshly advanced stamp), a failed triage keeps that window for the retry, a successful one advances
-    only its own watermark, and a quiet night (no new distillation input) still runs a configured triage;
+  * (#208) every night the triage sweeps the WHOLE base (no `--since` window, no watermark) with the skip of
+    pairs judged in the last nights; a failed triage leaves nothing to carry -- its unjudged pairs are offered
+    again by the next night -- and a quiet night (no new distillation input) still runs a configured triage;
   * (F5a) apply_triage checks the real path of every file of its plan -- each card, archive target, review
     marker, report -- before its first write: a detached base whose card files are symlinks into the protected
     base is refused (rc 4) with nothing changed, the earlier cards of the plan included;
-  * (F7a) the first triage window is persisted by the night driver, under its lock, before anything can move
-    the night's stamp: a triage that fails before it could seed itself keeps the window, an existing watermark
-    is never replaced, and a seed that cannot be written stops the night with its stamp unmoved.
-  * (F7b) both writers of a first triage window (the night, the standalone triage) use ONE create-if-absent
-    initialiser (khms_triage_seed): a start another writer stored between a writer's look and its write is
-    never replaced, and the loser judges from the stored winner, not from the seed it computed.
 
 Isolated: a temporary base, a copy of the tools with fake judge/report children. No model, no network, no
 scheduler.
@@ -148,6 +142,8 @@ def stage_code(tmp):
     shutil.copytree(TOOLS, code, ignore=shutil.ignore_patterns("__pycache__"))
     fake = ('import os, sys\nif "--since" in sys.argv:\n'
             ' open(os.environ["CAPTURE_SINCE"], "a").write(sys.argv[sys.argv.index("--since")+1] + "\\n")\n'
+            'if "--json" in sys.argv and os.environ.get("CAPTURE_ARGS"):\n'
+            ' open(os.environ["CAPTURE_ARGS"], "a").write(" ".join(sys.argv[1:]) + "\\n")\n'
             + stage.FAKE_SWEEP)
     (code / "khms_contradict.py").write_text(fake)
     (code / "khms_triage_report.py").write_text(stage.FAKE_REPORT)
@@ -213,15 +209,10 @@ def test_a_running_standalone_triage_blocks_an_update(tmp_path):
     assert probe.read_text() == "updater-refused"
 
 
-# --- F7: the triage's own coverage window in the whole night ---------------------------------------
+# --- F7 (#208, 2026-10-05): every night is a FULL sweep -- no window, no watermark -------------------
 def night_env(tmp_path, root, fake, code, **extra):
     env = night.env_for(tmp_path, root, fake, KHMS_NIGHT_TRIAGE="bash " + str(code / "nightly_triage.sh"))
-    bindir = tmp_path / "bin"
-    bindir.mkdir(exist_ok=True)
-    date = bindir / "date"                      # a weekday, so the incremental (--since) mode is used
-    date.write_text('#!/bin/bash\nif [ "${1:-}" = +%u ]; then echo 1; else exec /usr/bin/date "$@"; fi\n')
-    date.chmod(0o755)
-    env.update(CAPTURE_SINCE=str(tmp_path / "since"), FAKE_MODE="ok", PATH=str(bindir) + ":" + env["PATH"])
+    env.update(CAPTURE_SINCE=str(tmp_path / "since"), CAPTURE_ARGS=str(tmp_path / "args"), FAKE_MODE="ok")
     env.update({k: str(v) for k, v in extra.items()})
     return env
 
@@ -231,59 +222,38 @@ def sinces(tmp_path):
     return p.read_text().split() if p.exists() else []
 
 
-def test_full_night_passes_previous_window_to_triage(tmp_path):
+def sweep_args(tmp_path):
+    p = tmp_path / "args"
+    return p.read_text().splitlines() if p.exists() else []
+
+
+def test_a_night_runs_the_full_sweep_with_the_judged_skip(tmp_path):
+    """No `--since` on any weekday: the sweep gets the whole base and the skip of pairs judged in the last
+    nights (the staging dir, 28 nights, tonight's date); nothing is stored as a triage window."""
     root, fake = night.make_base(tmp_path, n_marks=1)
-    os.utime(root / "memory/know" / f"{night.CARD}.md", (1577836800, 1577836800))
-    stamp = root / "state/shared/last-nightly"
-    old = "2001-01-01T00:00:00+00:00"
-    stamp.write_text(old + "\n")
+    (root / "state/shared/last-nightly").write_text("2001-01-01T00:00:00+00:00\n")
     code = stage_code(tmp_path)
     r = run(["bash", str(TOOLS / "nightly_distill.sh")], night_env(tmp_path, root, fake, code))
     assert r.returncode == 0, r.stderr + night.log_of(root)
-    assert sinces(tmp_path) == [old], ("triage skipped the previous window", old, sinces(tmp_path),
-                                       night.log_of(root))
-    # the night's own checkpoint moved; the triage's watermark moved only by its own success
-    assert stamp.read_text().strip() != old
-    assert (root / "state/shared/last-triage").read_text().strip() not in ("", old)
+    assert sinces(tmp_path) == [], sinces(tmp_path)
+    args = sweep_args(tmp_path)
+    assert args and all("--skip-judged-dir" in a and "--skip-nights 28" in a and "--today" in a
+                        for a in args), args
+    assert "triage start (mode=full, skip judged last 28 nights" in night.log_of(root)
+    assert not (root / "state/shared/last-triage").exists()
 
 
-def test_a_failed_triage_keeps_its_window_and_the_retry_covers_it(tmp_path):
+def test_a_failed_triage_is_retried_by_the_next_full_night(tmp_path):
+    """A failed triage leaves no state to carry: its unjudged pairs are not in any skip, so the next night's full
+    sweep offers them again (the retry the removed watermark used to provide)."""
     root, fake = night.make_base(tmp_path, n_marks=1)
-    stamp = root / "state/shared/last-nightly"
-    old = "2001-01-01T00:00:00+00:00"
-    stamp.write_text(old + "\n")
     code = stage_code(tmp_path)
-    tstamp = root / "state/shared/last-triage"
-    # night 1: the judge crashes and there is no local fallback -> the stage FAILS, the night goes on
     r = run(["bash", str(TOOLS / "nightly_distill.sh")], night_env(tmp_path, root, fake, code, FAKE_MODE="crash"))
     assert "triage stage FAILED" in night.log_of(root), night.log_of(root)
-    assert sinces(tmp_path) == [old]
-    assert stamp.read_text().strip() != old                 # the sweep's checkpoint advanced as before
-    assert tstamp.read_text().strip() == old                 # the triage window is kept, not dropped
-    # night 2 (the retry): nothing new to distil, the triage still runs and gets the SAME window
     (root / "journal/2099-01-01.md").unlink()
     r = run(["bash", str(TOOLS / "nightly_distill.sh")], night_env(tmp_path, root, fake, code))
     assert r.returncode == 0, r.stderr + night.log_of(root)
-    assert sinces(tmp_path) == [old, old], sinces(tmp_path)
-    first_ok = tstamp.read_text().strip()
-    assert first_ok != old
-    # night 3: the window now starts where the successful retry started
-    r = run(["bash", str(TOOLS / "nightly_distill.sh")], night_env(tmp_path, root, fake, code))
-    assert r.returncode == 0, r.stderr
-    assert sinces(tmp_path) == [old, old, first_ok], sinces(tmp_path)
-
-
-def test_a_triage_that_judged_nothing_does_not_advance_its_window(tmp_path):
-    root, env = base(tmp_path)
-    code = stage_code(tmp_path)
-    env = stage_env(tmp_path, env)
-    env.update(KHMS_READ_ONLY="0", FAKE_MODE="errors")                  # every pair LLM-ERROR, rc 0
-    tstamp = root / "state/shared/last-triage"
-    tstamp.write_text("2001-01-01T00:00:00+00:00\n")
-    r = run(["bash", str(code / "nightly_triage.sh")], env)
-    assert r.returncode == 0, r.stderr
-    assert (root / "memory/inbox/2099-01-01-triage.md").exists()        # the honest morning file is written
-    assert tstamp.read_text().strip() == "2001-01-01T00:00:00+00:00"    # ... but the window is not covered
+    assert len(sweep_args(tmp_path)) >= 2 and sinces(tmp_path) == [], sweep_args(tmp_path)
 
 
 def test_quiet_full_night_still_runs_configured_triage(tmp_path):
@@ -365,197 +335,3 @@ def test_apply_checks_the_review_marker_file(tmp_path):
     r = run([sys.executable, str(TOOLS / "apply_triage.py"), str(triage), "--apply", "--brain", str(other)], env)
     assert r.returncode == 4, (r.returncode, r.stdout, r.stderr)
     assert [f.read_bytes() for f in files] == before and not protected_marker.exists()
-
-
-# --- F7a: the first triage window is persisted before the night moves its own stamp ---------------
-OLD = "2001-01-01T00:00:00+00:00"
-
-
-@pytest.mark.parametrize("seeded", [False, True])
-def test_failure_before_first_stage_preserves_window(tmp_path, seeded):
-    """Diblin F7a: the stage entry fails before nightly_triage.sh could seed itself (a start failure, rc 17);
-    the night moves its own stamp; the next night must still hand the triage the ORIGINAL window. `seeded` is
-    the positive control: a triage watermark that already existed."""
-    root, fake = night.make_base(tmp_path, n_marks=1)
-    stamp = root / "state/shared/last-nightly"
-    stamp.write_text(OLD + "\n")
-    if seeded:
-        (root / "state/shared/last-triage").write_text(OLD + "\n")
-    code = stage_code(tmp_path)
-    fail = tmp_path / "triage-entry.sh"
-    fail.write_text("#!/bin/bash\nexit 17\n")
-    env = night_env(tmp_path, root, fake, code, KHMS_NIGHT_TRIAGE="bash " + str(fail))
-    first = run(["bash", str(TOOLS / "nightly_distill.sh")], env)
-    assert first.returncode == 0 and "triage stage FAILED" in night.log_of(root), first.stderr
-    assert stamp.read_text().strip() != OLD
-    (root / "journal/2099-01-01.md").unlink()
-    second = run(["bash", str(TOOLS / "nightly_distill.sh")], night_env(tmp_path, root, fake, code))
-    assert second.returncode == 0, second.stderr
-    assert sinces(tmp_path) == [OLD], (OLD, sinces(tmp_path), night.log_of(root))
-
-
-def test_the_night_never_overwrites_an_existing_triage_watermark(tmp_path):
-    """The seed is written only where no triage watermark exists: an older watermark (an uncovered triage
-    window that started before the night's stamp) is kept, never replaced by the newer night stamp."""
-    root, fake = night.make_base(tmp_path, n_marks=1)
-    (root / "state/shared/last-nightly").write_text(OLD + "\n")
-    older = "1999-01-01T00:00:00+00:00"
-    (root / "state/shared/last-triage").write_text(older + "\n")
-    code = stage_code(tmp_path)
-    fail = tmp_path / "triage-entry.sh"
-    fail.write_text("#!/bin/bash\nexit 17\n")
-    run(["bash", str(TOOLS / "nightly_distill.sh")],
-        night_env(tmp_path, root, fake, code, KHMS_NIGHT_TRIAGE="bash " + str(fail)))
-    assert (root / "state/shared/last-triage").read_text().strip() == older
-    (root / "journal/2099-01-01.md").unlink()
-    r = run(["bash", str(TOOLS / "nightly_distill.sh")], night_env(tmp_path, root, fake, code))
-    assert r.returncode == 0, r.stderr
-    assert sinces(tmp_path) == [older], sinces(tmp_path)
-
-
-def test_a_seed_that_cannot_be_persisted_stops_the_night_before_its_stamp_moves(tmp_path):
-    """When the first triage window cannot be written, the night stops before anything moves the only other copy
-    of its start (the night stamp): rc != 0, a FAILED line, the night stamp untouched. The retry with a writable
-    watermark then hands the triage the original window (positive control)."""
-    if os.geteuid() == 0:
-        pytest.skip("a read-only directory does not stop root")
-    root, fake = night.make_base(tmp_path, n_marks=1)
-    stamp = root / "state/shared/last-nightly"
-    stamp.write_text(OLD + "\n")
-    code = stage_code(tmp_path)
-    ro = tmp_path / "ro"
-    ro.mkdir()
-    ro.chmod(0o555)
-    try:
-        r = run(["bash", str(TOOLS / "nightly_distill.sh")],
-                night_env(tmp_path, root, fake, code, KHMS_TRIAGE_STAMP=ro / "sub/last-triage"))
-    finally:
-        ro.chmod(0o755)
-    assert r.returncode != 0, night.log_of(root)
-    assert "triage watermark could not be written" in night.log_of(root), night.log_of(root)
-    assert stamp.read_text().strip() == OLD
-    assert sinces(tmp_path) == []
-    r = run(["bash", str(TOOLS / "nightly_distill.sh")], night_env(tmp_path, root, fake, code))
-    assert r.returncode == 0, r.stderr + night.log_of(root)
-    assert sinces(tmp_path) == [OLD], sinces(tmp_path)
-
-
-# --- F7b: ONE create-if-absent initialiser of the triage watermark, shared by both writers ----------
-# The interleaver: a PATH wrapper around `mv` and `ln` that, at the moment a writer publishes a temporary
-# `last-triage.tmp*` file into the watermark, first runs ANOTHER initialiser (REVIEW_GAP) and only then the real
-# command with the original arguments. Whatever primitive the tree uses to publish the seed, the other writer
-# gets in between the decision to seed and the publication (review 173 step 3e, F7b, Diblin's reproducer).
-GAP_WRAPPER = r'''
-import os, pathlib, subprocess, sys
-name = pathlib.Path(sys.argv[0]).name
-args = sys.argv[1:]
-dest = os.environ['REVIEW_TSTAMP']
-if (os.environ.get('REVIEW_INTERLEAVE') == '1' and len(args) >= 2 and args[-1] == dest
-        and pathlib.Path(args[-2]).name.startswith('last-triage.tmp')):
-    gap = os.environ['REVIEW_GAP']
-    if gap == 'stage':          # the real standalone triage, no TRIAGE_SEED (it seeds 1970), its judge crashes
-        env = dict(os.environ, REVIEW_INTERLEAVE='0', FAKE_MODE='crash', KHMS_JUDGE='sonnet', KHMS_LLM_URL='')
-        env.pop('TRIAGE_SEED', None)
-        run = subprocess.run(['bash', os.environ['REVIEW_STAGE']], env=env, capture_output=True, text=True,
-                             timeout=20)
-        pathlib.Path(os.environ['REVIEW_PROOF']).write_text(
-            str(run.returncode) + '\n' + pathlib.Path(dest).read_text() + run.stderr)
-    else:                       # any other initialiser that stored GAP as the window start first
-        pathlib.Path(dest).write_text(gap + '\n')
-real = os.environ['REVIEW_REAL_' + name.upper()]
-os.execv(real, [real] + args)
-'''
-
-
-def gap_env(tmp_path, env, tstamp, gap, interleave=True, **extra):
-    bindir = tmp_path / "racebin"
-    bindir.mkdir(exist_ok=True)
-    for name in ("mv", "ln"):
-        w = bindir / name
-        w.write_text("#!" + sys.executable + "\n" + GAP_WRAPPER)
-        w.chmod(0o755)
-    env = dict(env)
-    env.update(REVIEW_REAL_MV=shutil.which("mv", path=env["PATH"]), REVIEW_REAL_LN=shutil.which("ln", path=env["PATH"]),
-               PATH=str(bindir) + ":" + env["PATH"], REVIEW_TSTAMP=str(tstamp), REVIEW_GAP=gap,
-               REVIEW_INTERLEAVE="1" if interleave else "0", REVIEW_PROOF=str(tmp_path / "proof"))
-    env.update({k: str(v) for k, v in extra.items()})
-    return env
-
-
-@pytest.mark.parametrize("interleave", [False, True])
-def test_first_seed_does_not_replace_older_standalone_window(tmp_path, interleave):
-    """Diblin F7b (his reproducer, as a repo test): the night decided to seed 2001 (its stamp) and is about to
-    publish it; in that gap the real standalone triage seeds 1970 (no TRIAGE_SEED), fails (rc 1) and keeps its
-    window. The night must not overwrite it: the retry gets 1970. `interleave=False` is the positive control: the
-    1970 watermark exists before the night starts."""
-    root, fake = night.make_base(tmp_path, n_marks=1)
-    stamp = root / "state/shared/last-nightly"
-    stamp.write_text(OLD + "\n")
-    tstamp = root / "state/shared/last-triage"
-    if not interleave:
-        tstamp.write_text("1970-01-01\n")
-    code = stage_code(tmp_path)
-    fail = tmp_path / "fail-entry.sh"
-    fail.write_text("#!/bin/bash\nexit 17\n")
-    env = gap_env(tmp_path, night_env(tmp_path, root, fake, code, KHMS_NIGHT_TRIAGE="bash " + str(fail)),
-                  tstamp, "stage", interleave, REVIEW_STAGE=code / "nightly_triage.sh")
-    first = run(["bash", str(TOOLS / "nightly_distill.sh")], env)
-    assert first.returncode == 0 and "triage stage FAILED" in night.log_of(root), first.stderr
-    if interleave:
-        assert (tmp_path / "proof").read_text().startswith("1\n1970-01-01\n"), (tmp_path / "proof").read_text()
-    assert tstamp.read_text() == "1970-01-01\n", tstamp.read_text()
-    # Retry without the interleaver, with the real standalone driver and fake model tools.
-    (root / "journal/2099-01-01.md").unlink()
-    second = run(["bash", str(TOOLS / "nightly_distill.sh")], night_env(tmp_path, root, fake, code))
-    assert second.returncode == 0, second.stderr
-    assert sinces(tmp_path)[-1] == "1970-01-01", (sinces(tmp_path), night.log_of(root))
-
-
-def test_a_standalone_that_loses_the_first_seed_uses_the_stored_winner(tmp_path):
-    """The other direction: the standalone triage decided to seed 1970; in the gap before its publication another
-    initialiser stored 1999. The standalone must not overwrite it and must judge from the stored winner -- never
-    continue with the seed it computed before it lost."""
-    root, env = base(tmp_path)
-    code = stage_code(tmp_path)
-    env = stage_env(tmp_path, env)
-    tstamp = root / "state/shared/last-triage"
-    winner = "1999-01-01T00:00:00+00:00"
-    env = gap_env(tmp_path, env, tstamp, winner, KHMS_READ_ONLY="0", FAKE_MODE="crash", KHMS_JUDGE="sonnet",
-                  KHMS_LLM_URL="", TRIAGE_FULL="0")
-    bindir = tmp_path / "bin"
-    bindir.mkdir(exist_ok=True)
-    (bindir / "date").write_text('#!/bin/bash\nif [ "${1:-}" = +%u ]; then echo 1; else exec /usr/bin/date "$@"; fi\n')
-    (bindir / "date").chmod(0o755)
-    env["PATH"] = str(bindir) + ":" + env["PATH"]
-    r = run(["bash", str(code / "nightly_triage.sh")], env)
-    assert r.returncode == 1, (r.returncode, r.stderr)                 # the fake judge crashed: window kept
-    assert tstamp.read_text() == winner + "\n", tstamp.read_text()
-    assert sinces(tmp_path) == [winner], sinces(tmp_path)
-
-
-def seed_call(tmp_path, root, seed, **extra):
-    env = {k: v for k, v in os.environ.items() if not k.startswith(("KHMS_", "NIGHTLY_", "TRIAGE_"))}
-    env.update(KHMS_ROOT=str(root), KHMS_STATE=str(tmp_path / "agent"), KHMS_READ_ONLY="0")
-    env.update({k: str(v) for k, v in extra.items()})
-    script = ('. "$1/khms_paths.sh"; khms_load || exit 3; khms_triage_seed "$2"; rc=$?; '
-              'printf "rc=%s seeded=%s since=%s\\n" "$rc" "$KHMS_TRIAGE_SEEDED" "$KHMS_TRIAGE_SINCE"')
-    return run(["bash", "-c", script, "seed", str(TOOLS), seed], env)
-
-
-def test_the_seed_primitive_creates_once_and_reports_the_stored_value(tmp_path):
-    """khms_triage_seed: absent -> creates it and says so; present -> keeps it and returns ITS value; an existing
-    EMPTY watermark is not a start anyone stored -- it is refused (rc 1) and left as it is, since replacing it can
-    race exactly like F7b; no temporary file is left behind in any case."""
-    root, _ = base(tmp_path)
-    tstamp = root / "state/shared/last-triage"
-    r = seed_call(tmp_path, root, "2001-01-01")
-    assert r.stdout.strip() == "rc=0 seeded=1 since=2001-01-01", r.stdout + r.stderr
-    r = seed_call(tmp_path, root, "1970-01-01")
-    assert r.stdout.strip() == "rc=0 seeded=0 since=2001-01-01", r.stdout + r.stderr
-    assert tstamp.read_text() == "2001-01-01\n"
-    tstamp.write_text("")
-    r = seed_call(tmp_path, root, "1970-01-01")
-    assert r.stdout.strip().startswith("rc=1 seeded=0 since="), r.stdout + r.stderr
-    assert "empty" in r.stderr, r.stderr
-    assert tstamp.read_text() == ""
-    assert sorted(p.name for p in tstamp.parent.iterdir()) == ["last-triage"], list(tstamp.parent.iterdir())

@@ -19,7 +19,7 @@ _KHMS_KEYS=(KHMS_ROOT KHMS_CONFIG_FILE KHMS_CONFIG_DIR KHMS_STATE KHMS_SHARED_ST
   KHMS_RECALL_INTENT KHMS_HOOK_STATE
   KHMS_HOOKS_OFF_FILE KHMS_LEN_CACHE KHMS_EXPERIMENT KHMS_GLOSSARY KHMS_DIRECTIVE KHMS_EMBED_DIR
   KHMS_EMBED_PY KHMS_DENSE_SOCKET KHMS_HF_HOME KHMS_SNAPSHOT_ROOT KHMS_TRANSCRIPTS KHMS_MESSAGES KHMS_PATTERNS
-  KHMS_NIGHTLY_LOCK KHMS_WEEKLY_LOCK KHMS_NIGHT_STAMP KHMS_WEEK_STAMP KHMS_TRIAGE_STAMP KHMS_SWEEP_FAILED KHMS_NIGHT_LOG
+  KHMS_NIGHTLY_LOCK KHMS_WEEKLY_LOCK KHMS_NIGHT_STAMP KHMS_WEEK_STAMP KHMS_SWEEP_FAILED KHMS_NIGHT_LOG
   KHMS_AGENT KHMS_AGENT_TRANSCRIPTS KHMS_SWEEP_MODEL KHMS_MARK_MODEL KHMS_CONS_MODEL
   KHMS_WEEK_PART_MODEL KHMS_WEEK_MODEL KHMS_PROJECT_SLUG KHMS_GIT_REPOS KHMS_CHAT_FETCH KHMS_CHAT_VERIFY
   KHMS_NIGHT_TRIAGE KHMS_SPEC KHMS_PRINCIPAL KHMS_PROMPT_EXT KHMS_ACCOUNT_DIR
@@ -40,7 +40,6 @@ declare -gA _KHMS_DEFAULT=(
   [KHMS_MESSAGES]='${KHMS_CONFIG_DIR}/messages.env' [KHMS_PATTERNS]='${KHMS_CONFIG_DIR}/patterns.env'
   [KHMS_NIGHTLY_LOCK]='${KHMS_SHARED_STATE}/nightly.lock' [KHMS_WEEKLY_LOCK]='${KHMS_SHARED_STATE}/weekly.lock'
   [KHMS_NIGHT_STAMP]='${KHMS_SHARED_STATE}/last-nightly' [KHMS_WEEK_STAMP]='${KHMS_SHARED_STATE}/last-weekly'
-  [KHMS_TRIAGE_STAMP]='${KHMS_SHARED_STATE}/last-triage'
   [KHMS_SWEEP_FAILED]='${KHMS_SHARED_STATE}/sweep-failed' [KHMS_NIGHT_LOG]='${KHMS_STATE}/nightly.log'
   [KHMS_AGENT]="claude"
   [KHMS_AGENT_TRANSCRIPTS]='${HOME}/.claude/projects' [KHMS_SWEEP_MODEL]="sonnet" [KHMS_MARK_MODEL]="sonnet"
@@ -203,43 +202,6 @@ khms_code_lock() {
     exec {KHMS_CODE_LOCK_FD}>&-
     return 5
   }
-}
-
-# khms_triage_seed SEED: THE ONE INITIALISER of the triage watermark (KHMS_TRIAGE_STAMP). The night driver and
-# the standalone triage both call it -- there is no second way to write a first triage window (review 173 F7b).
-# The seed is published by link(2) (`ln -T tmp stamp`), which creates the name only when it does not exist yet,
-# atomically: of two initialisers racing, exactly one creates it and the other fails to. A check followed by a
-# rename (`[ ! -s ]` ... `mv -f`) is NOT this: the rename replaces whatever another writer stored in between,
-# which let a night overwrite a standalone triage's older uncovered window (1970) with its newer stamp (2001).
-# Whoever wins, every caller then READS THE STORED VALUE and uses that as its window start, never the seed it
-# computed before it knew whether it won. Sets KHMS_TRIAGE_SINCE (the stored start) and KHMS_TRIAGE_SEEDED (1 =
-# this call created the watermark, 0 = it existed or another initialiser won). rc 1 with a reason on stderr when
-# no start is stored -- the directory or file cannot be written, or a watermark exists but is EMPTY (no writer
-# stores an empty one, and replacing it would be a check-then-replace again); the caller then stops before
-# anything moves the other copy of the window's start. The watermark's ADVANCE (a run that judged its whole plan
-# moves it to that run's start) is a replacement, not an initialisation, and stays a plain rename in its writer.
-khms_triage_seed() {
-  local seed="${1:-}" ts tmp=""
-  KHMS_TRIAGE_SINCE=""; KHMS_TRIAGE_SEEDED=0
-  [ -n "$seed" ] || { _khms_err "khms_triage_seed needs a SEED"; return 2; }
-  ts="$(khms_get KHMS_TRIAGE_STAMP)" || return 3
-  if [ ! -e "$ts" ] && [ ! -L "$ts" ]; then
-    if mkdir -p -- "$(dirname -- "$ts")" && tmp="$(mktemp -- "$ts.tmp.XXXXXX")"; then
-      printf '%s\n' "$seed" > "$tmp" && ln -T -- "$tmp" "$ts" 2>/dev/null && KHMS_TRIAGE_SEEDED=1
-      rm -f -- "$tmp"
-    fi
-  fi
-  if [ -s "$ts" ]; then
-    KHMS_TRIAGE_SINCE="$(head -n1 -- "$ts")"
-    [ -n "$KHMS_TRIAGE_SINCE" ] && return 0
-  fi
-  KHMS_TRIAGE_SEEDED=0
-  if [ -e "$ts" ]; then
-    echo "khms: the triage watermark $ts exists but holds no start (empty first line) -- refusing to guess one" >&2
-  else
-    echo "khms: the triage watermark $ts could not be written -- no triage window start is stored" >&2
-  fi
-  return 1
 }
 
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
