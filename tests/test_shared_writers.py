@@ -277,3 +277,34 @@ runpy.run_path(sys.argv[0],run_name='__main__')
     assert p.returncode!=0 and 'simulated report failure' in p.stderr
     marker=root/'state/shared/reviewed/.reviewed-2026-01-01-triage'
     assert not marker.exists()
+
+
+def test_erratum_waits_for_card_lock_then_applies_without_snapshot(tmp_path):
+    root,env,unit=base(tmp_path)
+    approved=approve(env,unit)
+    assert approved.returncode==0,approved.stdout+approved.stderr
+    card=next((root/'memory/know').glob('*.md'))
+    runtime=Path(env['KHMS_RUNTIME'])
+    cmd=[sys.executable,str(TOOLS/'khms_erratum.py'),'declare','--card',card.stem,
+         '--was','The relay opens when its supply is removed.',
+         '--evidence','Bench measurement: removing the supply kept the relay closed.',
+         '--by','coordinator']
+    with (runtime/'cards.lock').open('a') as lock:
+        fcntl.flock(lock,fcntl.LOCK_EX)
+        proc=subprocess.Popen(cmd,env=env,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+        try:
+            time.sleep(.2)
+            assert proc.poll() is None
+        finally:
+            fcntl.flock(lock,fcntl.LOCK_UN)
+            out,err=proc.communicate(timeout=20)
+    assert proc.returncode==0,out+err
+    tomb=next((root/'memory/tombstones/bodies').glob('TS-*.md')).stem
+    p=subprocess.run([sys.executable,str(TOOLS/'khms_erratum.py'),'apply','--card',card.stem,
+                      '--ts',tomb,'--now','The relay stays closed when its supply is removed.'],
+                     env=env,text=True,capture_output=True)
+    assert p.returncode==0,p.stdout+p.stderr
+    assert 'The relay stays closed' in card.read_text()
+    assert 'ERRATUM' in card.read_text()
+    assert not list(root.rglob('*snapshot*'))
+    assert not (root/'state/shared/views-dirty').exists()
