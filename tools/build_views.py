@@ -8,7 +8,7 @@ computes belief and condense_score, regenerates views/ and MEMORY.md.
 Exit 1 on schema violations (bad YAML, derived without derived_from, id mismatch)
 and on a half-closed `supersedes` edge (target still served as current, issue #209).
 """
-import glob
+import khms_files as glob
 import os
 import re
 import sys
@@ -20,6 +20,7 @@ import yaml
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import khms_lint  # noqa: E402  (errata rules R1/R2 — see khms_lint.py, 2026-09-20)
 
+import khms_lock as KL
 import khms_paths as P  # noqa: E402
 
 BRAIN = P.ROOT
@@ -108,6 +109,55 @@ def type_problem(meta):
     return None
 
 
+REQUIRED_KEYS = ("type", "level", "status", "tags", "scope", "date")
+
+
+def card_problems(meta, legacy=None):
+    """-> (problems, grandfathered): every per-card schema violation of one card.
+
+    THE ONE SOURCE of the per-card gate (package PAPPR, #209).  build_views.load_cards
+    refuses a know/ card on it, convert_inbox2.selfcheck runs it over the converter's
+    output, and approve_inbox.main runs it over the batch BEFORE an id is allocated.
+    Until 2026-10-09 approve ran none of it, so two cards edited after conversion
+    (K-95373 without `date`, K-95402 goal→method at observation level) were written
+    and the base stayed unbuildable until a hand repair (plans/handoff-LFIX9.md §2).
+
+    `meta` is a card's front matter; links are read from `meta["links"]` only (a
+    top-level link key is a producer's slip that approve_inbox nests before writing).
+    `legacy` is the {id: 'type/level'} map of load_legacy_types(): pass it for cards
+    that already live in know/; a NEW card (a temp label) gets none — the type gate is
+    hard on everything approved from now on.  `grandfathered` is True when the card's
+    only type problem is excused by that map.  Problem texts carry no card id; the
+    caller prefixes its own label.
+    """
+    problems = [f"missing '{k}'" for k in REQUIRED_KEYS if k not in meta]
+    if problems:
+        return problems, False
+    if meta["level"] not in LEVELS:
+        problems.append(f"bad level {meta['level']}")
+    if meta["status"] not in STATUSES:
+        problems.append(f"bad status {meta['status']}")
+    grandfathered = False
+    bad_type = type_problem(meta)
+    if bad_type:
+        if (legacy or {}).get(meta.get("id")) == f"{meta.get('type')}/{meta.get('level')}":
+            grandfathered = True
+        else:
+            problems.append(
+                f"{bad_type}. A new card must carry one of the nine. "
+                f"A genuinely NEW type is a decision card + a row in spec §4.2 "
+                f"+ a member of OBS_TYPES/DER_TYPES here — never a new row in "
+                f"{os.path.relpath(LEGACY_TYPES_FILE, BRAIN)}, which is frozen "
+                f"history and may only shrink")
+    links = meta.get("links") or {}
+    if not isinstance(links, dict):
+        links = {}
+    if meta["level"] == "derived" and not links.get("derived_from"):
+        problems.append("derived card with empty derived_from")
+    if meta["level"] == "observation" and "evidence" not in meta:
+        problems.append("observation without evidence")
+    return problems, grandfathered
+
 def load_cards():
     cards = {}
     legacy = load_legacy_types()
@@ -126,33 +176,17 @@ def load_cards():
         cid = meta.get("id")
         if cid != os.path.basename(path)[:-3]:
             fail(f"{path}: id '{cid}' != filename")
-        for req in ("type", "level", "status", "tags", "scope", "date"):
-            if req not in meta:
-                fail(f"{cid}: missing '{req}'")
-        if meta["level"] not in LEVELS:
-            fail(f"{cid}: bad level {meta['level']}")
-        if meta["status"] not in STATUSES:
-            fail(f"{cid}: bad status {meta['status']}")
-        bad_type = type_problem(meta)
-        if bad_type:
-            if legacy.get(cid) == f"{meta.get('type')}/{meta.get('level')}":
-                grandfathered.add(cid)
-            else:
-                fail(f"{cid}: {bad_type}. A new card must carry one of the nine. "
-                     f"A genuinely NEW type is a decision card + a row in spec §4.2 "
-                     f"+ a member of OBS_TYPES/DER_TYPES here — never a new row in "
-                     f"{LEGACY_TYPES_FILE}, which is frozen "
-                     f"history and may only shrink")
+        problems, excused = card_problems(meta, legacy)
+        if problems:
+            fail(f"{cid}: {problems[0]}")
+        if excused:
+            grandfathered.add(cid)
         links = meta.get("links") or {}
         for k in ("derived_from", "supports", "contradicts", "refuted_by"):
             links.setdefault(k, [])
             if links[k] is None:
                 links[k] = []
         links.setdefault("supersedes", None)
-        if meta["level"] == "derived" and not links["derived_from"]:
-            fail(f"{cid}: derived card with empty derived_from")
-        if meta["level"] == "observation" and "evidence" not in meta:
-            fail(f"{cid}: observation without evidence")
         meta["links"] = links
         meta["body"] = body
         lines = body.splitlines()
@@ -168,7 +202,7 @@ def load_cards():
     # shrinkable.
     if grandfathered:
         print(f"type gate: {len(grandfathered)} card(s) predate the gate and are "
-              f"grandfathered by {LEGACY_TYPES_FILE}")
+              f"grandfathered by {os.path.relpath(LEGACY_TYPES_FILE, BRAIN)}")
     stale = sorted(set(legacy) - grandfathered)
     if stale:
         print(f"type gate: {len(stale)} exception row(s) no longer needed, delete "
@@ -176,8 +210,7 @@ def load_cards():
     # Errata (2026-09-20, package KBFIX): a claim retracted into the tombstone ledger may not
     # stand unmarked in ANY card (R1), and a card's `errata:` head, its ERRATUM blocks and the
     # ledger must agree (R2). Loud on purpose: between `khms_erratum.py declare` and `apply`
-    # this build FAILS, which is the check being a check (a check that passes either way is
-    # no check) — and a nightly card that
+    # this build FAILS, which is the check being a check (K-90585) — and a nightly card that
     # re-derives a retracted sentence from the journal fails here too, not in a review's eye.
     retracted = khms_lint.load_retracted(BRAIN)
     ledger_ids = {t["ts"] for t in retracted}
@@ -370,8 +403,6 @@ def write_views(cards, reg, alias):
             tagmap.setdefault(t2, []).append(c)
 
     # topic views
-    for old in glob.glob(os.path.join(VIEWS, "topics", "*.md")):
-        os.remove(old)
     for tag, group in sorted(tagmap.items()):
         L = ["# topic: " + tag, ""]
         pats = sorted((c for c in group if c["level"] == "derived" and c["status"] == "active"),
@@ -386,25 +417,28 @@ def write_views(cards, reg, alias):
                             ("⛔ Refuted & dead ends", refu)):
             if items:
                 L += [f"## {name}", *[card_line(c) for c in items], ""]
-        open(os.path.join(VIEWS, "topics", f"{tag}.md"), "w", encoding="utf-8").write("\n".join(L))
+        KL.atomic_text(os.path.join(VIEWS, "topics", f"{tag}.md"), "\n".join(L))
 
     # by-type
-    for old in glob.glob(os.path.join(VIEWS, "by-type", "*.md")):
-        os.remove(old)
     bytype = {}
     for c in cards.values():
         bytype.setdefault(c["type"], []).append(c)
     for t, items in bytype.items():
         fn = re.sub(r"[^a-z0-9]+", "-", t.lower())
         body = "\n".join(card_line(c) for c in sorted(items, key=lambda c: c["id"]))
-        open(os.path.join(VIEWS, "by-type", f"{fn}.md"), "w", encoding="utf-8").write(
-            f"# type: {t}\n\n{body}\n")
+        KL.atomic_text(os.path.join(VIEWS, "by-type", f"{fn}.md"), f"# type: {t}\n\n{body}\n")
+
+    # Remove obsolete names only after every current file was atomically published.
+    for directory, names in (("topics", {f"{t}.md" for t in tagmap}),
+                              ("by-type", {re.sub(r"[^a-z0-9]+", "-", t.lower()) + '.md' for t in bytype})):
+        for old in glob.glob(os.path.join(VIEWS, directory, '*.md')):
+            if os.path.basename(old) not in names:
+                os.unlink(old)
 
     # recent
     cutoff = (datetime.date.today() - datetime.timedelta(days=RECENT_DAYS)).isoformat()
     rec = [c for c in cards.values() if str(c["date"]) >= cutoff]
-    open(os.path.join(VIEWS, "recent.md"), "w", encoding="utf-8").write(
-        "# recent (last %d days)\n\n%s\n" % (
+    KL.atomic_text(os.path.join(VIEWS, "recent.md"), "# recent (last %d days)\n\n%s\n" % (
             RECENT_DAYS, "\n".join(card_line(c) for c in sorted(rec, key=lambda c: str(c["date"]), reverse=True))))
 
     # tags registry rewrite (keep desc/aliases, refresh counts, list unregistered)
@@ -416,15 +450,12 @@ def write_views(cards, reg, alias):
         r = reg[tag]
         n = len(tagmap.get(tag, []))
         L.append(f"| {tag} | {r['group']} | {r['desc']} | {', '.join(r['aliases']) or '—'} | {n} |")
-    open(os.path.join(VIEWS, "tags.md"), "w", encoding="utf-8").write("\n".join(L) + "\n")
+    KL.atomic_text(os.path.join(VIEWS, "tags.md"), "\n".join(L) + "\n")
 
     # condense candidates (weekly review input)
     cand = sorted((c for c in cards.values() if c["condense"] > 0), key=lambda c: -c["condense"])
-    open(os.path.join(VIEWS, "condense-candidates.md"), "w", encoding="utf-8").write(
-        "# condense candidates (ranked)\n\n" +
-        "\n".join(f"- {c['id']} score {c['condense']:.1f} — {c['title']}" for c in cand[:50]) + "\n")
-
-    # reverse correction index: "who corrects ME". The hook builds the same map
+    KL.atomic_text(os.path.join(VIEWS, "condense-candidates.md"), "# condense candidates (ranked)\n\n" +
+        "\n".join(f"- {c['id']} score {c['condense']:.1f} — {c['title']}" for c in cand[:50]) + "\n")    # reverse correction index: "who corrects ME". The hook builds the same map
     # in memory from the cards it has already loaded (ks.reverse_correctors), so
     # this file is not what it reads — it is the human-readable half, and the
     # place a review can see at a glance which corrections are wired up. Written
@@ -446,7 +477,7 @@ def write_views(cards, reg, alias):
         L.append(f"- **{tgt}** {name}")
         for cor in sorted({c["id"]: c for c in rev[tgt]}.values(), key=lambda c: c["id"]):
             L.append(f"    ⚠ corrected by {cor['id']} [{cor['status']}] — {cor['title'][:80]}")
-    open(os.path.join(VIEWS, "correctors.md"), "w", encoding="utf-8").write("\n".join(L) + "\n")
+    KL.atomic_text(os.path.join(VIEWS, "correctors.md"), "\n".join(L) + "\n")
 
     # errata index: cards whose text was corrected in place (khms_erratum.py). The retracted
     # wording is inside each card's ERRATUM block and in memory/tombstones/; this is the
@@ -456,15 +487,14 @@ def write_views(cards, reg, alias):
         L.append(f"- **{c['id']}** [{c['status']}] {c['title'][:80]}")
         for e in c["errata"]:
             L.append(f"    ✎ {e.get('ts')} {e.get('date')} by {e.get('by')}")
-    open(os.path.join(VIEWS, "errata.md"), "w", encoding="utf-8").write("\n".join(L) + "\n")
+    KL.atomic_text(os.path.join(VIEWS, "errata.md"), "\n".join(L) + "\n")
 
     # scope tree usage (open ontology — this documents the branches actually in use)
     scopes = {}
     for c in cards.values():
         scopes.setdefault(str(c["scope"]), 0)
         scopes[str(c["scope"])] += 1
-    open(os.path.join(VIEWS, "scopes.md"), "w", encoding="utf-8").write(
-        "# scope tree (branches in use)\n\n" +
+    KL.atomic_text(os.path.join(VIEWS, "scopes.md"), "# scope tree (branches in use)\n\n" +
         "\n".join(f"- {s} ({n} cards)" for s, n in sorted(scopes.items())) + "\n")
     return tagmap, unregistered
 
@@ -495,16 +525,16 @@ def write_memory_md(cards, reg, tagmap):
     text = "\n".join(L) + "\n"
     target = os.path.join(MEM, "MEMORY.md")
     try:
-        open(target, "w", encoding="utf-8").write(text)
+        KL.atomic_text(target, text)
     except PermissionError:
         # NC sync can restore stale read-only perms — reclaim and retry
         try:
             os.chmod(target, 0o644)
-            open(target, "w", encoding="utf-8").write(text)
+            KL.atomic_text(target, text)
             print("note: MEMORY.md was read-only (sync artifact) — perms fixed, written")
         except OSError:
             preview = os.path.join(VIEWS, "MEMORY-preview.md")
-            open(preview, "w", encoding="utf-8").write(text)
+            KL.atomic_text(preview, text)
             print(f"note: MEMORY.md not writable — wrote {preview}")
     return len(text.splitlines())
 
@@ -579,7 +609,7 @@ def refresh_dense_index():
               file=sys.stderr)
 
 
-def main():
+def _build_locked():
     P.require_writable("rebuild the views and MEMORY.md")
     cards = load_cards()
     reg, alias = load_registry()
@@ -592,6 +622,16 @@ def main():
     if n_lines > 80:
         print("WARNING: MEMORY.md exceeds 80 lines", file=sys.stderr)
     refresh_dense_index()
+
+
+def main():
+    P.require_writable('build views')
+    with KL.lock('cards'), KL.lock('views'):
+        _build_locked()
+        try:
+            os.unlink(os.path.join(P.SHARED_STATE, 'views-dirty'))
+        except FileNotFoundError:
+            pass
 
 
 if __name__ == "__main__":

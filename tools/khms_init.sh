@@ -78,9 +78,9 @@ created=()
 COUNTER="$SHARED/next_id"
 if [ ! -e "$COUNTER" ]; then
   hi=0
-  for f in "$ROOT"/memory/know/K-*.md "$ROOT"/memory/archive/know/K-*.md; do
-    [ -e "$f" ] || continue
-    n="${f##*/K-}"; n="${n%.md}"; n=$((10#$n))
+  canonical="$(python3 "$CODE/khms_files.py" "$ROOT/memory/know" "$ROOT/memory/archive/know")" || exit 3
+  for f in $canonical; do
+    n="${f#K-}"; n="${n%.md}"; n=$((10#$n))
     [ "$n" -gt "$hi" ] && hi="$n"
   done
   echo "$((hi + 1))" > "$COUNTER"

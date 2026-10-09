@@ -130,7 +130,8 @@ class GateWritesWhatApproveRefusesToRead(unittest.TestCase):
         os.makedirs(os.path.join(root, "state", "shared"), exist_ok=True)
         open(os.path.join(root, "state", "shared", "next_id"), "w").write("90500\n")
         open(os.path.join(know, "K-90001.md"), "w").write(
-            "---\nid: K-90001\nstatus: active\n---\nbody\n")
+            "---\nid: K-90001\nstatus: active\ntype: fact\nlevel: observation\nscope: universal\n"
+            "tags: [testing]\nevidence: measured\nsource: fixture\ndate: 2026-01-01\n---\nbody\n")
         inbox = os.path.join(root, "inbox.md")
         open(inbox, "w", encoding="utf-8").write(
             "## Cards\n\n"
@@ -239,7 +240,7 @@ class SupersedeMarking(unittest.TestCase):
     def target(self, cid, status="active"):
         open(os.path.join(self.know, cid + ".md"), "w", encoding="utf-8").write(
             "---\nid: %s\ntype: fact\nlevel: observation\nstatus: %s\n"
-            "tags: [testing]\nlinks:\n  derived_from: []\n  supports: []\n"
+            "scope: universal\nevidence: measured\nsource: fixture\ndate: 2026-01-01\ntags: [testing]\nlinks:\n  derived_from: []\n  supports: []\n"
             "  contradicts: []\n  supersedes: null\n  refuted_by: []\n---\n"
             "the mast is four metres tall.\n" % (cid, status))
 
@@ -279,7 +280,9 @@ class SupersedeMarking(unittest.TestCase):
 
     def test_a_missing_target_is_reported_not_crashed(self):
         r = self.approve("**LINKS:** supersedes=[K-90404]")
-        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        # Automatic view validation exposes the unresolved target, never a false fresh view.
+        self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertTrue(os.path.exists(os.path.join(self.root, 'state/shared/views-dirty')))
         self.assertIn("no such card", r.stdout)
 
     def test_supports_changes_no_status(self):

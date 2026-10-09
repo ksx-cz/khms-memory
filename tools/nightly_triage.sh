@@ -99,7 +99,7 @@ if [ "$DRYRUN" = "1" ]; then
   echo "  brain          : $BRAIN"
   echo "  date           : $DATE"
   echo "  mode           : full (all cards, every night); skip pairs judged in the last $SKIP_NIGHTS nights and unchanged since ($STAGING)"
-  echo "  cards in know/ : $(ls "$BRAIN"/memory/know/K-*.md | wc -l)"
+  echo "  cards in know/ : $(python3 "$KHMS_CODE/khms_files.py" "$BRAIN/memory/know" | wc -l)"
   echo "  embed index    : $(ls -la "$BRAIN"/memory/.embed/bge.npz 2>/dev/null | awk '{print $5" B, "$6" "$7" "$8}')"
   echo "  adjudicate top : $LIMIT pairs"
   echo "  judge          : $KHMS_JUDGE$([ "$KHMS_JUDGE" = local ] || echo " (claude -p --model $KHMS_JUDGE via $KHMS_CLAUDE_BIN)") — judge of record"

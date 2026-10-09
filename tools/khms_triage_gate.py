@@ -11,9 +11,9 @@ decision, a policy); a winner whose own status is in doubt; a "winner" written l
 loser it is said to beat; two cards that share no tag. Cards K-92816, K-92932, K-93087 and
 K-93118 each asked for one of these filters as a recommendation; none was in the code.
 
-WHAT THE MEASUREMENT SAYS (tools/eval_triage_selector.py, card state read from the
-pre-nightly brain snapshot of each night, so a status or edge written BY that morning's
-review is never used to judge that night's row): every rule here costs some human-APPLIED
+WHAT THE HISTORICAL MEASUREMENT SAYS (the deployment evaluator must prove
+pre-review card state from retained server versions; unavailable history is
+UNVERIFIABLE, never reconstructed from the current cards): every rule here costs some human-APPLIED
 rows, and each rule's cost is printed per rule by the evaluator. A rule is ENABLED below only
 if the union of the enabled rules keeps >= 95 % of the APPLY rows over the whole labelled set.
 The other rules are kept, measured and OFF — switching one on is a one-line decision with its

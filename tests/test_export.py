@@ -73,3 +73,15 @@ def test_refuses_while_an_update_holds_the_code_lock(tmp_path, base):
                        timeout=120)
     assert p.returncode == 5 and "being updated" in p.stderr, (p.returncode, p.stderr)
     assert not out.exists()
+
+
+def test_conflict_copy_is_not_exported_or_left_from_previous_export(tmp_path, base):
+    out=tmp_path/'out'
+    name=cid(11)+' (conflicted copy 2026).md'
+    (base/'memory/know'/name).write_text('foreign conflict')
+    assert run(tmp_path,base,str(out)).returncode==0
+    assert not (out/'know'/name).exists()
+    (out/'know'/name).write_text('left by old exporter')
+    assert run(tmp_path,base,str(out)).returncode==0
+    assert not (out/'know'/name).exists()
+    assert (out/'know'/(cid(11)+'.md')).exists()

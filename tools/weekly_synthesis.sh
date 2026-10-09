@@ -19,6 +19,7 @@ CODE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 # shellcheck source=khms_paths.sh
 . "$CODE/khms_paths.sh"
 khms_load || exit 3
+python3 "$CODE/khms_health.py" || exit 3
 khms_require_writable "run the weekly synthesis" || exit $?
 ROOT=$(khms_get KHMS_ROOT)
 khms_code_lock || exit $?
@@ -84,8 +85,12 @@ echo "$(date -Is) weekly start" >> "$LOG"
 render_prompt() {
   python3 "$CODE/khms_prompt.py" "$1" 2>>"$LOG" || weekly_fail "prompt $1 could not be rendered (khms_prompt.py)"
 }
+RUN_PROVEN_WHY=""
 weekly_fail() {   # weekly_fail <why> — the run fails visibly and leaves no output that could pass for a week
-  echo "$(date -Is) weekly FAILED: $1 — no $DATE-weekly.md, not stamped; the next weekly reads this window again" >> "$LOG"
+  local line
+  line="$(date -Is) weekly FAILED: $1 — no $DATE-weekly.md, not stamped; the next weekly reads this window again"
+  echo "$line" >> "$LOG"
+  echo "$line" >&2
   if [ -f "$OUT" ]; then mv -f "$OUT" "$STAGING/weekly-$DATE-FAILED-$(date +%H%M%S).md"; fi
   exit 1
 }
@@ -105,8 +110,9 @@ printf 'weekly %s pid=%s\n' "$(date -Is)" "$$" > "$NLOCK"     # the holder line 
 
 # 0-token headers digest: one line per card
 HDR=$STAGING/weekly-$DATE-headers.txt
-WEEKLY_KNOW="$ROOT/memory/know" python3 - > "$HDR" <<'EOF'
-import os, re, glob, yaml
+PYTHONPATH="$KHMS_CODE${PYTHONPATH:+:$PYTHONPATH}" WEEKLY_KNOW="$ROOT/memory/know" python3 - > "$HDR" <<'EOF'
+import os, re, yaml
+import khms_files as glob
 for p in sorted(glob.glob(os.path.join(os.environ["WEEKLY_KNOW"], "K-*.md"))):
     text = open(p, encoding="utf-8").read()
     m = re.match(r"^---\n(.*?)\n---\n(.*)$", text, re.S)
@@ -177,7 +183,8 @@ STAGE_MARK=$STAGING/.weekly-stage-start
 # must exist and be non-empty. Tried WEEKLY_PART_ATTEMPTS times; returns 1 when no attempt passed.
 run_proven() {
   local label="$1" tmo="$2" req="$3" out="$4" prompt="$5" model="$6"
-  local attempt=1 sid rc tr cov
+  local attempt=1 sid rc tr cov said
+  local call_out=$STAGING/.weekly-call-output
   while [ "$attempt" -le "$WEEKLY_PART_ATTEMPTS" ]; do
     sid=$(python3 -c 'import uuid; print(uuid.uuid4())')
     rm -f "$out"
@@ -186,22 +193,33 @@ run_proven() {
     # `Edit` is in the list for the same reason as in nightly_distill.sh: a headless run cannot be
     # granted permission interactively, so without Edit in this list the stage's only writable path
     # is whole-file Write — which is what made the nightly sweep re-emit its entire output eight times.
-    timeout --signal=TERM --kill-after=60s "$tmo" "$AGENT_BIN" -p "$prompt" \
-      --session-id "$sid" --model "$model" --allowedTools Read Write Edit Glob Grep >> "$LOG" 2>&1 || rc=$?
+    # --setting-sources "" (PDRAIN, #209): a stage must not load the coordinator's ~/.claude/CLAUDE.md
+    # and hooks (the nightly MARK stage answered as the coordinator and delegated instead of writing);
+    # effort high is what the user settings supplied until then.
+    timeout --signal=TERM --kill-after=60s "$tmo" /usr/bin/env "$AGENT_BIN" -p "$prompt" \
+      --session-id "$sid" --setting-sources "" --effort high --model "$model" \
+      --strict-mcp-config --tools Read Write Edit Glob Grep \
+      --allowedTools Read Write Edit Glob Grep > "$call_out" 2>&1 || rc=$?
+    cat "$call_out" >> "$LOG"
+    said=$(grep -v '^[[:space:]]*$' "$call_out" | tail -1 | cut -c1-200 || true)
     tr=$(find "$TRANSCRIPT_ROOT" -name "$sid.jsonl" -type f 2>/dev/null | head -1)
     # Report, not gate: `|| true` so this cannot kill the script under `set -e`.
     [ -n "$tr" ] && python3 "$CODE/maxtok_check.py" --stage "$label" "$tr" >> "$LOG" 2>&1 || true
     if [ "$rc" -ne 0 ]; then
-      echo "$(date -Is) $label attempt $attempt/$WEEKLY_PART_ATTEMPTS FAILED (rc=$rc$([ "$rc" -eq 124 ] && echo ' = TIMEOUT'))" >> "$LOG"
+      RUN_PROVEN_WHY="$label attempt $attempt/$WEEKLY_PART_ATTEMPTS: model call FAILED (rc=$rc$([ "$rc" -eq 124 ] && echo ' = TIMEOUT'))${said:+: $said}"
+      echo "$(date -Is) $RUN_PROVEN_WHY" >> "$LOG"
     elif [ -z "$tr" ]; then
-      echo "$(date -Is) $label attempt $attempt/$WEEKLY_PART_ATTEMPTS: no transcript $sid.jsonl under $TRANSCRIPT_ROOT — reading cannot be proven" >> "$LOG"
+      RUN_PROVEN_WHY="$label attempt $attempt/$WEEKLY_PART_ATTEMPTS: no transcript $sid.jsonl under $TRANSCRIPT_ROOT — reading cannot be proven"
+      echo "$(date -Is) $RUN_PROVEN_WHY" >> "$LOG"
     else
       cov=0
       python3 "$CODE/read_coverage.py" --transcript "$tr" --label "$label" --list "$req" >> "$LOG" 2>&1 || cov=$?
       if [ "$cov" -ne 0 ]; then
-        echo "$(date -Is) $label attempt $attempt/$WEEKLY_PART_ATTEMPTS: did not read all of its input (READ-COVERAGE above)" >> "$LOG"
+        RUN_PROVEN_WHY="$label attempt $attempt/$WEEKLY_PART_ATTEMPTS: did not read all of its input (READ-COVERAGE above)"
+        echo "$(date -Is) $RUN_PROVEN_WHY" >> "$LOG"
       elif [ ! -s "$out" ]; then
-        echo "$(date -Is) $label attempt $attempt/$WEEKLY_PART_ATTEMPTS: wrote no output ($out)" >> "$LOG"
+        RUN_PROVEN_WHY="$label attempt $attempt/$WEEKLY_PART_ATTEMPTS: wrote no output ($out)"
+        echo "$(date -Is) $RUN_PROVEN_WHY" >> "$LOG"
       else
         return 0
       fi
@@ -234,7 +252,7 @@ $(sed 's|^|  * |' "$_gf")
 OUTPUT FILE: $_pout"
     echo "$(date -Is) weekly part $_k/$_K: $(grep -c . "$_gf") chunk(s) -> $_pout" >> "$LOG"
     run_proven "weekly-part-$_k" "$WEEKLY_PART_TIMEOUT" "$_gf" "$_pout" "$_prompt" "$WEEKLY_PART_MODEL" \
-      || weekly_fail "part $_k/$_K did not prove it read its chunks ($_gf)"
+      || weekly_fail "part $_k/$_K failed every attempt ($_gf) — last: $RUN_PROVEN_WHY"
     PART_FILES+=("$_pout")
   done
 else
@@ -268,7 +286,7 @@ INPUTS:
 OUTPUT FILE: $OUT"
 echo "$(date -Is) weekly merge: $(grep -c . "$HDR_INDEX") header chunk(s) + ${#PART_FILES[@]} part file(s) -> $OUT" >> "$LOG"
 run_proven "weekly-merge" "$WEEKLY_MERGE_TIMEOUT" "$MERGE_REQ" "$OUT" "$MERGE_PROMPT" "$WEEKLY_MODEL" \
-  || weekly_fail "the merge did not prove it read the header chunks and every part's findings"
+  || weekly_fail "the merge failed every attempt — last: $RUN_PROVEN_WHY"
 
 # Grounding check: src=K-xxxxx quotes are resolved to the cards themselves, so a
 # misattributed claim is caught by a tool rather than at review by eye.

@@ -4,8 +4,8 @@
 Every case runs tools/khms_hook.py as a subprocess against a temporary base made by khms_init.sh, with
 the shipped English wording and matchers (the conftest strips every KHMS_* variable). Covered here:
 
-  * PROPOSAL GATE on a report: a recommendation needs a recall on its own subject in the same turn,
-    evidenced by the session transcript (a successful recall.sh call), not by the hook's own injection.
+  * PROPOSAL GATE: searches relevant cards, shows new results once per author context.
+    An unrelated transcript recall is not a substitute; no-hit is explicitly logged.
   * DISPATCH GATE on the Agent tool: the same rule for a brief; an unreadable brief fails OPEN, and the
     fail-open is logged and shown at the next SessionStart (a broken gate must not look like an idle one).
   * STOP GATE: the principal's last report-channel message is owed an answer; a terminal prompt, a
@@ -103,6 +103,16 @@ PROPOSAL = (HONEST + "\n\nThe harness picks up noise from the motor leads.\n"
 
 
 class ProposalGate(HookCase):
+    def setUp(self):
+        super().setUp()
+        path = os.path.join(self.root, 'memory', 'know', 'K-%05d.md' % 90001)
+        with open(path, 'w') as f:
+            f.write('---\nid: K-%05d\ntype: fact\nlevel: observation\nstatus: active\n'
+                    'tags: [testing]\nscope: universal\ndate: 2026-01-01\n---\n'
+                    '# Sensor harness and gyroscope calibration\n'
+                    'Shielded twisted pair sensor harness reduces motor leads noise. '
+                    'Rewrite gyroscope calibration routine only after measuring.\n' % 90001)
+
     def test_a_recommendation_without_a_recall_on_it_is_denied(self):
         self.prompt()
         deny, why = self.denied(self.fire(self.report(PROPOSAL)))
@@ -111,12 +121,12 @@ class ProposalGate(HookCase):
         self.assertIn("shielded", why)          # the refusal names the query to run
         self.assertIn("| DENY |", self.read_log("proposal_gate.log"))
 
-    def test_a_recall_on_the_proposal_itself_allows_it(self):
+    def test_a_proposal_citing_the_recalled_card_is_known(self):
         self.prompt()
         self.recall_in_transcript("shielded twisted pair sensor harness")
-        deny, why = self.denied(self.fire(self.report(PROPOSAL)))
+        deny, why = self.denied(self.fire(self.report(PROPOSAL + "\nRead " + ("K-%05d" % 90001))))
         self.assertFalse(deny, why)
-        self.assertIn("| ALLOW |", self.read_log("proposal_gate.log"))
+        self.assertIn("| ALLOW-KNOWN |", self.read_log("proposal_gate.log"))
 
     def test_a_failed_recall_does_not_count(self):
         self.prompt()
@@ -135,6 +145,28 @@ class ProposalGate(HookCase):
         deny, _ = self.denied(self.fire(self.report(HONEST + "\n\nThe harness was checked; it is fine.\n")))
         self.assertFalse(deny)
 
+    def test_same_proposal_is_once_per_author_and_resets_on_session_start(self):
+        self.prompt()
+        payload = self.report(PROPOSAL)
+        self.assertTrue(self.denied(self.fire(payload))[0])
+        self.assertFalse(self.denied(self.fire(payload))[0])
+        payload['agent_id'] = 'other-author'
+        self.assertTrue(self.denied(self.fire(payload))[0])
+        self.fire({'hook_event_name': 'SessionStart', 'session_id': 's1'})
+        self.assertTrue(self.denied(self.fire(payload))[0])
+
+    def test_terminology_gate_requires_edit_not_a_repeated_send(self):
+        glossary = os.path.join(self.root, 'terms.txt')
+        with open(glossary, 'w') as f:
+            f.write('smoky ride => smoke test run\n')
+        for _ in range(2):
+            deny, why = self.denied(self.fire(self.report(HONEST + '\nA smoky ride.'),
+                                            KHMS_TERM_GLOSSARY=glossary))
+            self.assertTrue(deny)
+            self.assertIn('smoke test run', why)
+        self.assertFalse(self.denied(self.fire(self.report(HONEST + '\nA smoke test run.'),
+                                              KHMS_TERM_GLOSSARY=glossary))[0])
+
     def test_the_gate_can_be_switched_off(self):
         with open(os.path.join(self.root, "config", "khms_experiment.json"), "w") as f:
             json.dump({"proposal_gate": False}, f)
@@ -145,6 +177,16 @@ class ProposalGate(HookCase):
 
 # --- the dispatch gate ---------------------------------------------------------------------------------
 class DispatchGate(HookCase):
+    def setUp(self):
+        super().setUp()
+        path = os.path.join(self.root, 'memory', 'know', 'K-%05d.md' % 90001)
+        with open(path, 'w') as f:
+            f.write('---\nid: K-%05d\ntype: fact\nlevel: observation\nstatus: active\n'
+                    'tags: [testing]\nscope: universal\ndate: 2026-01-01\n---\n'
+                    '# Sensor harness and gyroscope calibration\n'
+                    'Shielded twisted pair sensor harness reduces motor leads noise. '
+                    'Rewrite gyroscope calibration routine only after measuring.\n' % 90001)
+
     def dispatch(self, prompt, session="s1"):
         return {"hook_event_name": "PreToolUse", "tool_name": "Agent", "session_id": session,
                 "cwd": self.root, "transcript_path": self.transcript,
@@ -159,13 +201,13 @@ class DispatchGate(HookCase):
         self.assertTrue(deny)
         self.assertIn(brief, why)
 
-    def test_a_bound_recall_allows_the_dispatch(self):
+    def test_a_brief_citing_the_recalled_card_is_known(self):
         brief = os.path.join(self.root, "brief.md")
         with open(brief, "w") as f:
             f.write("# Brief\nI propose that the agent rewrites the calibration routine of the gyroscope.\n")
         self.prompt()
         self.recall_in_transcript("gyroscope calibration routine rewrite")
-        deny, why = self.denied(self.fire(self.dispatch("Your brief is %s - do exactly that." % brief)))
+        deny, why = self.denied(self.fire(self.dispatch("Read K-90001. Your brief is %s - do exactly that." % brief)))
         self.assertFalse(deny, why)
 
     def test_an_unreadable_brief_fails_open_and_is_shown_at_the_next_session_start(self):
@@ -177,10 +219,10 @@ class DispatchGate(HookCase):
         ctx = self.context({"hook_event_name": "SessionStart", "session_id": "s2"})
         self.assertIn("ERROR->ALLOW", ctx)
 
-    def test_no_turn_in_the_session_is_exempt(self):
+    def test_no_turn_still_shows_new_relevant_cards(self):
         deny, _ = self.denied(self.fire(self.dispatch("I propose rewriting the gyroscope calibration.")))
-        self.assertFalse(deny)
-        self.assertIn("| EXEMPT |", self.read_log("proposal_gate.log"))
+        self.assertTrue(deny)
+        self.assertIn("| DENY |", self.read_log("proposal_gate.log"))
 
 
 # --- the Stop gate ---------------------------------------------------------------------------------------
@@ -285,10 +327,10 @@ class SwitchesAndContext(HookCase):
             f.write("1: FLOCK  ADVISORY  WRITE 999 %02x:%02x:%d 0 EOF\n"
                     % (os.major(st.st_dev), os.minor(st.st_dev), st.st_ino))
         ctx = self.context({"hook_event_name": "SessionStart", "session_id": "s1"},
-                           KHMS_PROC_LOCKS=table)
+                           KHMS_PROC_LOCKS=table, KHMS_NIGHTLY_LOCK=lock)
         self.assertIn("NIGHT PIPELINE IS RUNNING", ctx)
         quiet = self.context({"hook_event_name": "SessionStart", "session_id": "s2"},
-                             KHMS_PROC_LOCKS=os.path.join(self.root, "empty-locks"))
+                             KHMS_PROC_LOCKS=os.path.join(self.root, "empty-locks"), KHMS_NIGHTLY_LOCK=lock)
         self.assertNotIn("NIGHT PIPELINE IS RUNNING", quiet)
 
     def test_an_unreadable_lock_table_is_said_not_guessed(self):
@@ -297,7 +339,8 @@ class SwitchesAndContext(HookCase):
         with open(os.path.join(self.root, "memory", "inbox", "2026-01-01.md"), "w") as f:
             f.write("a card proposal\n")
         ctx = self.context({"hook_event_name": "SessionStart", "session_id": "s1"},
-                           KHMS_PROC_LOCKS=os.path.join(self.root, "no-such-table"))
+                           KHMS_PROC_LOCKS=os.path.join(self.root, "no-such-table"),
+                           KHMS_NIGHTLY_LOCK=os.path.join(self.state, "shared", "nightly.lock"))
         self.assertIn("UNREVIEWED INBOX", ctx)
         self.assertIn("Night pipeline state unknown", ctx)
 

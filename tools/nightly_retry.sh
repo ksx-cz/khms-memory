@@ -35,6 +35,14 @@ _retry_clip() {
   case "$unit" in m) secs=$((n * 60)) ;; h) secs=$((n * 3600)) ;; d) secs=$((n * 86400)) ;; *) secs=$n ;; esac
   if [ "$secs" -gt "$left" ] 2>/dev/null; then echo "${left}s"; else echo "$spec"; fi
 }
+# THE ACCOUNT'S USAGE LIMIT IS NOT TRANSIENT (PDRAIN, #209; P209N review A-4). On 2026-10-04 the
+# weekly limit answered every call in ~3 s with "You've hit your weekly limit · resets Oct 8, 3am";
+# the wrapper still slept and retried every stage, every remaining batch was attempted twice, and the
+# triage judge made 84 failing calls. A limit message now ends the stage at once with rc 75, and when
+# RETRY_LIMIT_FLAG names a file (nightly_distill.sh sets one per night) the first hit writes it and
+# every later retry_claude_call of the run returns 75 WITHOUT calling the model.
+RETRY_LIMIT_RE=${RETRY_LIMIT_RE:-"hit your [a-z0-9 -]*limit|usage limit reached"}
+RETRY_RC_LIMIT=75
 retry_claude_call() {
   local stage="$1" tmo="$2" log="$3" stage_mark="$4"
   shift 4
@@ -48,7 +56,12 @@ retry_claude_call() {
   # of several calls (the multi-part sweep) cannot outlive its budget by K x attempts x timeout.
   # Unset = the old contract exactly.
   local deadline="${RETRY_DEADLINE_EPOCH:-}"
+  local flag="${RETRY_LIMIT_FLAG:-}" out
   while :; do
+    if [ -n "$flag" ] && [ -s "$flag" ]; then
+      echo "$(date -Is) $stage NOT STARTED (attempt $attempt/$max_attempts): the account's usage limit was hit earlier in this run ($(head -c 200 "$flag"))" >> "$log"
+      return "$RETRY_RC_LIMIT"
+    fi
     if [ -n "$deadline" ]; then
       left=$(( deadline - $(date +%s) ))
       if [ "$left" -le 0 ]; then
@@ -59,7 +72,16 @@ retry_claude_call() {
     fi
     : > "$stage_mark"
     rc=0
-    timeout --signal=TERM --kill-after=60s "$tmo" "$@" >> "$log" 2>&1 || rc=$?
+    out=$(mktemp "${TMPDIR:-/tmp}/retry-out.XXXXXX")
+    timeout --signal=TERM --kill-after=60s "$tmo" "$@" > "$out" 2>&1 || rc=$?
+    cat "$out" >> "$log"
+    if [ "$rc" -ne 0 ] && grep -qiE "$RETRY_LIMIT_RE" "$out"; then
+      echo "$(date -Is) $stage USAGE LIMIT on attempt $attempt/$max_attempts (rc=$rc): $(grep -m1 -iE "$RETRY_LIMIT_RE" "$out" | head -c 200) — not retried$([ -n "$flag" ] && echo "; no further model call starts in this run ($flag)")" >> "$log"
+      if [ -n "$flag" ]; then echo "$(date -Is) $stage: $(grep -m1 -iE "$RETRY_LIMIT_RE" "$out" | head -c 200)" > "$flag"; fi
+      rm -f "$out"
+      return "$RETRY_RC_LIMIT"
+    fi
+    rm -f "$out"
     if [ "$rc" -eq 0 ]; then
       if [ "$attempt" -gt 1 ]; then
         echo "$(date -Is) $stage RECOVERED on attempt $attempt/$max_attempts after a transient failure" >> "$log"

@@ -37,6 +37,7 @@ CODE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 # shellcheck source=khms_paths.sh
 . "$CODE/khms_paths.sh"
 khms_load || exit 3
+python3 "$CODE/khms_health.py" || exit 3
 khms_require_writable "run the nightly sweep" || exit $?
 ROOT=$(khms_get KHMS_ROOT)
 AGENT=$(khms_get KHMS_AGENT)
@@ -99,7 +100,17 @@ SWEEP_GROUP_CHUNKS=${SWEEP_GROUP_CHUNKS:-80}
 # whether or not the thing it guards is healthy. Caps are generous (a genuinely big day measured
 # ~75 min of productive sweep on 2026-08-15) but finite, and a timeout kills the stage, releases
 # the lock, and leaves a FAILED line in the log where the morning review can see it.
-SWEEP_TIMEOUT=${SWEEP_TIMEOUT:-90m}
+# MEASURED LIMITS (board #209, P209N, 2026-10-06) — ONE RULE for every per-call stage limit:
+# limit = 2 x the longest call measured, rounded UP to 5 min. Source: the night's own claude -p
+# transcripts priced/timed by tools/tok_account.py, plus logs/nightly.log, nights 2026-09-20..10-06
+# (17 nights; table in plans/handoff-P209N.md). tools/test_nightly_stage_limits.py holds the
+# measured maxima and fails when a default here drifts from the rule.
+#   sweep        17 calls, 7.2-36.9 min (max 2026-09-23)            -> 75m   (was 90m)
+#   consolidate  29 batches 2026-10-02..06, 4.8-38.9 min (max 10-05) -> 80m   (was 45m: 1.16x)
+#   MARK chunk    3 chunks 2026-10-03, 10.1-14.1 min                 -> 30m   (was 40m, an estimate)
+# A call that exceeds its limit is killed by timeout(1) and logged by nightly_retry.sh as
+# "FAILED after N/N attempts (rc=124 = TIMEOUT)"; the night then ends "nightly INCOMPLETE".
+SWEEP_TIMEOUT=${SWEEP_TIMEOUT:-75m}
 # THE SWEEP'S OVERALL DEADLINE (K209H, REV209 F8), minutes after the run's start. Until then a
 # multi-part sweep had no total bound: K parts x 3 attempts x SWEEP_TIMEOUT, on a service with no
 # timeout. No sweep part and no retry attempt STARTS after it, and a started attempt is clipped to
@@ -118,7 +129,13 @@ SWEEP_FAILED_FILE=$(khms_get KHMS_SWEEP_FAILED)
 # 20 cards took 7.5, 9.3, 9.6, 12, 13, 14, 15, 16, 17, 20, 22 min — ~1.2 cards/min, worst
 # 22 min. A batch of 25 is therefore ~10–28 min; 45m is ~1.6x the worst measured rate and
 # a timed-out batch is NOT lost (it stays in the carry queue for the next night).
-CONSOLIDATE_TIMEOUT=${CONSOLIDATE_TIMEOUT:-45m}
+# RE-MEASURED on the first five uncapped nights (P209N): 29 batches took 4.8-38.9 min, and the
+# slowest was a 12-candidate batch (2026-10-05, consout-2026-10-04-06) — duration does not follow
+# batch size, so the rate-based 45m left 1.16x headroom. 80m = 2 x 38.9 rounded up (rule above).
+# Worst case with BATCH_RETRY_MAX=2: a batch started just before CARD_DEADLINE (+225 since P209M) ends
+# by +225+160 = +385 min, triage (TRIAGE_TIMEOUT 120m) by ~+505 = ~11:55 — inside the weekly's wait,
+# which starts at 04:00 (+30) and lasts WEEKLY_NIGHT_WAIT_MIN 480 min, i.e. until +510 (12:00).
+CONSOLIDATE_TIMEOUT=${CONSOLIDATE_TIMEOUT:-80m}
 CONSOLIDATE_BATCH=${CONSOLIDATE_BATCH:-25}
 
 # MERGE PRESSURE, added 2026-09-04 (audit review-2026-09-02-khms.md §5, §6 A5).
@@ -138,7 +155,8 @@ CONSOLIDATE_BATCH=${CONSOLIDATE_BATCH:-25}
 # exactly that way, with no line anywhere saying so. What replaced the cap:
 #   * the COVERAGE LEDGER (mark_ledger.py): every tracked journal MARK has an id and
 #     stays OPEN until a card covers it or the coordinator dismisses it with a reason;
-#     OPEN marks are the queue each night works from;
+#     OPEN marks are the queue the MARK stage works from, oldest first, as far as the night's
+#     card budget (MARK_PENDING_MAX + CARD_BUDGET_MIN below) reaches;
 #   * the MARK stage: queued marks the sweep did not cover go to the model in chunks;
 #   * the CARRY QUEUE (memory/ledger/carry/): consolidate runs in batches, every batch
 #     file stays in the carry queue until its output is merged into the inbox, so a batch
@@ -151,13 +169,23 @@ CARRY=$ROOT/memory/ledger/carry
 # turned 31–137 candidates out of a whole digest in 9–38 min (3.5–5.7 candidates/min,
 # nightly.log 2026-09-20..10-01); a chunk of 60 one-line marks is therefore ~15–20 min,
 # and 40m is 2x that. Chunks not started before the budget stay OPEN in the ledger.
+# MEASURED (P209N): the only night the stage ran (2026-10-03, 3 chunks of 60) took 10.1, 10.6 and
+# 14.1 min -> 30m (rule above). On the other four uncapped nights it ran NO chunk: the sweep alone
+# put 138-157 candidates over MARK_PENDING_MAX (see the backpressure note below).
 MARK_CHUNK=${MARK_CHUNK:-60}
-MARK_TIMEOUT=${MARK_TIMEOUT:-40m}
+MARK_TIMEOUT=${MARK_TIMEOUT:-30m}
 # Wall-clock budgets, minutes after the run's start (03:30): no NEW mark chunk after
-# +90 (05:00), no NEW consolidate batch after +180 (06:30) — a started one is bounded by
-# its own timeout. Triage (~25–45 min) runs after, so a full night ends by ~08:00.
+# +90 (05:00), no NEW consolidate batch after +225 (07:15) — a started one is bounded by
+# its own timeout. Triage (31–59 min measured, P209N) runs after, so a full night ends by ~08:30.
+# CARD_BUDGET_MIN was 180 until P209M (#209, reviewed budget increase: the night may write
+# more cards). Sized with MARK_PENDING_MAX below: the consolidation of MARK_PENDING_MAX candidates
+# (9 batches of 25) at the measured 12.5-19.6 min per batch (P209N: 75-139 min for 6-9 batches)
+# takes ~115-175 min; it starts after the sweep (12-26 min) and the MARK stage (chunks 10-14 min),
+# i.e. at ~+65..+90, and its last batch must still be allowed to START: +225. A night that does
+# not finish its batches carries them, and the carried candidates hold the next night's MARK
+# stage back (backpressure) — the budget regulates itself instead of piling up carry.
 MARK_BUDGET_MIN=${MARK_BUDGET_MIN:-90}
-CARD_BUDGET_MIN=${CARD_BUDGET_MIN:-180}
+CARD_BUDGET_MIN=${CARD_BUDGET_MIN:-225}
 # Attempts per batch/chunk (the sweep keeps nightly_retry.sh's default 3): a batch that
 # fails twice is carried, and the next one is tried rather than spending the night on it.
 BATCH_RETRY_MAX=${BATCH_RETRY_MAX:-2}
@@ -168,7 +196,17 @@ BATCH_RETRY_MAX=${BATCH_RETRY_MAX:-2}
 # shrink while the real backlog only moved. 125 = 5 batches = what ~100 min of
 # consolidation at the measured ~1.2 cards/min gets through. The marks it does not reach
 # stay OPEN, visibly, in the ledger.
-MARK_PENDING_MAX=${MARK_PENDING_MAX:-125}
+# RAISED 125 -> 225 (P209M, #209, owner 2026-10-06 K-93929 remedy b). MEASURED (P209N, nights
+# 10-02..10-06): the sweep ALONE yields 52-157 candidates (62, 68, 138, 52, 157), so at 125 the
+# stage was skipped on 4 of 5 nights while the OPEN queue grew 2740 -> 4387. A MARK chunk of 60
+# marks yields 13-28 candidates (10-03: 13, 28, 21) and accounts for all 60 ids (candidates or
+# NOT CARDED verdicts). At 225 = 9 batches, a night with the largest measured sweep (157) still
+# runs 4 chunks (157 -> ~178 -> ~199 -> ~220 -> stop) = ~240 marks; a 60-candidate night runs
+# chunks until the MARK budget (+90) stops it. COST, measured per unit on the same nights
+# (P209N per-stage table, tok_account): a MARK chunk ~$1.8 (10-03: $5.46 / 3), a consolidate batch
+# ~$2.4-3.3 ($14.28/6, $19.90/7, $28.99/9, $22.77/7) — i.e. ~$4-5 per 60 marks taken off the queue,
+# and ~+$14-17 a night at 4 chunks + 3 extra batches over the 125/180 setting ($30-39 measured).
+MARK_PENDING_MAX=${MARK_PENDING_MAX:-225}
 
 mkdir -p "$STAGING"
 # The stage prompts: prompts/<name>.md with their {{...}} fields and private extension slots filled
@@ -233,9 +271,28 @@ else
   printf 'nightly %s pid=%s nk=%s\n' "$RUN_START" "$$" "$NK" > "$LOCK"
 fi
 echo "$RUN_START nightly start (night key $NK)" >> "$LOG"
-# The ledger tool, never fatal: a ledger bug must not cost the night's cards (a non-fatal check
-# that kills the run under `set -e` once cost weeks of nights), but it must say so — a silent
-# ledger failure would read as "nothing OPEN".
+# THE USAGE-LIMIT FLAG (PDRAIN, #209; P209N A-4): retry_claude_call writes it on the first
+# "You've hit your … limit" answer and then refuses every later model call of this run (rc 75), and
+# the stage loops below stop at it with ONE line instead of attempting every chunk and batch.
+export RETRY_LIMIT_FLAG=$STAGING/.usage-limit-$NK
+rm -f "$RETRY_LIMIT_FLAG"
+limit_stop() {   # limit_stop <what is left> -> 0 (and one log line) when the usage limit was hit
+  [ -s "$RETRY_LIMIT_FLAG" ] || return 1
+  echo "$(date -Is) USAGE LIMIT — $1 not started ($(head -c 200 "$RETRY_LIMIT_FLAG")); they stay queued/carried for the next night" >> "$LOG"
+  case " $FAILED_STAGES " in *" usage-limit "*) ;; *) FAILED_STAGES="$FAILED_STAGES usage-limit" ;; esac
+  return 0
+}
+# THE KNOW-HOW TEST, MADE VISIBLE (P209M, knowledge, not progress records).
+# The MARK and consolidate prompts drop a pure status/progress item with the reason `not know-how`;
+# this line counts those verdicts per output, so the log shows the test working (or never firing).
+knowhow_line() {   # knowhow_line <stage tag> <output file> -> one log line
+  local ids cands
+  ids=$(grep -cE '^- M-[0-9a-f]{8} :: not know-how' "$2" 2>/dev/null || true)
+  cands=$(grep -oiE 'not know-how: *[0-9]+' "$2" 2>/dev/null | grep -oE '[0-9]+' | awk '{s+=$1} END {print s+0}' || true)   # pipefail: no match is not an error
+  echo "$(date -Is) know-how ($1): ${ids:-0} MARK id(s) and ${cands:-0} candidate(s) dropped as not know-how (K-93929)" >> "$LOG"
+}
+# The ledger tool, never fatal: a ledger bug must not cost the night's cards (K-90490), but
+# it must say so — a silent ledger failure would read as "nothing OPEN".
 ledger() {
   if [ ! -f "$LEDGER_TOOL" ]; then
     echo "$(date -Is) mark ledger MISSING ($LEDGER_TOOL) — coverage not tracked tonight" >> "$LOG"
@@ -476,6 +533,20 @@ echo "$(date -Is) digest ${SIZE}B — swept whole (no size cap since #209)" >> "
 # chars) before spending its last 24 minutes on Edits that could never be allowed. The prompts now
 # mandate append-by-Edit; the tool list has to make that possible.
 TOOLS="Read Write Edit Glob Grep"
+# STAGE ISOLATION (PDRAIN, #209, 2026-10-06). HOME is the coordinator's home, so every stage call loaded
+# ~/.claude/settings.json and the COORDINATOR's ~/.claude/CLAUDE.md ("I decide WHO the work goes to")
+# plus its hooks (recall injection on the prompt, gates). In the 2026-10-06 drain 2 of 63 MARK calls
+# answered by printing an `Agent({... subagent_type: "librarian" ...})` delegation as text and exited 0
+# without writing their OUTPUT FILE (a probe: `claude -p "…who are you…"` -> "the coordinator"; with
+# --setting-sources "" -> "NO"). A stage gets its prompt and nothing else; the one thing the user
+# settings supplied that the stages rely on — effortLevel high (P209N: every stage call is
+# sonnet · high) — is passed explicitly.
+# OFFERED = PERMITTED (2026-10-07, owner: "fixni aby nepadala na permissions"). --allowedTools only
+# pre-approves; the stage was still OFFERED Bash (and the account's claude.ai connectors), tried
+# ls/wc/find/sed and got "This command requires approval" auto-rejected — 479 rejected calls
+# 2026-10-06..07 in consolidate and MARK stages. --tools limits the offered set to $TOOLS and
+# --strict-mcp-config drops MCP; probe: the stage lists exactly "Edit, Glob, Grep, Read, Write".
+STAGE_ISOLATION=(--setting-sources "" --effort high --strict-mcp-config --tools $TOOLS)
 QREPORT=$STAGING/nightly-$NK-quotecheck.txt
 SWEEP=$STAGING/nightly-$NK-sweep.md
 # Tonight's proposals: every consolidated batch is published as its OWN immutable inbox unit
@@ -626,8 +697,8 @@ if [ "$DRYRUN" = "1" ]; then
     "$(wc -l < "$GITLOG_INDEX" 2>/dev/null || echo 0)"
   printf 'sweep parts: %s (one sweep call per part of <= %s chunks; 0 = one call, prompt as below)\n' \
     "${#SWEEP_GROUP_FILES[@]}" "$SWEEP_GROUP_CHUNKS"
-  printf 'sweep deadline: no sweep part or retry attempt starts after %s (+%s s); failed sweeps so far: %s\n' \
-    "$(date -d @"$SWEEP_DEADLINE" +%H:%M)" "$((SWEEP_DEADLINE - RUN_START_EPOCH))" \
+  printf 'sweep: timeout %s per call; deadline: no sweep part or retry attempt starts after %s (+%s s); failed sweeps so far: %s\n' \
+    "$SWEEP_TIMEOUT" "$(date -d @"$SWEEP_DEADLINE" +%H:%M)" "$((SWEEP_DEADLINE - RUN_START_EPOCH))" \
     "$(grep -c . "$SWEEP_FAILED_FILE" 2>/dev/null || echo 0)"
   echo
   echo "--- SWEEP stage INPUTS block (verbatim, as the prompt receives it) ---"
@@ -651,9 +722,12 @@ EOF
   echo "--- MARK LEDGER / MARK stage (board #209) ---"
   ledger sync --dry 2>&1 | sed 's|^|  |' || true
   echo "  queue: $QUEUE_N OPEN mark(s) not held by any pending proposal -> $QUEUE"
-  grep -m3 '^- M-' "$QUEUE" | cut -c1-160 | sed 's|^|    |'
+  # `|| true`: an EMPTY queue is a normal night; under `set -o pipefail` grep's rc 1 used to end
+  # the dry run here with rc 1, before the MARK-stage limits, quote sources and triage were printed.
+  { grep -m3 '^- M-' "$QUEUE" || true; } | cut -c1-160 | sed 's|^|    |'
   echo "  MARK stage: chunks of $MARK_CHUNK, timeout $MARK_TIMEOUT, $BATCH_RETRY_MAX attempt(s), no new chunk after $(date -d @"$MARK_DEADLINE" +%H:%M) or once >= $MARK_PENDING_MAX candidates wait for consolidation"
   echo "  grounding journal source (window + every journal from $LFLOOR): $JVERIFY ($(stat -c%s "$JVERIFY") B)"
+  echo "  know-how test (K-93929): consolidate prompt $(grep -c 'not know-how' "$CODE/prompts/nightly-consolidate.md" || true) line(s), MARK prompt $(grep -c 'not know-how' "$CODE/prompts/nightly-marks.md" || true) line(s) name the drop reason; each output's drops are logged as 'know-how (<stage>): …'"
   echo
   echo "--- verify_quotes sources (must match the src= labels the stages may use) ---"
   echo "  digest=$DIGEST"
@@ -748,6 +822,7 @@ elif [ ${#SWEEP_GROUP_FILES[@]} -gt 1 ]; then
   for _k in $(seq 1 "$_K"); do
     _gf=${SWEEP_GROUP_FILES[$((_k - 1))]}
     if [ "$_k" = "1" ]; then _gout=$SWEEP; else _gout=$STAGING/nightly-$NK-sweep-g$(printf %02d "$_k").md; fi
+    if limit_stop "sweep parts $_k..$_K"; then SWEEP_OK=0; break; fi
     if [ "$(date +%s)" -ge "$SWEEP_DEADLINE" ]; then
       SWEEP_OK=0
       echo "$(date -Is) sweep part $_k/$_K NOT STARTED — the sweep deadline $(date -d @"$SWEEP_DEADLINE" +%H:%M) (+${SWEEP_BUDGET_MIN} min) has passed; the sweep is incomplete" >> "$LOG"
@@ -757,7 +832,7 @@ elif [ ${#SWEEP_GROUP_FILES[@]} -gt 1 ]; then
     if ! RETRY_DEADLINE_EPOCH=$SWEEP_DEADLINE retry_claude_call "sweep-$_k" "$SWEEP_TIMEOUT" "$LOG" "$STAGE_MARK" -- \
          "$AGENT" -p "$SWEEP_BASE
 
-$(sweep_group_inputs "$_k" "$_K" "$_gf" "$_gout")" --model "$SWEEP_MODEL" --allowedTools $TOOLS; then
+$(sweep_group_inputs "$_k" "$_K" "$_gf" "$_gout")" "${STAGE_ISOLATION[@]}" --model "$SWEEP_MODEL" --allowedTools $TOOLS; then
       SWEEP_OK=0
       echo "$(date -Is) sweep part $_k/$_K FAILED — the sweep is incomplete; parts after it are not started" >> "$LOG"
     fi
@@ -783,7 +858,7 @@ $(sweep_group_inputs "$_k" "$_K" "$_gf" "$_gout")" --model "$SWEEP_MODEL" --allo
   done
 else
 RETRY_DEADLINE_EPOCH=$SWEEP_DEADLINE retry_claude_call sweep "$SWEEP_TIMEOUT" "$LOG" "$STAGE_MARK" -- \
-  "$AGENT" -p "$SWEEP_PROMPT" --model "$SWEEP_MODEL" --allowedTools $TOOLS || SWEEP_OK=0
+  "$AGENT" -p "$SWEEP_PROMPT" "${STAGE_ISOLATION[@]}" --model "$SWEEP_MODEL" --allowedTools $TOOLS || SWEEP_OK=0
 # max_tokens guard over the LAST attempt (STAGE_MARK is re-stamped by each attempt).
 # Report, not gate: `|| true` keeps a check that is meant to be non-fatal from killing the run
 # under `set -e` (already paid for once, with weeks of lost nights).
@@ -867,6 +942,7 @@ MK=0
 for MC in "${MCHUNKS[@]}"; do
   [ -f "$MC" ] || continue
   MK=$((MK + 1))
+  if limit_stop "MARK chunks $MK..${#MCHUNKS[@]} (their marks stay OPEN)"; then break; fi
   if [ "$(date +%s)" -ge "$MARK_DEADLINE" ]; then
     echo "$(date -Is) === marks === budget of ${MARK_BUDGET_MIN} min reached — $(( ${#MCHUNKS[@]} - MK + 1 )) chunk(s) left OPEN in the ledger for the next night" >> "$LOG"
     break
@@ -888,12 +964,18 @@ INPUTS:
 - knowledge base (grep before carding): $ROOT/memory/know
 OUTPUT FILE: $MOUT"
   if RETRY_MAX_ATTEMPTS=$BATCH_RETRY_MAX retry_claude_call "marks-$MK" "$MARK_TIMEOUT" "$LOG" "$STAGE_MARK" -- \
-       "$AGENT" -p "$MPROMPT" --model "$MARK_MODEL" --allowedTools $TOOLS; then
+       "$AGENT" -p "$MPROMPT" "${STAGE_ISOLATION[@]}" --model "$MARK_MODEL" --allowedTools $TOOLS; then
     if [ -s "$MOUT" ]; then
       python3 "$BATCH_TOOL" merge "$SWEEP" "$MOUT" --letter M --relabel-base $((MK * 1000)) >> "$LOG" 2>&1 \
         || echo "$(date -Is) marks-$MK merge FAILED (non-fatal) — its marks stay OPEN" >> "$LOG"
+    else
+      # rc 0 and no output is a failed chunk, not a quiet one (PDRAIN: 2 of 63 calls on 2026-10-06
+      # printed a delegation and wrote nothing; until then only "coverage: 0/60" in the log said so)
+      FAILED_STAGES="$FAILED_STAGES marks-$MK"
+      echo "$(date -Is) marks-$MK exited 0 but wrote no output ($MOUT) — FAILED, its $(grep -c '^- M-' "$MC") mark(s) stay OPEN for the next night" >> "$LOG"
     fi
     ledger coverage "$MOUT" --queue "$MC" >> "$LOG" 2>&1 || true
+    knowhow_line "marks-$MK" "$MOUT"
   else
     FAILED_STAGES="$FAILED_STAGES marks-$MK"
     echo "$(date -Is) marks-$MK FAILED — output not merged, its $(grep -c '^- M-' "$MC") mark(s) stay OPEN for the next night" >> "$LOG"
@@ -991,6 +1073,7 @@ postprocess_batch() {
   python3 "$CODE/verify_quotes.py" "$f" --source digest="$dg" --source journal="$jv" \
     --source gitlog="$gl" > "$qr" 2>&1 || true
   echo "$(date -Is) quotecheck(post $tag): $(tail -1 "$qr")" >> "$LOG"
+  knowhow_line "$tag" "$f"
   echo "$(date -Is) === verify_relations === gate over $f (no cap)" >> "$LOG"
   if python3 "$CODE/nearest_cards.py" "$f" --only-missing >> "$LOG" 2>&1; then
     python3 "$CODE/verify_relations.py" "$f" > "$rr" 2>&1 || true   # report, not a gate
@@ -1005,7 +1088,23 @@ postprocess_batch() {
 batch_rb() {        # the relabel base a batch is published with (publish and verify agree)
   if [ "$KIND" = "cons" ]; then echo $(( (10#$BNN - 1) * 1000 )); else echo 0; fi
 }
+# THE HEADER GATE (PINBOX, #209). 2026-10-06 published 145 candidates whose header was
+# `type: X; level: Y; tags: [...]` on one line — no prompt stated the shape and nothing between
+# the model and the inbox looked at it. The prompts now state it; here a key-LABELLED compound
+# line is split into one `key: value` per line (card_header.py fix — labelled, so not a guess),
+# and `publish` refuses (rc 5, no unit) whatever is still malformed: the batch stays in carry and
+# the night ends INCOMPLETE, loudly, instead of handing the review an unconvertible unit. The
+# fix runs on the publish source in BOTH paths, a fresh output and a durable one from a killed
+# night, so the durable output and its published unit stay byte-comparable for `published`.
 publish_batch() {   # publish_batch <source file> -> 0 when the unit is verified for this batch
+  # A header still malformed after normalising is QUARANTINED (PDRAIN, #209): the card moves, whole,
+  # under a `## DROPPED (malformed header …)` trailer with its reason — until then publish refused
+  # the whole batch, and a refused durable output was refused again every night, holding all its
+  # cards and MARK ids in carry for good (drain 2026-10-06: 4 headers held 25 cards).
+  if ! python3 "$CODE/card_header.py" fix "$1" >> "$LOG" 2>&1; then
+    python3 "$CODE/card_header.py" quarantine "$1" >> "$LOG" 2>&1 || true
+    echo "$(date -Is) card header gate: $1 — malformed header(s) moved to ## DROPPED (malformed header) for the review, nothing guessed (see the quarantine line above)" >> "$LOG"
+  fi
   python3 "$BATCH_TOOL" publish "$1" --unit "$UNIT" --batch-id "$BID" --record "$RECORD" \
     --relabel-base "$(batch_rb)" >> "$LOG" 2>&1
 }
@@ -1017,7 +1116,7 @@ finish_batch() {    # the carry cleanup — repeatable, the batch is already pub
   python3 "$BATCH_TOOL" merge "$PROPOSED_SO_FAR" "$UNIT" >> "$LOG" 2>&1 || true
   return 0
 }
-CB=0; CB_DONE=0; CB_LEFT=0
+CB=0; CB_DONE=0; CB_LEFT=0; CB_LIMIT=0
 PUBLISHED_UNITS=()
 : > "$PROPOSED_SO_FAR"
 mapfile -t CBATCHES < <(carry_batches)
@@ -1066,6 +1165,9 @@ for B in "${CBATCHES[@]}"; do
     fi
     continue
   fi
+  # a batch that needs a model call is skipped (not the loop: published/durable/NOT CARDED
+  # batches above still publish without one); the skipped ones are named once after the loop
+  if [ -s "$RETRY_LIMIT_FLAG" ]; then CB_LIMIT=$((CB_LIMIT + 1)); continue; fi
   if [ "$(date +%s)" -ge "$CARD_DEADLINE" ]; then
     CB_LEFT=$(carry_batches | wc -l)
     echo "$(date -Is) consolidate budget of ${CARD_BUDGET_MIN} min reached — $CB_LEFT batch(es) stay in $CARRY for the next night" >> "$LOG"
@@ -1081,7 +1183,7 @@ for B in "${CBATCHES[@]}"; do
 
 $(consolidate_inputs "$B" "$BD" "$CB" "$BOUT")"
   if RETRY_MAX_ATTEMPTS=$BATCH_RETRY_MAX retry_claude_call "consolidate-$BD-$BNN" "$CONSOLIDATE_TIMEOUT" "$LOG" "$STAGE_MARK" -- \
-       "$AGENT" -p "$CPROMPT" --model "$CONS_MODEL" --allowedTools $TOOLS; then
+       "$AGENT" -p "$CPROMPT" "${STAGE_ISOLATION[@]}" --model "$CONS_MODEL" --allowedTools $TOOLS; then
     if [ -s "$BOUT" ]; then
       postprocess_batch "$BOUT" "$BD" "$BID"
       cp "$BOUT" "$DUR.tmp" && mv "$DUR.tmp" "$DUR"
@@ -1104,6 +1206,7 @@ $(consolidate_inputs "$B" "$BD" "$CB" "$BOUT")"
   python3 "$CODE/maxtok_check.py" --stage "consolidate-$BD-$BNN" --since "$STAGE_MARK" \
     --projects "$PROJ_DIR" >> "$LOG" 2>&1 || true
 done
+[ "$CB_LIMIT" -eq 0 ] || limit_stop "$CB_LIMIT consolidate batch(es) (they stay in $CARRY)" || true
 # A run directory whose batches are all published is closed: its window is folded into the
 # stamp (never backwards) and the directory goes.
 for _d in "$CARRY"/[0-9]*/; do

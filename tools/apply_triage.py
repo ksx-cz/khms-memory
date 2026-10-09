@@ -54,6 +54,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import khms_contradict as kc        # noqa: E402  (quote_coverage — one definition, not two)
 import khms_triage_report as R      # noqa: E402  (role coherence — likewise)
 
+import khms_lock as L
 import khms_paths as P  # noqa: E402
 
 # The base: the resolver's root; --brain names another one (tests use a throwaway base).
@@ -62,28 +63,6 @@ import khms_paths as P  # noqa: E402
 DEFAULT_BRAIN = P.soft("ROOT")
 
 
-def snapshot_first(brain, tag):
-    """Take a rollback point before the first frontmatter write (audit 2026-09-02 §6 A1).
-
-    Same reasoning as approve_inbox.snapshot_first: there is no git under the brain, so the
-    undo of a wrong triage is a copy out of a snapshot, and it has to be taken before the
-    write, not after the surprise. Only for the selected base (`--brain <tmp>` in the tests is a
-    throwaway and gets nothing) and never when KHMS_NO_SNAPSHOT=1. A failed snapshot warns
-    loudly and does not block the apply — refusing to write would be the worse failure.
-    """
-    if os.environ.get("KHMS_NO_SNAPSHOT") == "1" or not P.same_path(brain, DEFAULT_BRAIN):
-        return
-    script = os.path.join(P.CODE, "khms_snapshot.sh")
-    if not os.path.exists(script):
-        print(f"WARN: {script} is missing — writing WITHOUT a rollback point", file=sys.stderr)
-        return
-    r = subprocess.run(["bash", script, "--tag", tag], capture_output=True,
-                       text=True, timeout=900)
-    if r.returncode == 0:
-        print((r.stdout or "").strip().splitlines()[0], file=sys.stderr)
-    else:
-        print(f"WARN: snapshot rc={r.returncode} — NO rollback point for this run: "
-              f"{(r.stderr or '').strip()[:200]}", file=sys.stderr)
 STATUS_RANK = {"active": 0, "challenged": 1, "refuted": 2, "superseded": 3, "condensed": 3}
 CLASS_FROM_ACTION = {"MARK_DEAD_END": "refute", "MARK_CONJECTURE": "challenge",
                      "RETIRE_WHOLE": "retire", "AMEND": None}
@@ -331,7 +310,7 @@ def main():
     write = args.apply and not args.dry_run
     # THE WRITE POLICY, BEFORE ANYTHING IS READ OR WRITTEN. `--brain` is compared with the selected base
     # by what it names (real path), never as text: `<base>/.` or a symlink to the base IS the selected base
-    # and gets its policy, its snapshot and its shared review marker. Every output of the run is checked,
+    # and gets its policy and its shared review marker. Every output of the run is checked,
     # the preview's report included -- a dry run is a promise not to change the base, not an exemption
     # from the reader boundary.
     selected = P.same_path(args.brain, DEFAULT_BRAIN)
@@ -353,6 +332,15 @@ def main():
               "VERDICT lines first.", file=sys.stderr)
         sys.exit(2)
 
+    with L.lock('cards', args.brain):
+        apply_locked(args, write, markers, rp)
+    if write and selected:
+        subprocess.run([sys.executable, os.path.join(P.CODE, 'build_views.py')], check=True)
+
+
+def apply_locked(args, write, markers, rp):
+    import khms_health
+    khms_health.require_healthy(args.brain)
     text = open(args.triage_file, encoding="utf-8").read()
     rows = parse_rows(text)
     verdicts = parse_verdicts(text)
@@ -360,7 +348,7 @@ def main():
                                assume_apply=args.assume_apply)
     edits = plan(applied, args.brain)
 
-    stamp = datetime.datetime.now().isoformat(timespec="seconds")
+    stamp = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
     report = [f"# apply_triage — {os.path.basename(args.triage_file)} "
               f"({'APPLIED' if write else 'DRY RUN'} {stamp})",
               "", f"rows: {len(rows)} · verdict lines: {len(verdicts)} · "
@@ -412,9 +400,9 @@ def main():
 
     archived = []
     if write:
-        snapshot_first(args.brain, "pre-triage")
+        L.dirty(args.brain)
         for cid, c, after_text in changed_files:
-            open(c["path"], "w", encoding="utf-8").write(after_text)
+            L.atomic_text(c["path"], after_text)
         for cid, c in sorted(edits.items()):
             if c["archive"]:
                 if not args.archive:
@@ -424,11 +412,6 @@ def main():
                 os.makedirs(os.path.dirname(dst), exist_ok=True)
                 shutil.move(c["path"], dst)
                 archived.append(cid)
-        if marker:
-            # The review marker the morning ping reads: the shared markers dir of the selected base;
-            # a throwaway --brain keeps its own under <brain>/state/shared/reviewed.
-            os.makedirs(markers, exist_ok=True)
-            open(marker, "a").close()
     elif any(c["archive"] for c in edits.values()):
         report.append("archive moves pending (--apply --archive): "
                       + ", ".join(cid for cid, c in edits.items() if c["archive"]))
@@ -437,7 +420,10 @@ def main():
 
     out = "\n".join(report) + "\n"
     print(out)
-    open(rp, "w", encoding="utf-8").write(out)
+    L.atomic_text(rp, out)
+    if write and marker:
+        # Commit the review fact only after cards, archive moves and the report succeeded.
+        L.atomic_text(marker, 'sha256=' + hashlib.sha256(text.encode()).hexdigest() + '\n')
     print(f"report -> {rp}", file=sys.stderr)
 
 

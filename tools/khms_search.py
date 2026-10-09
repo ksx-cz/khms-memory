@@ -12,7 +12,7 @@ frontmatter links/level are parsed, and a reverse index answers "which card
 corrects this one" (supersedes/contradicts/refuted_by) so a consumer never
 serves a refuted card without its refuter.
 """
-import glob
+import khms_files as glob
 import math
 import os
 import re

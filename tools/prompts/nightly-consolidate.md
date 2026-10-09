@@ -135,13 +135,29 @@ A candidate may carry a line `MARKS: M-xxxxxxxx …` — the ids of the journal 
 dismisses it). Carry every MARKS line through unchanged. When you MERGE candidates, the
 survivor's MARKS line is the union of all of theirs. When you DROP a candidate that has a
 MARKS line, every one of its ids goes into a final `## MARKS NOT CARDED` section as
-`- <id> :: <the drop reason>` (or `- <id> :: already carded K-xxxxx` when the base already
-holds it). Never invent an id and never drop one silently: an id that reaches neither a card
+`- <id> :: <the drop reason>` (or `- <id> :: already carded K-xxxxx: "<one sentence copied
+verbatim from K-xxxxx that holds it>"` when the base already holds it — the review tool greps the
+quote in the card, and a verdict without a quote the card contains is not coverage: the mark stays
+OPEN). Never invent an id and never drop one silently: an id that reaches neither a card
 nor that section stays OPEN and costs another night.
 
 ## Then
 
-- Deduplicate candidates; drop noise (no reusable knowledge, unsupported claims). Count drops.
+- Deduplicate candidates; drop noise (unsupported claims) and apply the KNOW-HOW TEST below. Count drops.
+- **KNOW-HOW TEST** (owner 2026-10-06, K-93929: "Store know-how, not a status dump."). Ask of every
+  candidate: would a future agent act differently knowing this? A candidate that ONLY records status or
+  progress — something was launched, finished or killed, passed (GREEN, rc=0, "N passed"), committed,
+  pushed, tagged, merged or deployed, a board move, a file kept or deleted, the next step — is DROPPED
+  with the reason `not know-how`: count it under `## Dropped` as `not know-how: <N>`, and every MARKS id
+  it carried goes to `## MARKS NOT CARDED` as `- <id> :: not know-how (K-93929): <one sentence why>`.
+  A VALUE THAT HAS ITS OWN SOURCE IN THE REPO is not know-how either (owner 2026-10-08: rear tyre track in a card
+  went stale against `robot_physical.yaml`; K-91076): a dimension, a tunable, a rate floor, an address — the card
+  never states the number as the fact; it states the know-how around it (how it was measured, why it is so, what
+  breaks) and POINTS to the file:key that holds it. A candidate whose only content is such a value is DROPPED as
+  `not know-how: value lives in <file>`.
+  A candidate that carries a finding that holds beyond today, a cause, a refutation, a measured fact about
+  the system, a decision WITH its reason, a mistake WITH its measure, an owner requirement or a base
+  inconsistency SURVIVES — trim its status details, do not drop it for them. When unsure, keep it.
 - Enforce schema exactly (attributes, descriptive observations, derived_from on derived, registry
   tags, English, YAML quoting).
 {{EXT:summary-line}}
@@ -178,6 +194,25 @@ nor that section stays OPEN and costs another night.
   status-change proposals, and every grounding action you took.
 - Append a short factual day summary (5–10 lines, English) to the journal file named as the append
   target in your inputs — append only, never rewrite existing content.
+
+**The card header — ONE shape, checked by a tool, in every card you output.** Right under the `### <label>: <title>`
+heading, one `key: value` per line, no code fence, nothing else on the line:
+
+    type: problem→solution
+    level: observation
+    tags: [nav, gotcha]
+
+`type` is one of the nine types of spec §4.2 (`fact`, `problem→solution`, `action→outcome`,
+`decision→rationale`, `requirement`, `principle`, `policy`, `goal→method`, `overview`); `level`
+is the one its §4.2 row names (`observation` for the first five, `derived` for the last four) or
+`assumption`; `tags` is a `[a, b]` list from the tag registry. `scope`, `evidence`, `source` and
+`date` may follow, each on its OWN line. Never join keys on one line (`type: fact; level:
+observation; tags: [...]` or `type: fact · level: …`), never write `observation (fact)`: on
+2026-10-06 all 145 candidates came out `; `-joined and none of them could be converted. The
+night's publish step (`tools/card_header.py`) refuses a batch with a malformed header.
+Your input may carry another shape (a fenced block, keys joined by `;` or `·`): write the card
+out in this one, values unchanged. A candidate whose type you cannot name from its body
+template is flagged, never given an invented type.
 
 Carry each surviving card's `**QUOTES:**` block through into your output unchanged. Review re-runs
 the verifier over your file, so a card that loses its grounding on the way through gets caught

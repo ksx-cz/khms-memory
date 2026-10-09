@@ -41,6 +41,7 @@ import datetime
 import hashlib
 import json
 import os
+import khms_files
 import re
 import shlex
 import subprocess
@@ -301,7 +302,7 @@ def unreviewed_inbox(inbox):
     except Exception as exc:                                       # noqa: BLE001
         log("SessionStart", "inbox-check", action="unit check unavailable (%s)" % exc.__class__.__name__)
     out = []
-    for f in sorted(os.listdir(inbox)):
+    for f in sorted(khms_files.listdir(inbox)):
         m = re.match(r"^(\d{4}-\d{2}-\d{2})(-weekly)?\.md$", f)
         if card_units is not None:
             if f in card_units:
@@ -309,13 +310,17 @@ def unreviewed_inbox(inbox):
         elif m and not any(os.path.exists(f"{rdir}/.reviewed-{m.group(1)}{s}")
                            for s in ("", f"{m.group(2) or ''}-cards")):
             out.append(f)
-        t = re.match(r"^(\d{4}-\d{2}-\d{2})-triage\.md$", f)
-        if t and not any(os.path.exists(f"{rdir}/.reviewed-{t.group(1)}{s}") for s in ("", "-triage")):
-            out.append(f)
+        if f.endswith('-triage.md'):
+            import khms_review_state
+            if not khms_review_state.triage_reviewed(os.path.join(inbox, f), BRAIN, rdir):
+                out.append(f)
     return out
 
 
 def handle_session_start(payload):
+    state_path, state = load_state(payload.get('session_id', ''))
+    clear_proposal_state(state)
+    save_state(state_path, state)
     parts = []
     inbox = f"{BRAIN}/memory/inbox"
     try:
@@ -620,9 +625,6 @@ def _unquoted(text):
     return _QUOTED_RE.sub(" ", text or "")
 
 
-def _not_listed(m, text):
-    a, b = m.start(), m.end()
-    return "/" not in text[max(0, a - _SLASH_NEAR):a] and "/" not in text[b:b + _SLASH_NEAR]
 
 
 def brief_marker(raw, n):
@@ -659,87 +661,6 @@ def _prop_line_norm(raw):
     return ks.norm(raw).strip().lstrip("-*_>•·+ \t")
 
 
-def proposal_spans(text, brief=False):
-    """[(label, span_text)] -- every proposal of a report (or, with brief=True, of a brief).
-
-    * A marker line is one proposal. A marker HEADER directly followed by a list takes the list; a marker
-      line that says too little on its own (a bare question) takes the line above with it.
-    * An option block `A) ... B) ...` is one proposal together with the line that asks -- but only when it
-      is a CHOICE (a question, a marker or a choice word nearby); A) B) C) used as part labels propose
-      nothing."""
-    lines = (text or "").splitlines()
-    usable = []                         # (index, raw, normalised) outside code
-    pos = {}                            # raw line index -> usable index
-    in_code = False
-    for i, raw in enumerate(lines):
-        if raw.strip().startswith("```"):
-            in_code = not in_code
-            continue
-        if in_code or raw.lstrip().startswith(">"):
-            continue
-        n = _prop_line_norm(raw)
-        if not n or PROPOSAL_SKIP_RE.match(n):
-            continue
-        pos[i] = len(usable)
-        usable.append((i, raw, n))
-    spans, taken = [], set()
-
-    def marker(x):
-        return brief_marker(usable[x][1], usable[x][2]) if brief \
-            else PROPOSAL_MARKER_RE.search(usable[x][2])
-
-    def asks(ks_, opts=()):
-        return any(("?" in usable[x][2] and not (brief and x in opts)) or marker(x)
-                   or PROPOSAL_CHOICE_RE.search(usable[x][2])
-                   or (brief and PROPOSAL_EN_CHOICE_RE.search(usable[x][2])) for x in ks_)
-
-    k = 0
-    while k < len(usable):
-        m = PROPOSAL_OPTION_RE.match(usable[k][1])
-        if not (m and m.group(1) == "A"):
-            k += 1
-            continue
-        block, want, j = [k], "B", k + 1
-        while j < len(usable) and j <= block[-1] + 3:
-            mj = PROPOSAL_OPTION_RE.match(usable[j][1])
-            if mj and mj.group(1) == want:
-                block.append(j)
-                want = chr(ord(want) + 1)
-            j += 1
-        if len(block) < 2:
-            k += 1
-            continue
-        idx = list(range(block[0], block[-1] + 1))
-        head = [k - 1] if k > 0 and usable[k - 1][0] >= usable[k][0] - 2 else []
-        after = [x for x in (block[-1] + 1, block[-1] + 2) if x < len(usable)]
-        if asks(head + idx + after, opts=set(idx)):
-            taken.update(idx + head)
-            body = " ".join(usable[x][1].strip() for x in head + idx)
-            spans.append((usable[k][1].strip(), body))
-        k = block[-1] + 1
-    for k, (i, raw, n) in enumerate(usable):
-        if k in taken or not marker(k):
-            continue
-        body = raw.strip()
-        nxt = lines[i + 1] if i + 1 < len(lines) else ""
-        if PROPOSAL_LIST_RE.match(nxt) and not PROPOSAL_LIST_RE.match(raw):
-            j = i + 1
-            while j < len(lines) and lines[j].strip() and j <= i + 15:
-                if j in pos:
-                    taken.add(pos[j])
-                    body += " " + lines[j].strip()
-                j += 1
-        elif spans and PROPOSAL_REF_RE.search(raw):
-            label, prev = spans[-1]
-            spans[-1] = (label, prev + " " + body)
-            taken.add(k)
-            continue
-        elif ("?" in n or len(proposal_terms(body)) < PROPOSAL_MIN_TERMS) \
-                and k > 0 and (k - 1) not in taken:
-            body = usable[k - 1][1].strip() + " " + body
-        taken.add(k)
-        spans.append((raw.strip(), body))
-    return spans
 
 
 def proposal_terms(span):
@@ -1020,22 +941,6 @@ def _proposal_items(missing):
                      for label, q in missing[:PROPOSAL_MAX_SHOWN])
 
 
-def run_proposal_gate(payload, event, exp):
-    """True == the report was DENIED (and the deny was already printed)."""
-    if not exp.get("proposal_gate", True):
-        return False
-    session = payload.get("session_id", "")
-    _path, st = load_state(session)
-    verdict, why, missing = proposal_verdict(_reply_text(payload), st, session,
-                                             payload.get("transcript_path") or "")
-    if verdict == "EXEMPT":
-        return False
-    proposal_log(session, verdict, why, missing[0][0] if missing else "")
-    if verdict != "DENY":
-        return False
-    deny(event, M.msg("HOOK_PROPOSAL_DENY", why=why, items=_proposal_items(missing)))
-    log(event, "report", action="DENY (proposal without recall: %s)" % why)
-    return True
 
 
 # --- the dispatch gate: the same rule when a subagent is launched -------------------------------------
@@ -1098,63 +1003,10 @@ def dispatch_brief_paths(prompt, cwd=None, unresolved=None):
     return out
 
 
-def dispatch_texts(prompt, cwd=None):
-    """[(where, text)] to check, [(path, error)] of named briefs that could not be read."""
-    texts, errors, unresolved = [("prompt", str(prompt or ""))], [], []
-    for p in dispatch_brief_paths(prompt, cwd, unresolved):
-        try:
-            with open(p, encoding="utf-8", errors="replace") as fh:
-                texts.append((p, fh.read()))
-        except OSError as exc:
-            errors.append((p, exc.__class__.__name__))
-    errors += [(t, M.msg("HOOK_WHY_RELATIVE")) for t in unresolved]
-    return texts, errors
 
 
-def stamp_prompt_turn(payload):
-    """UserPromptSubmit: every prompt opens a turn for the dispatch gate."""
-    path, st = load_state(payload.get("session_id", ""))
-    st["prompt_t"] = now()
-    save_state(path, st)
 
 
-def run_dispatch_proposal_gate(payload, exp):
-    """True == the dispatch was DENIED (and the deny was already printed)."""
-    if not exp.get("proposal_gate", True):
-        return False
-    session = payload.get("session_id", "")
-    _path, st = load_state(session)
-    ti = payload.get("tool_input") or {}
-    what = "dispatch %s" % re.sub(r"\s+", " ", str(ti.get("description")
-                                                   or ti.get("subagent_type") or "?"))[:60]
-    since = st.get("prompt_t", st.get("turn_start"))
-    texts, errors = dispatch_texts(ti.get("prompt") or "", payload.get("cwd") or None)
-    for p, err in errors:
-        proposal_log(session, "ERROR->ALLOW", M.msg("HOOK_WHY_BRIEF_UNREADABLE", what=what, err=err), p)
-    if since is None:
-        proposal_log(session, "EXEMPT", "%s: %s" % (what, M.msg("HOOK_WHY_NO_DISPATCH_TURN")), "")
-        return False
-    missing, where, verdicts = [], [], []
-    for src, text in texts:
-        verdict, why, miss = proposal_verdict(
-            text, st, session, payload.get("transcript_path") or "",
-            since_t=since, agent_id=str(payload.get("agent_id") or ""), brief=True)
-        verdicts.append((verdict, why))
-        if verdict == "DENY":
-            missing += miss
-            where.append("brief " + src if src != "prompt" else "prompt")
-    if not missing:
-        allowed = [w for v, w in verdicts if v == "ALLOW"]
-        proposal_log(session, "ALLOW" if allowed else "EXEMPT",
-                     "%s: %s" % (what, "; ".join(allowed) if allowed else M.msg("HOOK_WHY_NO_PROPOSAL")),
-                     "")
-        return False
-    why = M.msg("HOOK_WHY_DISPATCH_UNCOVERED", n=len(missing))
-    proposal_log(session, "DENY", "%s: %s" % (what, why), missing[0][0])
-    deny("PreToolUse", M.msg("HOOK_DISPATCH_DENY", why=why, where=", ".join(where),
-                             items=_proposal_items(missing)))
-    log("PreToolUse", what, action="DENY (proposal in brief without recall: %s)" % why)
-    return True
 
 
 # --- fail-open records: a broken gate is not an idle one ---------------------------------------------
@@ -1389,6 +1241,8 @@ def handle_report(payload, event, exp):
     except Exception as exc:                                       # noqa: BLE001
         log(event, "report", action="claim-gate error %s" % exc)
     try:
+        if run_term_gate(payload, event, exp):
+            return
         if run_proposal_gate(payload, event, exp):
             return
     except Exception as exc:                                       # noqa: BLE001
@@ -1401,6 +1255,335 @@ def handle_report(payload, event, exp):
     except Exception as exc:                                       # noqa: BLE001
         log(event, "report", action="stop-stamp error %s" % exc)
 
+
+
+_GATE_CARDS = []
+_SLASH_NEAR = 3
+PROPOSAL_TOPN = 5
+PROPOSAL_MAX_SHOWN = 3
+PROPOSAL_Q_CHARS = 400
+PROPOSAL_LOG_WORDS = 12
+PROPOSAL_SRC = "gate:proposal"
+PROPOSAL_CZ_LABEL_RE = PAT.regex('HOOK_PROPOSAL_LABEL', r'(?!)')
+PROPOSAL_CZ_NONE = set(PAT.words('HOOK_PROPOSAL_NONE', ['none', 'no', 'unchanged']))
+PROPOSAL_CZ_PAREN_ADJ_RE = PAT.regex('HOOK_PROPOSAL_PAREN_ADJ', r'(?!)')
+PROPOSAL_CZ_PAREN_RE = PAT.regex('HOOK_PROPOSAL_PAREN', r'(?!)')
+TERM_GLOSSARY = P.soft('KHMS_TERM_GLOSSARY', '')
+PROPOSAL_DENY_HEAD = {'reply':'This proposal has relevant recall results:',
+                      'dispatch':'This brief proposes a change (%s); relevant recall results:'}
+PROPOSAL_DENY_TAIL = 'Read the relevant cards, revise the proposal or resend it after reading. The same proposal is shown once per author context.'
+TERM_DENY = 'Preferred terminology: rewrite these expressions before sending:\n%s'
+
+PROPOSAL_EN_MARKER_RE = re.compile(
+    r"\b(?:i|we)\s+(?:would\s+|'d\s+|do\s+|strongly\s+)?(?:propose|recommend|suggest)\b"
+    r"|\b(?:my|our)\s+(?:proposal|recommendation|suggestion|advice)\b"
+    r"|\b(?:shall|should)\s+(?:i|we)\b[^?]*\?")
+
+PROPOSAL_EN_LABEL_RE = re.compile(
+    r"(?:^|[(\[]\s*|[.!;:]\s+|\s[-–—]\s+)(recommendation|recommended|recommend|proposal|"
+    r"suggestion|proposed fix|proposed change)\s*:", re.I)
+
+PROPOSAL_LIST_RE = re.compile(r"^\s*(?:[-*•]|\d+(?:[–-]\d+)?[.)])\s")
+
+_QUOTED_RE = re.compile(r"`[^`]*`|\"[^\"\n]*\"|„[^“\n]*“|“[^”\n]*”")
+
+_TERM_EXEMPT = re.compile(r"```.*?(```|\Z)|`[^`\n]*`|„[^“\n]{0,400}“|“[^”\n]{0,400}”"
+                          r"|\"[^\"\n]{0,400}\"", re.S)
+
+
+def _not_listed(m, text, group=0):
+    a, b = m.start(group), m.end(group)
+    return "/" not in text[max(0, a - _SLASH_NEAR):a] and "/" not in text[b:b + _SLASH_NEAR]
+
+def proposal_marker(raw, n):
+    'Shared proposal/terminology gate: proposal_marker'
+    if raw.lstrip().startswith("#"):
+        return False
+    t = _unquoted(n)
+    for rx in (PROPOSAL_MARKER_RE, PROPOSAL_EN_MARKER_RE):
+        if any(_not_listed(m, t) for m in rx.finditer(t)):
+            return True
+    for m in PROPOSAL_EN_LABEL_RE.finditer(_unquoted(raw)):
+        if not m.group(1).isupper():
+            return True
+    if _cz_label(t) is not None:
+        return True
+    rxs = (PROPOSAL_CZ_PAREN_ADJ_RE,) if PROPOSAL_LIST_RE.match(raw) else (
+        PROPOSAL_CZ_PAREN_ADJ_RE, PROPOSAL_CZ_PAREN_RE)
+    return any(_not_listed(m, t, 1) for rx in rxs for m in rx.finditer(t))
+
+def _cz_label(t):
+    'Shared proposal/terminology gate: _cz_label'
+    for m in PROPOSAL_CZ_LABEL_RE.finditer(t):
+        if not _not_listed(m, t):
+            continue
+        rest = m.group("rest") if m.group("rest") is not None else m.group("box") or ""
+        rest = re.sub(r"[\W_]+", " ", rest).strip()
+        if rest not in PROPOSAL_CZ_NONE:
+            return rest
+    return None
+
+def proposal_spans(text, brief=False):
+    'Shared proposal/terminology gate: proposal_spans'
+    lines = (text or "").splitlines()
+    usable = []                         # (index, raw, normalised) outside code
+    pos = {}                            # raw line index -> usable index
+    in_code = False
+    for i, raw in enumerate(lines):
+        if raw.strip().startswith("```"):
+            in_code = not in_code
+            continue
+        if in_code or raw.lstrip().startswith(">"):
+            continue
+        n = _prop_line_norm(raw)
+        if not n or PROPOSAL_SKIP_RE.match(n):
+            continue
+        pos[i] = len(usable)
+        usable.append((i, raw, n))
+    spans, taken = [], set()
+    for k, (i, raw, n) in enumerate(usable):
+        if k in taken or not proposal_marker(raw, n):
+            continue
+        body = raw.strip()
+        nxt = lines[i + 1] if i + 1 < len(lines) else ""
+        head = _cz_label(_unquoted(n)) == "" and (i + 1) in pos   # standalone proposal label, text below
+        if (PROPOSAL_LIST_RE.match(nxt) or head) and not PROPOSAL_LIST_RE.match(raw):
+            j = i + 1
+            while j < len(lines) and lines[j].strip() and j <= i + 15:
+                if j in pos:
+                    taken.add(pos[j])
+                    body += " " + lines[j].strip()
+                j += 1
+        elif spans and PROPOSAL_REF_RE.search(raw):
+            label, prev = spans[-1]
+            spans[-1] = (label, prev + " " + body)
+            taken.add(k)
+            continue
+        elif k > 0 and (k - 1) not in taken:
+            body = usable[k - 1][1].strip() + " " + body
+        taken.add(k)
+        spans.append((raw.strip(), body))
+    return spans
+
+def _gate_cards():
+    'Shared proposal/terminology gate: _gate_cards'
+    if not _GATE_CARDS:
+        _GATE_CARDS.append(ks.load_cards())
+    return _GATE_CARDS[0]
+
+def proposal_rank(query, cards):
+    'Shared proposal/terminology gate: proposal_rank'
+    import khms_recall_hybrid as hyb
+    top, meta = hyb.hybrid_rank(query, cards=cards, topn=PROPOSAL_TOPN)
+    channel = "lexical:fallback" if meta.get("dense_err") else "hybrid:%s" % hyb.MODEL
+    return [c for _s, _m, c in top], channel
+
+def clear_proposal_state(st):
+    'Shared proposal/terminology gate: clear_proposal_state'
+    st.pop("prop_seen", None)
+    st.pop("prop_shown", None)
+    st.pop("prop_turn", None)
+
+def stamp_prompt_turn(payload):
+    'Shared proposal/terminology gate: stamp_prompt_turn'
+    path, st = load_state(payload.get("session_id", ""))
+    st["prompt_t"] = now()
+    save_state(path, st)
+
+def _log_query(span_text):
+    words = re.sub(r"[|\s]+", " ", span_text).split()
+    return " ".join(words[:PROPOSAL_LOG_WORDS])
+
+def proposal_gate(texts, author, st, cards=None, log=True, turn=None):
+    'Shared proposal/terminology gate: proposal_gate'
+    seen = st.setdefault("prop_seen", {}).setdefault(author, {})
+    shown = st.setdefault("prop_shown", {}).setdefault(author, {})
+    turns = st.setdefault("prop_turn", {})
+    tkey = "%s|%s" % (author, turn[0]) if turn and turn[1] is not None else None
+    this_turn = turns.get(tkey) if tkey else None
+    if this_turn and this_turn.get("turn") != turn[1]:
+        this_turn = None
+    cited = set()
+    for _w, t in texts:
+        cited.update(re.findall(r"\bK-\d{5}\b", t or ""))
+    out, done = [], set()
+    for where, text in texts:
+        for label, body in proposal_spans(text):
+            q = re.sub(r"\s+", " ", body).strip()[:PROPOSAL_Q_CHARS]
+            fp = hashlib.sha1(ks.norm(q).encode("utf-8")).hexdigest()[:16]
+            if fp in done:
+                continue
+            done.add(fp)
+            sp = {"where": where, "label": label, "query": _log_query(q), "fp": fp,
+                  "top": [], "new": [], "lines": [], "channel": ""}
+            out.append(sp)
+            if fp in seen:
+                sp["tag"] = "REPEAT"
+                continue
+            if cards is None:
+                cards = _gate_cards()
+            top, sp["channel"] = proposal_rank(q, cards)
+            if this_turn and set(this_turn.get("cards", [])) & {c["id"] for c in top}:
+                sp["tag"], sp["top"] = "SHOWN", list(this_turn.get("cards", []))
+                continue
+            if log:
+                ks.log_query(sp["query"], [(0.0, [], c) for c in top],
+                             src="%s:%s" % (PROPOSAL_SRC, sp["channel"]))
+            sp["top"] = [c["id"] for c in top]
+            sp["new"] = [c["id"] for c in top if c["id"] not in shown and c["id"] not in cited]
+            sp["lines"] = ["%s%s %s" % (c["id"], "" if c.get("status") in ("active", "?")
+                                        else " [%s]" % c.get("status"),
+                                        re.sub(r"\s+", " ", c.get("first", ""))[:110])
+                           for c in top]
+            sp["tag"] = "NOHIT" if not top else "KNOWN" if not sp["new"] else "OPEN"
+    t = now()
+    opened = [sp for sp in out if sp["tag"] == "OPEN"]
+    for sp in opened:
+        seen[sp["fp"]] = t
+        for cid in sp["top"]:
+            shown[cid] = t
+    if opened and tkey:
+        prev = this_turn.get("cards", []) if this_turn else []
+        turns[tkey] = {"turn": turn[1], "cards": list(dict.fromkeys(
+            prev + [cid for sp in opened for cid in sp["top"]]))}
+    if not out:
+        return "EXEMPT", out
+    return ("DENY" if opened else "ALLOW"), out
+
+def proposal_log_spans(session, what, spans, _st=None):
+    'Shared proposal/terminology gate: proposal_log_spans'
+    for sp in spans:
+        tag = sp["tag"]
+        verdict = "DENY" if tag == "OPEN" else "ALLOW-" + tag
+        why = {"OPEN": "new cards %s (of %s)" % (",".join(sp["new"]), ",".join(sp["top"])),
+               "REPEAT": "same proposal already shown",
+               "KNOWN": "all %d cards shown or cited (%s)"
+                        % (len(sp["top"]), ",".join(sp["top"])),
+               "NOHIT": "recall found no card",
+               "SHOWN": "shown-this-turn %s" % ",".join(sp["top"])}[tag]
+        chan = (" [%s]" % sp["channel"]) if sp.get("channel") else ""
+        proposal_log(session, verdict, "%s: %s%s" % (what, why, chan), sp["label"])
+
+def proposal_deny_text(head, spans):
+    out = [head]
+    for sp in [s for s in spans if s["tag"] == "OPEN"][:PROPOSAL_MAX_SHOWN]:
+        out.append("- proposal %s (query: `%s`)" % (
+            re.sub(r"\s+", " ", sp["label"])[:90], sp["query"]))
+        out += ["    %s" % ln for ln in sp["lines"]]
+    out.append(PROPOSAL_DENY_TAIL)
+    return "\n".join(out)
+
+def _deny(event, reason):
+    print(json.dumps({"hookSpecificOutput": {
+        "hookEventName": event,
+        "permissionDecision": "deny",
+        "permissionDecisionReason": reason}}, ensure_ascii=False))
+
+def _term_rules():
+    'Shared proposal/terminology gate: _term_rules'
+    rules = []
+    try:
+        with open(TERM_GLOSSARY, encoding="utf-8") as fh:
+            for ln in fh:
+                s = ln.strip()
+                if not s or s.startswith("#") or "=>" not in s:
+                    continue
+                rx, term = (p.strip() for p in s.rsplit("=>", 1))
+                try:
+                    rules.append((re.compile(rx, re.I), term))
+                except re.error as exc:
+                    log("PreToolUse", "term-glossary", action="bad regex %r: %s" % (rx, exc))
+    except OSError:
+        return []
+    return rules
+
+def term_hits(text):
+    'Shared proposal/terminology gate: term_hits'
+    rules = _term_rules()
+    if not rules:
+        return []
+    body = _TERM_EXEMPT.sub(" ", text or "")
+    hits, seen = [], set()
+    for rx, term in rules:
+        for m in rx.finditer(body):
+            w = " ".join(m.group(0).split())
+            if w.lower() not in seen:
+                seen.add(w.lower())
+                hits.append((w, term))
+    return hits
+
+def run_term_gate(payload, event, exp):
+    'Shared proposal/terminology gate: run_term_gate'
+    if not exp.get("term_gate", True):
+        return False
+    hits = term_hits(_reply_text(payload))
+    if not hits:
+        return False
+    lines = "\n".join("- %s -> use %s" % (w, t) for w, t in hits)
+    _deny(event, TERM_DENY % lines)
+    log(event, "discord-reply", action="DENY (term: %s)"
+        % ", ".join("%s=>%s" % (w, t) for w, t in hits)[:200])
+    return True
+
+def run_proposal_gate(payload, event, exp):
+    'Shared proposal/terminology gate: run_proposal_gate'
+    if not exp.get("proposal_gate", True):
+        return False
+    session = payload.get("session_id", "")
+    path, st = load_state(session)
+    author = str(payload.get("agent_id") or "main")
+    verdict, spans = proposal_gate([("reply", _reply_text(payload))], author, st,
+                                   turn=("reply", st.get("turn_start")))
+    if verdict == "EXEMPT":
+        return False
+    save_state(path, st)
+    proposal_log_spans(session, "reply", spans)
+    if verdict != "DENY":
+        return False
+    _deny(event, proposal_deny_text(PROPOSAL_DENY_HEAD["reply"], spans))
+    log(event, "discord-reply", action="DENY (proposal: %d open)"
+        % sum(1 for s in spans if s["tag"] == "OPEN"))
+    return True
+
+def dispatch_texts(prompt, cwd=None):
+    'Shared proposal/terminology gate: dispatch_texts'
+    texts, errors, unresolved = [("prompt", str(prompt or ""))], [], []
+    for p in dispatch_brief_paths(prompt, cwd, unresolved):
+        try:
+            with open(p, encoding="utf-8", errors="replace") as fh:
+                texts.append(("brief " + p, fh.read()))
+        except OSError as exc:
+            errors.append((p, exc.__class__.__name__))
+    errors += [(t, "relativni cesta bez cwd") for t in unresolved]
+    return texts, errors
+
+def run_dispatch_proposal_gate(payload, exp):
+    'Shared proposal/terminology gate: run_dispatch_proposal_gate'
+    if not exp.get("proposal_gate", True):
+        return False
+    session = payload.get("session_id", "")
+    path, st = load_state(session)
+    ti = payload.get("tool_input") or {}
+    what = "dispatch %s" % re.sub(r"\s+", " ", str(ti.get("description")
+                                                   or ti.get("subagent_type") or "?"))[:60]
+    texts, errors = dispatch_texts(ti.get("prompt") or "", payload.get("cwd") or None)
+    for p, err in errors:
+        proposal_log(session, "ERROR->ALLOW",
+                     "%s: unreadable brief (%s, fail-open)" % (what, err), p)
+    verdict, spans = proposal_gate(texts, str(payload.get("agent_id") or "main"), st,
+                                   turn=("dispatch", st.get("prompt_t", st.get("turn_start"))))
+    if verdict == "EXEMPT":
+        proposal_log(session, "EXEMPT", "%s: bez navrhu" % what, "")
+        return False
+    save_state(path, st)
+    proposal_log_spans(session, what, spans)
+    if verdict != "DENY":
+        return False
+    where = ", ".join(sorted({s["where"] for s in spans if s["tag"] == "OPEN"}))
+    _deny("PreToolUse", proposal_deny_text(PROPOSAL_DENY_HEAD["dispatch"] % where, spans))
+    log("PreToolUse", what, action="DENY (proposal in brief: %d open)"
+        % sum(1 for s in spans if s["tag"] == "OPEN"))
+    return True
 
 def main():
     global EXP_TAG

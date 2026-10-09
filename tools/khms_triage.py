@@ -43,7 +43,7 @@ BRAIN = P.ROOT
 TOMB_DIR = f"{BRAIN}/memory/tombstones"
 LEDGER = f"{TOMB_DIR}/LEDGER.md"
 # The tombstone id counter. It lives BESIDE the ledger it numbers, not in tools/, so that a
-# restore of memory/ (brain_snapshot.sh --restore; the base is not in git) brings the ledger
+# per-file server restore of memory/ (the base is not in git) brings the ledger
 # and the number that must not collide with it back together.
 TS_COUNTER = f"{TOMB_DIR}/.next_ts_id"
 
@@ -384,7 +384,7 @@ def next_ts_id(ledger: list[dict] | None = None, counter: str = TS_COUNTER) -> s
     allocated back into that ledger, every call within one run read the same maximum: the
     2026-09-05 triage published seven proposals, all `TS-00001`, all
     `body=bodies/TS-00001.md`. The floor is still read because the base is not in git — a
-    ledger restored from a snapshot can be AHEAD of the counter, and reissuing a number that
+    ledger restored from a server file version can be AHEAD of the counter, and reissuing a number that
     already stands in the ledger would merge two different errors into one record.
     (`build_board.py` treats `.board_next_id` against the board the same way.)
     """

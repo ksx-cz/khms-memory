@@ -299,7 +299,9 @@ def test_the_kind_table_comes_from_private_patterns_and_keeps_ids(tmp_path):
     priv = subprocess.run([sys.executable, "-c", code], env=dict(base, KHMS_PATTERNS=str(pat)),
                           capture_output=True, text=True)
     assert eng.returncode == 0 and priv.returncode == 0, eng.stderr + priv.stderr
-    assert eng.stdout.count("'decision'") == 1 and "entscheidung" not in eng.stdout
+    # New #209 policy: unfamiliar non-status kinds stay visible; aliases still
+    # decide the canonical name (and therefore preserve deployment IDs).
+    assert eng.stdout.count("'decision'") == 1 and eng.stdout.count("'entscheidung'") == 1
     assert priv.stdout.count("'entscheidung'") == 2, priv.stdout
     importlib.import_module("mark_ledger")
 
@@ -380,7 +382,7 @@ def test_the_weekly_waits_for_a_running_night_and_holds_the_code_lock(tmp_path):
     holder = subprocess.Popen(["flock", "-x", str(lock), "sleep", "30"], start_new_session=True)
     try:
         time.sleep(0.3)
-        r = run_week(tmp_path, root, WEEKLY_NIGHT_WAIT_MIN="0")
+        r = run_week(tmp_path, root, WEEKLY_NIGHT_WAIT_MIN="0", KHMS_NIGHTLY_LOCK=str(lock))
     finally:
         os.killpg(holder.pid, 9)
         holder.wait()

@@ -21,7 +21,7 @@ Every writer that hands out an id -- new_card.sh, approve_inbox.py, the tombston
 The counter is never moved backwards, and nothing else in the code writes it.
 """
 import fcntl
-import glob
+import khms_files as glob
 import os
 import re
 import sys
@@ -100,7 +100,7 @@ def reserve(kind="card", n=1, floor_extra=0, path=None):
     spec = KINDS.get(kind) or {}
     # absolute: a bare relative counter name (`--tomb-counter ctr`) has no dirname to create
     path = os.path.abspath(path or counter_path(kind))
-    os.makedirs(P.SHARED_STATE, exist_ok=True)
+    os.makedirs(P.RUNTIME, mode=0o700, exist_ok=True)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(P.ALLOC_LOCK, "a+") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)

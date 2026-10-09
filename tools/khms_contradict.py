@@ -1074,13 +1074,20 @@ JUDGE_IN_TOKEN_ALLOWANCE = 16000    # tokens the CLI may add beyond prompt + sys
 # judge name -> the model id its `--model` alias bills as. sonnet = claude-sonnet-5, measured
 # (TRIAGESONNET modelUsage). haiku's id is NOT measured: under a bound its price is unknown and
 # every attempt is refused (an unknown price is never $0).
-CLAUDE_MODEL_IDS = {"sonnet": "claude-sonnet-5"}
+CLAUDE_MODEL_IDS = {"sonnet": "claude-sonnet-5-5"}
 JUDGE_BUDGET = None                 # a JudgeBudget, or None = no bound (the evaluators)
 
 
 class JudgeBudgetStop(Exception):
     """The bound refused an attempt. Deliberately NOT an OSError: the retry loop must not
     read it as a failed call and retry it."""
+
+
+USAGE_LIMIT_RE = re.compile(r"hit your [a-z0-9 -]*limit|usage limit reached", re.I)
+
+
+class JudgeUsageLimit(JudgeBudgetStop):
+    """An account limit is terminal for this run, never a transient retry."""
 
 
 class JudgeBudget:
@@ -1237,6 +1244,9 @@ def _post_claude(prompt, timeout=None, model=None):
     if budget is not None:
         c = r.get("total_cost_usd")
         budget.settle(w, None if c is None else float(c))
+    if not ok and USAGE_LIMIT_RE.search(str(r.get("result") or "")):
+        raise JudgeUsageLimit(f"the account's usage limit answered claude -p --model {model} "
+                              f"({str(r.get('result'))[:160]}) -- no further judge call tonight")
     if not ok:
         raise ClaudeJudgeError(f"claude -p --model {model} rc={cp.returncode} is_error="
                                f"{r.get('is_error')}: {str(r.get('result'))[:200]}")

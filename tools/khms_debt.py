@@ -24,7 +24,7 @@ never reached), and cards vs cards ever touched (what retrieval never served).
 """
 import argparse
 import datetime as dt
-import glob
+import khms_files as glob
 import os
 import re
 import sys

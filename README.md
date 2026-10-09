@@ -1,7 +1,7 @@
 # KHMS — a file-based long-term memory an agent can install into itself
 
 KHMS ("know-how management system") is a long-term memory for LLM agents made of plain
-markdown files — in a git repository, or in a plain directory with hardlinked snapshots for
+markdown files — in a plain directory with server-side file version history for
 the deployments that will not put their memory in a repository at all. Every piece of knowledge is one immutable **card** with
 YAML frontmatter — what kind of knowledge it is, how strongly it is evidenced, where it came
 from, and which other cards it is derived from, supports or contradicts. Cards are never
@@ -75,3 +75,36 @@ KHMS's answers, in one line each:
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+### One shared base, separate agents
+
+Set `KHMS_SHARED=1` in the base's configuration, with one absolute `KHMS_RUNTIME`
+outside the synchronized root. Each agent must supply its own `KHMS_STATE`, also
+outside the root. Runtime locks and the embedding cache are host-local; counters,
+night/week checkpoints, review markers and approval receipts live in
+`KHMS_SHARED_STATE` and travel with the base. Shared paths cannot be overridden by
+one agent's environment. An initialized shared base with no canonical cards is a
+failure, not a fresh base to recreate.
+
+Approval, triage and errata hold the same card lock from validation through the
+last write. Approval receipts reserve IDs once and support retry after a partial
+write; a different input for the same unfinished unit is refused. View builders
+hold that lock while reading and publishing complete files. A durable dirty mark
+survives a crash before the rebuild. Conflicted copies are reported and excluded
+from retrieval, pending review, allocation and export.
+
+Recall prints matching unreviewed journal findings in a separate evidence section;
+they are not approved cards. Proposal gates show relevant recall results once per
+author context; terminology rules can be supplied with `KHMS_TERM_GLOSSARY`.
+`khms_review_state.py` supplies the pending census. `khms_review_ping.sh --deputy`
+delegates delivery to the explicitly configured `KHMS_PING_DEPUTY` command.
+
+There are no local snapshots or pre-write backups. `khms_versions.py` lists and
+reads retained Nextcloud versions, and restores an explicitly selected version
+with byte verification. Configure `KHMS_DAV_URL` (including `/remote.php/dav`),
+`KHMS_DAV_USER`, `KHMS_DAV_BASE` and `KHMS_DAV_NETRC`. Credentials are read only by
+curl from that file. A listed but unreadable version is not recovery evidence.
+Restore while writers are paused, reconcile the counter and tombstone ledger,
+check the review hashes, and rebuild the views before resuming. Per-file history
+is not an atomic history of the whole base. Missing history remains unavailable;
+it cannot be reconstructed as evidence from a derived packet or today's card.

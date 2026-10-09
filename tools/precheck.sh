@@ -17,8 +17,8 @@ if khms_may_write "$LOG"; then
   mkdir -p "$(dirname "$LOG")" && echo "$(date -Is) $*" >> "$LOG"
 fi
 
-KHMS_KNOW="$ROOT/memory/know" python3 - "$@" <<'PY'
-import glob, os, re, sys, yaml
+PYTHONPATH="$KHMS_CODE${PYTHONPATH:+:$PYTHONPATH}" KHMS_KNOW="$ROOT/memory/know" python3 - "$@" <<'PY'
+import khms_files as glob, os, re, sys, yaml
 tags = set(sys.argv[1:])
 hits = []
 for path in sorted(glob.glob(os.path.join(os.environ["KHMS_KNOW"], "K-*.md"))):

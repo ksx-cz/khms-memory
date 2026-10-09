@@ -14,20 +14,20 @@
 
 KHMS_CODE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 
-_KHMS_KEYS=(KHMS_ROOT KHMS_CONFIG_FILE KHMS_CONFIG_DIR KHMS_STATE KHMS_SHARED_STATE KHMS_READ_ONLY
+_KHMS_KEYS=(KHMS_ROOT KHMS_CONFIG_FILE KHMS_CONFIG_DIR KHMS_STATE KHMS_SHARED_STATE KHMS_SHARED KHMS_RUNTIME KHMS_READ_ONLY
   KHMS_RECALL_LOG KHMS_RECALL_JSONL KHMS_INJECT_LOG KHMS_PRECHECK_LOG KHMS_CLAIM_LOG KHMS_PROPOSAL_LOG KHMS_STOP_LOG
   KHMS_RECALL_INTENT KHMS_HOOK_STATE
   KHMS_HOOKS_OFF_FILE KHMS_LEN_CACHE KHMS_EXPERIMENT KHMS_GLOSSARY KHMS_DIRECTIVE KHMS_EMBED_DIR
-  KHMS_EMBED_PY KHMS_DENSE_SOCKET KHMS_HF_HOME KHMS_SNAPSHOT_ROOT KHMS_TRANSCRIPTS KHMS_MESSAGES KHMS_PATTERNS
+  KHMS_EMBED_PY KHMS_DENSE_SOCKET KHMS_HF_HOME KHMS_TERM_GLOSSARY KHMS_REPO KHMS_REPO_INCLUDE KHMS_DAV_URL KHMS_DAV_USER KHMS_DAV_BASE KHMS_DAV_NETRC KHMS_TRANSCRIPTS KHMS_MESSAGES KHMS_PATTERNS
   KHMS_NIGHTLY_LOCK KHMS_WEEKLY_LOCK KHMS_NIGHT_STAMP KHMS_WEEK_STAMP KHMS_SWEEP_FAILED KHMS_NIGHT_LOG
   KHMS_AGENT KHMS_AGENT_TRANSCRIPTS KHMS_SWEEP_MODEL KHMS_MARK_MODEL KHMS_CONS_MODEL
   KHMS_WEEK_PART_MODEL KHMS_WEEK_MODEL KHMS_PROJECT_SLUG KHMS_GIT_REPOS KHMS_CHAT_FETCH KHMS_CHAT_VERIFY
   KHMS_NIGHT_TRIAGE KHMS_SPEC KHMS_PRINCIPAL KHMS_PROMPT_EXT KHMS_ACCOUNT_DIR
-  KHMS_PING_SEND KHMS_PING_EXTRA KHMS_JUDGE KHMS_JUDGE_MAX_USD KHMS_LLM_URL KHMS_LLM_MODEL
+  KHMS_PING_DEPUTY KHMS_PING_SEND KHMS_PING_EXTRA KHMS_JUDGE KHMS_JUDGE_MAX_USD KHMS_LLM_URL KHMS_LLM_MODEL
   KHMS_REPORT_TOOL KHMS_REPORT_CHANNEL KHMS_REPORT_SERVER)
 declare -gA _KHMS_DEFAULT=(
   [KHMS_CONFIG_FILE]="" [KHMS_CONFIG_DIR]='${KHMS_ROOT}/config' [KHMS_STATE]='${KHMS_ROOT}/state'
-  [KHMS_SHARED_STATE]='${KHMS_ROOT}/state/shared' [KHMS_READ_ONLY]="0"
+  [KHMS_SHARED]="0" [KHMS_RUNTIME]="" [KHMS_SHARED_STATE]='${KHMS_ROOT}/state/shared' [KHMS_READ_ONLY]="0"
   [KHMS_RECALL_LOG]='${KHMS_STATE}/recall.log' [KHMS_RECALL_JSONL]='${KHMS_STATE}/recall.jsonl'
   [KHMS_INJECT_LOG]='${KHMS_STATE}/inject.log' [KHMS_PRECHECK_LOG]='${KHMS_STATE}/precheck.log'
   [KHMS_CLAIM_LOG]='${KHMS_STATE}/claim_gate.log' [KHMS_PROPOSAL_LOG]='${KHMS_STATE}/proposal_gate.log'
@@ -35,10 +35,10 @@ declare -gA _KHMS_DEFAULT=(
   [KHMS_HOOK_STATE]='${KHMS_STATE}/hook-state'
   [KHMS_HOOKS_OFF_FILE]='${KHMS_STATE}/hooks-off' [KHMS_LEN_CACHE]='${KHMS_STATE}/cardlen.json'
   [KHMS_EXPERIMENT]='${KHMS_CONFIG_DIR}/khms_experiment.json' [KHMS_GLOSSARY]="" [KHMS_DIRECTIVE]=""
-  [KHMS_EMBED_DIR]='${KHMS_SHARED_STATE}/embed' [KHMS_EMBED_PY]="" [KHMS_DENSE_SOCKET]=""
-  [KHMS_HF_HOME]="" [KHMS_SNAPSHOT_ROOT]="" [KHMS_TRANSCRIPTS]=""
+  [KHMS_EMBED_DIR]='${KHMS_RUNTIME}/embed' [KHMS_EMBED_PY]="" [KHMS_DENSE_SOCKET]=""
+  [KHMS_TERM_GLOSSARY]="" [KHMS_REPO]="" [KHMS_REPO_INCLUDE]="*" [KHMS_DAV_URL]="" [KHMS_DAV_USER]="" [KHMS_DAV_BASE]="" [KHMS_DAV_NETRC]="" [KHMS_HF_HOME]="" [KHMS_TRANSCRIPTS]=""
   [KHMS_MESSAGES]='${KHMS_CONFIG_DIR}/messages.env' [KHMS_PATTERNS]='${KHMS_CONFIG_DIR}/patterns.env'
-  [KHMS_NIGHTLY_LOCK]='${KHMS_SHARED_STATE}/nightly.lock' [KHMS_WEEKLY_LOCK]='${KHMS_SHARED_STATE}/weekly.lock'
+  [KHMS_NIGHTLY_LOCK]='${KHMS_RUNTIME}/nightly.lock' [KHMS_WEEKLY_LOCK]='${KHMS_RUNTIME}/weekly.lock'
   [KHMS_NIGHT_STAMP]='${KHMS_SHARED_STATE}/last-nightly' [KHMS_WEEK_STAMP]='${KHMS_SHARED_STATE}/last-weekly'
   [KHMS_SWEEP_FAILED]='${KHMS_SHARED_STATE}/sweep-failed' [KHMS_NIGHT_LOG]='${KHMS_STATE}/nightly.log'
   [KHMS_AGENT]="claude"
@@ -46,7 +46,7 @@ declare -gA _KHMS_DEFAULT=(
   [KHMS_CONS_MODEL]="sonnet" [KHMS_WEEK_PART_MODEL]="sonnet" [KHMS_WEEK_MODEL]="opus"
   [KHMS_PROJECT_SLUG]="" [KHMS_GIT_REPOS]="" [KHMS_CHAT_FETCH]="" [KHMS_CHAT_VERIFY]="" [KHMS_NIGHT_TRIAGE]=""
   [KHMS_SPEC]="" [KHMS_PRINCIPAL]="the principal" [KHMS_PROMPT_EXT]='${KHMS_CONFIG_DIR}/prompts' [KHMS_ACCOUNT_DIR]=""
-  [KHMS_PING_SEND]="" [KHMS_PING_EXTRA]="" [KHMS_JUDGE]="sonnet" [KHMS_JUDGE_MAX_USD]=""
+  [KHMS_PING_DEPUTY]="" [KHMS_PING_SEND]="" [KHMS_PING_EXTRA]="" [KHMS_JUDGE]="sonnet" [KHMS_JUDGE_MAX_USD]=""
   [KHMS_LLM_URL]="" [KHMS_LLM_MODEL]="qwen3-coder-next:latest"
   [KHMS_REPORT_TOOL]="" [KHMS_REPORT_CHANNEL]=""
   [KHMS_REPORT_SERVER]="")
@@ -97,6 +97,9 @@ _khms_resolve() { # _khms_resolve KEY STACK
   if [ "$key" = KHMS_CONFIG_FILE ] && [ -n "$_KHMS_ROOT_RESOLVED" ]; then printf '%s' "$_KHMS_CFG_RESOLVED"; return 0; fi
   if [ -n "${!key:-}" ]; then printf '%s' "${!key}"; return 0; fi
   if [ -n "${_KHMS_RAW[$key]:-}" ]; then _khms_expand "${_KHMS_RAW[$key]}" "$stack"; return $?; fi
+  if [ "$key" = KHMS_RUNTIME ]; then
+    python3 "$KHMS_CODE/khms_runtime.py" "$_KHMS_ROOT_RESOLVED"; return $?
+  fi
   if [ -n "${_KHMS_DEFAULT[$key]+x}" ] && [ "$key" != KHMS_ROOT ]; then
     _khms_expand "${_KHMS_DEFAULT[$key]}" "$stack"; return $?
   fi
@@ -145,6 +148,9 @@ khms_load() {     # discover root and settings file; rc 3 with a reason when imp
   _KHMS_ROOT_RESOLVED="$root"; _KHMS_CFG_RESOLVED="$cfg"
   local ro; ro="$(_khms_resolve KHMS_READ_ONLY KHMS_READ_ONLY)" || return 3
   case "$ro" in 0|1) ;; *) _khms_err "KHMS_READ_ONLY must be 0 or 1, got: $ro"; return 3 ;; esac
+  if [ "$(_khms_resolve KHMS_SHARED KHMS_SHARED)" = 1 ]; then
+    python3 "$KHMS_CODE/khms_paths.py" --root >/dev/null || return 3
+  fi
 }
 
 khms_get() {      # khms_get KEY -> resolved value on stdout (khms_load first)
@@ -165,7 +171,7 @@ khms_may_write() {   # khms_may_write PATH -> rc 0 when this deployment may appe
   local ro p k b; ro="$(khms_get KHMS_READ_ONLY)" || return 3
   [ "$ro" = 1 ] || return 0
   p="$(realpath -m -- "$1")"
-  for k in KHMS_ROOT KHMS_CONFIG_DIR KHMS_SHARED_STATE; do
+  for k in KHMS_ROOT KHMS_CONFIG_DIR KHMS_SHARED_STATE KHMS_RUNTIME; do
     b="$(khms_get "$k")" || return 3; b="$(realpath -m -- "$b")"
     [ "$p" = "$b" ] && return 1
     case "$p" in "${b%/}/"*) return 1 ;; esac

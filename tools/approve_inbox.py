@@ -8,6 +8,8 @@ Usage: approve_inbox.py [--dry-run] file.md [file2.md ...]
 Run ONLY after human/smart review of the input files (P6). Validate with build_views.py afterwards.
 """
 import re
+import hashlib
+import json
 import subprocess
 import sys
 import os
@@ -15,41 +17,15 @@ import os
 import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import build_views
 import khms_lint  # noqa: E402
 import khms_alloc  # noqa: E402
+import khms_lock as L
 import khms_paths as P  # noqa: E402
 
 BRAIN = P.ROOT
-REAL_BRAIN = BRAIN            # tests rebind BRAIN; this stays the real one, see snapshot_first
 KNOW = os.path.join(BRAIN, "memory", "know")
 
-
-def snapshot_first(tag):
-    """Take a rollback point before the first card is written (audit 2026-09-02 §6 A1).
-
-    THE BASE IS NOT IN GIT — the owner's rule — so "undo the approve" means "copy the file
-    back out of a snapshot", and the snapshot has to exist BEFORE the write. The one moment
-    that is true is here: after every refusal has had its say, before the first id is spent.
-    (The audit's own incident: khms_dedup.py rewrote eleven cards, and what saved them was a
-    snapshot somebody happened to take by hand that morning. Nothing should depend on that.)
-
-    Silent no-op for a throwaway brain — the tests rebind BRAIN — and for KHMS_NO_SNAPSHOT=1.
-    A snapshot that FAILS never blocks the approve, but it is said out loud: "this run has no
-    rollback point" is the first thing a reviewer needs to know, not the last.
-    """
-    if os.environ.get("KHMS_NO_SNAPSHOT") == "1" or BRAIN != REAL_BRAIN:
-        return
-    script = os.path.join(P.CODE, "khms_snapshot.sh")
-    if not os.path.exists(script):
-        print(f"WARN: {script} is missing — writing WITHOUT a rollback point", file=sys.stderr)
-        return
-    r = subprocess.run(["bash", script, "--tag", tag], capture_output=True,
-                       text=True, timeout=900)
-    if r.returncode == 0:
-        print((r.stdout or "").strip().splitlines()[0], file=sys.stderr)
-    else:
-        print(f"WARN: snapshot rc={r.returncode} — NO rollback point for this run: "
-              f"{(r.stderr or '').strip()[:200]}", file=sys.stderr)
 
 def unit_of(approve_file):
     """The inbox unit an approve/converted file was made from:
@@ -60,18 +36,21 @@ def unit_of(approve_file):
 
 
 def write_review_marker(approve_file):
+    """Close the review of the unit `approve_file` came from.  An existing unit goes through
+    mark_ledger.close_unit_review — the same path as `mark_ledger.py mark-reviewed` — so its
+    NOT CARDED verdicts are recorded with the close (#209 A4: without that the night queued
+    those marks again, 235 of them on 2 nights)."""
     stem, unit = unit_of(approve_file)
     if not re.match(r"^\d{4}-\d{2}-\d{2}", stem):
         return None
-    os.makedirs(P.REVIEW_MARKERS, exist_ok=True)
-    marker = os.path.join(P.REVIEW_MARKERS, f".reviewed-{stem}-cards")
-    body = ""
     if os.path.exists(unit):
-        import hashlib
-        h = hashlib.sha256(open(unit, "rb").read()).hexdigest()
-        body = f"sha256={h}\nunit=memory/inbox/{stem}.md\napprove={os.path.basename(approve_file)}\n"
-    with open(marker, "w", encoding="utf-8") as fh:
-        fh.write(body)
+        import mark_ledger
+        marker, _ = mark_ledger.close_unit_review(
+            mark_ledger.Paths(BRAIN), unit, "approve_inbox",
+            {"approve": os.path.basename(approve_file)}, prog="approve")
+        return marker
+    marker = os.path.join(P.REVIEW_MARKERS, f".reviewed-{stem}-cards")
+    L.atomic_text(marker, "")
     return marker
 
 
@@ -300,7 +279,9 @@ def parse_cards(text, skipped=None, unknown_links=None):
     return cards
 
 
-def main():
+def _main_locked():
+    import khms_health
+    khms_health.require_healthy(BRAIN)
     dry = "--dry-run" in sys.argv
     if not dry:
         P.require_writable("approve cards")
@@ -308,6 +289,52 @@ def main():
     if not files:
         print(__doc__)
         sys.exit(2)
+    identity = hashlib.sha256()
+    for path in files:
+        _, unit = unit_of(path)
+        identity.update(os.path.realpath(unit).encode() + b"\0" + open(path, 'rb').read())
+        if os.path.isfile(unit):
+            identity.update(open(unit, 'rb').read())
+    receipt = os.path.join(P.SHARED_STATE, 'approvals', identity.hexdigest() + '.json')
+    previous = json.loads(open(receipt).read()) if os.path.isfile(receipt) else None
+    units = sorted({os.path.realpath(unit_of(path)[1]) for path in files})
+    approval_dir = os.path.dirname(receipt)
+    if os.path.isdir(approval_dir):
+        for other in os.listdir(approval_dir):
+            other_path = os.path.join(approval_dir, other)
+            if not other.endswith('.json') or other_path == receipt:
+                continue
+            old = json.loads(open(other_path).read())
+            if not old.get('complete') and set(old.get('units', [])) & set(units):
+                print('REFUSED: this inbox unit has a partial approval with different input; '
+                      'reconcile receipt ' + other_path, file=sys.stderr)
+                sys.exit(1)
+    input_hashes = {path: hashlib.sha256(open(path, 'rb').read()).hexdigest()
+                    for path in set(files + units) if os.path.isfile(path)}
+
+    def inputs_unchanged():
+        if any(hashlib.sha256(open(path, 'rb').read()).hexdigest() != digest
+               for path, digest in input_hashes.items()):
+            raise RuntimeError('approval input changed during transaction; no reviewed marker written')
+
+    if previous and previous.get('complete'):
+        print('already approved: receipt ' + identity.hexdigest())
+        return
+    reviewed = []
+    for path in files:
+        stem, unit = unit_of(path)
+        marker = os.path.join(P.REVIEW_MARKERS, f'.reviewed-{stem}-cards')
+        if os.path.isfile(unit) and os.path.isfile(marker):
+            unit_hash = hashlib.sha256(open(unit, 'rb').read()).hexdigest()
+            reviewed.append(f'sha256={unit_hash}' in open(marker).read().splitlines())
+        else:
+            reviewed.append(False)
+    if all(reviewed):
+        print('already reviewed: identical inbox unit hash')
+        return
+    if any(reviewed):
+        print('REFUSED: mixed reviewed and unreviewed units; separate the inputs', file=sys.stderr)
+        sys.exit(1)
     all_cards = []
     skipped = []
     withheld, unknown_links = [], []
@@ -352,6 +379,19 @@ def main():
         print("   Fix them and re-run with ONLY those cards — the ones below are "
               "already written.")
 
+    schema = []
+    for meta, _ in all_cards:
+        view = dict(meta)
+        links = dict(meta.get('links') or {}) if isinstance(meta.get('links'), dict) else {}
+        stray = meta.get('derived_from')
+        if stray:
+            links['derived_from'] = list(links.get('derived_from') or []) + (stray if isinstance(stray, list) else [stray])
+        view['links'] = links
+        schema += [f"{meta.get('id')}: {problem}" for problem in build_views.card_problems(view)[0]]
+    if schema or skipped:
+        print('REFUSED: invalid input; no ids allocated: ' + '; '.join(schema), file=sys.stderr)
+        sys.exit(1)
+
     # A correction with no edge is a correction that will never be reached: the
     # retrieval layer follows links, and a card opening with "CORRECTED …" that
     # carried none once left the cards it corrects being recited to the principal
@@ -363,6 +403,8 @@ def main():
     # retracted — the nightly re-deriving it from the journal, or a quote of it — is refused
     # the same way (khms_lint R1/R2), so an erratum cannot be undone by the next sweep.
     retracted = khms_lint.load_retracted(BRAIN)
+    for flag in khms_lint.flag_batch([(str(m["id"]), m, b) for m, b in all_cards]):
+        print("FLAG (reviewer decides): " + flag)
     problems = khms_lint.lint_batch(
         [(str(m["id"]), m, b) for m, b in all_cards], known, retracted,
         {t["ts"] for t in retracted})
@@ -374,15 +416,19 @@ def main():
             print(f"   {p}")
         sys.exit(1)
 
-    if not dry:
-        snapshot_first("pre-approve")
 
     # One locked reservation for the whole batch, persisted BEFORE any card is written (khms_alloc.py):
     # a second writer on the same base -- another agent, another clone -- can never receive these ids.
     if dry:
         cur = khms_alloc.peek("card")
     else:
-        cur = khms_alloc.reserve("card", len(all_cards))[0]
+        inputs_unchanged()
+        L.dirty(BRAIN)
+        if previous:
+            cur = previous['first']
+        else:
+            cur = khms_alloc.reserve("card", len(all_cards))[0]
+            L.atomic_text(receipt, json.dumps({'first': cur, 'complete': False, 'units': units}) + '\n')
     mapping = {}
     for meta, _ in all_cards:
         mapping[str(meta["id"])] = f"K-{cur:05d}"
@@ -431,10 +477,10 @@ def main():
         if dry:
             print(f"DRY {old} -> {meta['id']}")
         else:
-            if os.path.exists(path):
-                print(f"ERROR: {path} exists — counter desync?", file=sys.stderr)
+            if os.path.exists(path) and open(path, encoding="utf-8").read() != out:
+                print(f"ERROR: {path} differs from the pending approval — reconcile receipt", file=sys.stderr)
                 sys.exit(1)
-            open(path, "w", encoding="utf-8").write(out)
+            L.atomic_text(path, out)
             written += 1
     if not dry:
         n_marked, notes = mark_superseded(supersede_edges)
@@ -452,6 +498,7 @@ def main():
         # named after the inbox UNIT the approve file came from (DATE, DATE-weekly, or a
         # published batch <night>-bNN) and carries the unit's sha256, so a later batch is a
         # new unit and anything appended to this one after the review un-reviews it.
+        inputs_unchanged()
         for f in files:
             write_review_marker(f)
         mpath = os.path.join(BRAIN, "memory", "inbox", ".staging", "last-mapping.txt")
@@ -471,6 +518,19 @@ def main():
     # code must not read a partial import as a finished one.
     if skipped:
         sys.exit(1)
+    if not dry:
+        L.atomic_text(receipt, json.dumps({'first': cur - len(all_cards), 'complete': True, 'units': units}) + '\n')
+
+
+def main():
+    if '--dry-run' in sys.argv:
+        return _main_locked()
+    P.require_writable('approve cards')
+    with L.lock('cards', BRAIN):
+        result = _main_locked()
+    # A failed build leaves views-dirty, so stale generated data is never reported fresh.
+    subprocess.run([sys.executable, os.path.join(P.CODE, 'build_views.py')], check=True)
+    return result
 
 
 if __name__ == "__main__":

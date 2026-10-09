@@ -147,7 +147,8 @@ class ReaderCannotWrite(unittest.TestCase):
     @classmethod
     def writer_env(cls, **kw):
         e = {"PATH": os.environ["PATH"], "HOME": cls.home, "KHMS_ROOT": cls.root, "KHMS_NO_SNAPSHOT": "1",
-             "PYTHONDONTWRITEBYTECODE": "1"}
+             "PYTHONDONTWRITEBYTECODE": "1",
+             "KHMS_EMBED_DIR": os.path.join(cls.root, "state", "shared", "embed")}
         e.update(kw)
         return e
 

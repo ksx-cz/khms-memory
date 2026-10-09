@@ -1099,9 +1099,10 @@ def selfcheck(path, expected, registry):
 
     The point is that this is the parser that will actually read the file, not a
     reimplementation of it: a check that passes for reasons unrelated to the
-    thing it guards is worth nothing.  Returns a list of problems.
+    thing it guards is worth nothing (K-90585).  Returns a list of problems.
     """
-    import approve_inbox          # beside this file (sys.path above)
+    import approve_inbox
+    import build_views
 
     skipped, problems = [], []
     parsed = approve_inbox.parse_cards(open(path, encoding="utf-8").read(), skipped)
@@ -1111,27 +1112,22 @@ def selfcheck(path, expected, registry):
         problems.append(f"{cid}: approve_inbox could not parse it: {err}")
     for meta, body in parsed:
         cid = meta.get("id", "?")
-        for key in ("id", "type", "level", "status", "tags", "scope", "date", "links"):
+        # The per-card gate build_views.py applies at the door — required keys,
+        # level/status, §4.2's closed type set and its type/level pair, derived
+        # without derived_from, observation without evidence — from build_views
+        # itself, not a copy (package PAPPR, #209); approve_inbox runs the same
+        # function before it allocates an id.  New cards: no legacy exception.
+        problems += [f"{cid}: {p}" for p in build_views.card_problems(meta)[0]]
+        # What the converter demands ON TOP of the door: its output always has an
+        # id and a links block, and an observation names its source and evidence.
+        for key in ("id", "links"):
             if key not in meta:
                 problems.append(f"{cid}: missing '{key}'")
-        # §4.2 is a CLOSED set at approve time: the set is open in the spec's
-        # sense (adding a type = a decision card + a row in the table), but a
-        # type nobody added is a type no tool knows, and cards are immutable
-        # once approved.  build_views.py refuses the same thing at the door.
-        ctype = meta.get("type")
-        if ctype not in SPEC_TYPES:
-            problems.append(f"{cid}: type '{ctype}' is not one of §4.2's nine types "
-                            f"— see the report row for which half of it broke")
-        elif meta.get("level") not in (LEVEL_OF_TYPE[ctype], "assumption"):
-            problems.append(f"{cid}: type '{ctype}' is a {LEVEL_OF_TYPE[ctype]}-level "
-                            f"type (§4.2) but level is '{meta.get('level')}'")
         if meta.get("level") == "observation":
-            for key in ("evidence", "source"):
-                if not meta.get(key):
-                    problems.append(f"{cid}: observation without '{key}'")
-        if meta.get("level") == "derived" and not (meta.get("links") or {}).get("derived_from"):
-            problems.append(f"{cid}: derived card with empty derived_from "
-                            f"(build_views.py will hard-fail on this)")
+            if not meta.get("source"):
+                problems.append(f"{cid}: observation without 'source'")
+            if "evidence" in meta and not meta.get("evidence"):
+                problems.append(f"{cid}: observation with an empty 'evidence'")
         for t in meta.get("tags") or []:
             if t not in registry:
                 problems.append(f"{cid}: tag '{t}' is not in the registry")

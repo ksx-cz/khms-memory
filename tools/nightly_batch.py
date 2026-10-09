@@ -24,7 +24,7 @@ first thing the next night does.  Nothing is dropped and nothing is redone.
           would hide every card after it)
     count FILE                                   -> number of candidates
 
-THE PER-BATCH TRANSACTION (Diblin review of #209 part A, 2026-10-01, P1-2/P1-4).
+THE PER-BATCH TRANSACTION (Independent review of #209 part A, 2026-10-01, P1-2/P1-4).
 "Merge into the inbox, then move the batch out of carry" was two writes; a kill
 between them left the batch to be consolidated again and merged again (a label
 clash was renamed, never recognised).  Now every step is idempotent and keyed
@@ -38,7 +38,8 @@ by a stable BATCH ID, so a run killed anywhere repeats nothing that finished:
     publish SRC --unit U --batch-id ID --record R [--relabel-base N]
           creates the inbox unit U from SRC with an exclusive link (never an
           overwrite), then records ID in R.  U already there with the same
-          content = no-op; with different content = refusal (rc 3).
+          content = no-op; with different content = refusal (rc 3); a card
+          with a malformed header (card_header.py) = refusal (rc 5), no unit.
     published ID --unit U --record R [--src S --relabel-base N]
           rc 0 VERIFIED (unit + manifest + sha, and S's normalised content when
           given), 10 ABSENT, 3 CONFLICT, 4 MISSING/error — see verify().  The
@@ -62,12 +63,29 @@ SECTION_RE = re.compile(r"^## +(.+?)\s*$")
 NOT_CARDED = "## MARKS NOT CARDED"
 
 
+# TRAILER SECTIONS KEEP THEIR CARDS (PDRAIN, #209). `## DROPPED (no valid RELATION)` and
+# `## DEFERRED` (tools/verify_relations.py) hold candidates the gate MOVED out of the proposal, and
+# the converter never reads past such a heading (convert_inbox2.TRAILERS). Until 2026-10-06 this
+# parser took every `### C<n>` line for a card wherever it stood, so publish/merge pulled every
+# gate-dropped candidate back under `## Cards` — the relation gate was undone by the very step that
+# published its result. A card line inside a trailer section now stays in that section.
+TRAILER_HEADS = ("## flagged", "## dropped", "## already carded", "## suspected",
+                 "## condense-confirmed", "## experiments", "## stats", "## new-tags",
+                 "## deferred", "## marks not carded")
+
+
+def is_trailer(heading):
+    h = heading.strip().lower()
+    return any(h.startswith(t) for t in TRAILER_HEADS)
+
+
 def parse(text):
     """-> (preamble, [card blocks], [(heading, content)])."""
     pre, cards, sections = [], [], []
     cur = None          # ("card", lines) | ("sec", heading, lines)
+    in_trailer = False
     for line in text.splitlines(keepends=True):
-        if CAND_RE.match(line):
+        if CAND_RE.match(line) and not in_trailer:
             cur = ["card", [line]]
             cards.append(cur)
             continue
@@ -75,9 +93,11 @@ def parse(text):
         if sm and not line.startswith("###"):
             if sm.group(1).strip().lower().rstrip(":") == "cards":
                 cur = None          # the cards container heading itself
+                in_trailer = False
                 continue
             cur = ["sec", line.rstrip("\n"), []]
             sections.append(cur)
+            in_trailer = is_trailer(line)
             continue
         if cur is None:
             pre.append(line)
@@ -370,16 +390,30 @@ def is_published(batch_id, unit, record, src=None, base=0):
         return False
 
 
+RC_HEADER = 5         # publish refused: a malformed card header (card_header.py)
+
+
 def publish(src, unit, batch_id, record, base=0):
     """-> (rc, message).  Exclusive create of `unit` + a manifest line; idempotent.
     rc 0 = the unit is verified as this batch's output; rc 3 = conflict or missing
-    artefact, nothing was overwritten and the batch stays in carry."""
+    artefact, nothing was overwritten and the batch stays in carry; rc 5 = a card header
+    is malformed (card_header.check_text), no unit was created, the batch stays in carry."""
     state, msg = verify(batch_id, unit, record, src, base)
     if state == VERIFIED:
         return 0, msg.replace("verify:", "publish:", 1) + " — no-op"
     if state != ABSENT:
         return 3, msg.replace("verify:", "publish:", 1) + " — never overwritten; the batch stays in carry"
     content = expected_content(src, base)
+    # The header gate (PINBOX, #209): a card whose written header is malformed never
+    # reaches the inbox — 2026-10-06 published 145 `type: X; level: Y; tags: [...]`
+    # candidates nobody could convert. nightly_distill.sh normalises the labelled
+    # shapes first (card_header.py fix); what is still malformed here fails the night.
+    import card_header
+    bad = card_header.check_text(content)
+    if bad:
+        return RC_HEADER, (f"publish: {batch_id} REFUSED — {len(bad)} card(s) with a malformed "
+                           f"header, no unit created, the batch stays in carry: "
+                           + " | ".join(bad))
     if not _link_unit(unit, content):
         return publish(src, unit, batch_id, record, base)
     if os.environ.get("NIGHTLY_BATCH_FAULT") == "publish-after-link":

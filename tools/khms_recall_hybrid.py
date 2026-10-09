@@ -357,9 +357,11 @@ def _finish(query_raw, results, cards, channel, src, meta):
     if not ks.tokens(query_raw):
         print("recall: query has no searchable tokens")
         return 2
+    import khms_pending
+    pending_count = khms_pending.render(query_raw)
     if not results:
-        print(f"recall: nothing on record for: {query_raw}")
-        return 1
+        print(f"recall: nothing on record among approved cards for: {query_raw}")
+        return 0 if pending_count else 1
     print_results(results, cards, "hybrid" if channel == "hybrid" else "lexical", meta)
     return 0
 

@@ -48,6 +48,7 @@ done
 # shellcheck source=khms_paths.sh
 . "$CODE/khms_paths.sh"
 khms_load || exit $?
+python3 "$CODE/khms_health.py" || exit 3
 BRAIN="$(khms_get KHMS_ROOT)"
 KNOW="${BRAIN}/memory/know"
 ARCHIVE="${BRAIN}/memory/archive/know"
@@ -112,11 +113,11 @@ fi
 TARGET="$(canon "$TARGET")"
 
 mkdir -p "$TARGET/know"
-rsync -a --delete --include='K-*.md' --exclude='*' "$KNOW/" "$TARGET/know/"
+rsync -a --delete --delete-excluded --include='K-[0-9][0-9][0-9][0-9][0-9].md' --exclude='*' "$KNOW/" "$TARGET/know/"
 
 if [[ "$WITH_ARCHIVE" -eq 1 && -d "$ARCHIVE" ]]; then
   mkdir -p "$TARGET/archive/know"
-  rsync -a --delete --include='K-*.md' --exclude='*' \
+  rsync -a --delete --delete-excluded --include='K-[0-9][0-9][0-9][0-9][0-9].md' --exclude='*' \
         "$ARCHIVE/" "$TARGET/archive/know/"
 else
   rm -rf "$TARGET/archive"

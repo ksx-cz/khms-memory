@@ -58,6 +58,8 @@ DEFAULTS = [
     ("KHMS_CONFIG_DIR", "${KHMS_ROOT}/config"),
     ("KHMS_STATE", "${KHMS_ROOT}/state"),
     ("KHMS_SHARED_STATE", "${KHMS_ROOT}/state/shared"),
+    ("KHMS_SHARED", "0"),
+    ("KHMS_RUNTIME", ""),  # host local; default hashes canonical root, never agent HOME
     ("KHMS_READ_ONLY", "0"),
     ("KHMS_RECALL_LOG", "${KHMS_STATE}/recall.log"),
     ("KHMS_RECALL_JSONL", "${KHMS_STATE}/recall.jsonl"),
@@ -73,17 +75,23 @@ DEFAULTS = [
     ("KHMS_EXPERIMENT", "${KHMS_CONFIG_DIR}/khms_experiment.json"),
     ("KHMS_GLOSSARY", ""),
     ("KHMS_DIRECTIVE", ""),
-    ("KHMS_EMBED_DIR", "${KHMS_SHARED_STATE}/embed"),
+    ("KHMS_EMBED_DIR", "${KHMS_RUNTIME}/embed"),
     ("KHMS_EMBED_PY", ""),
     ("KHMS_DENSE_SOCKET", ""),
     ("KHMS_HF_HOME", ""),
-    ("KHMS_SNAPSHOT_ROOT", ""),
+    ("KHMS_TERM_GLOSSARY", ""),
+    ("KHMS_REPO", ""),
+    ("KHMS_REPO_INCLUDE", "*"),
+    ("KHMS_DAV_URL", ""),
+    ("KHMS_DAV_USER", ""),
+    ("KHMS_DAV_BASE", ""),
+    ("KHMS_DAV_NETRC", ""),
     ("KHMS_TRANSCRIPTS", ""),
     ("KHMS_MESSAGES", "${KHMS_CONFIG_DIR}/messages.env"),
     ("KHMS_PATTERNS", "${KHMS_CONFIG_DIR}/patterns.env"),
-    ("KHMS_NIGHTLY_LOCK", "${KHMS_SHARED_STATE}/nightly.lock"),
+    ("KHMS_NIGHTLY_LOCK", "${KHMS_RUNTIME}/nightly.lock"),
     # --- night / week pipeline (nightly_distill.sh, weekly_synthesis.sh) ---------------------------------
-    ("KHMS_WEEKLY_LOCK", "${KHMS_SHARED_STATE}/weekly.lock"),     # one weekly at a time
+    ("KHMS_WEEKLY_LOCK", "${KHMS_RUNTIME}/weekly.lock"),     # one weekly at a time
     ("KHMS_NIGHT_STAMP", "${KHMS_SHARED_STATE}/last-nightly"),    # start of the last stamped night window
     ("KHMS_WEEK_STAMP", "${KHMS_SHARED_STATE}/last-weekly"),      # completion of the last weekly
     ("KHMS_SWEEP_FAILED", "${KHMS_SHARED_STATE}/sweep-failed"),   # one line per failed sweep, cleared on success
@@ -105,6 +113,7 @@ DEFAULTS = [
     ("KHMS_PROMPT_EXT", "${KHMS_CONFIG_DIR}/prompts"),            # private prompt extensions (optional)
     ("KHMS_ACCOUNT_DIR", ""),              # token accounting: the project's transcript directory ("" = derive)
     # --- morning review ping (khms_review_ping.sh) -----------------------------------------------------
+    ("KHMS_PING_DEPUTY", ""),
     ("KHMS_PING_SEND", ""),                # argv: delivers the ping text read on stdin ("" = print only)
     ("KHMS_PING_EXTRA", ""),               # argv: project lines to add to the ping, one per stdout line ("" = none)
     # --- standing-base triage (nightly_triage.sh, khms_contradict.py) -----------------------------------
@@ -215,6 +224,29 @@ class Resolved:
         ro = self.get("KHMS_READ_ONLY")
         if ro not in ("0", "1"):
             raise KhmsPathError(f"khms_paths: KHMS_READ_ONLY must be 0 or 1, got: {ro}")
+        self._validate_shared()
+
+    def _validate_shared(self):
+        if self.get('KHMS_SHARED') != '1':
+            return
+        state = self.env.get('KHMS_STATE')
+        if not state or not os.path.isabs(state) or under(state, self.get('KHMS_ROOT')):
+            raise KhmsPathError('shared base requires an explicit personal KHMS_STATE outside KHMS_ROOT')
+        # Shared runtime is part of the base configuration. Two agent environments
+        # must not redirect the same lock to different files.
+        configured = self.raw.get('KHMS_RUNTIME')
+        if not configured:
+            raise KhmsPathError('shared base requires KHMS_RUNTIME in the base configuration')
+        intended = self._expand('KHMS_RUNTIME', configured, ('KHMS_RUNTIME',))
+        actual = self.get('KHMS_RUNTIME')
+        if not os.path.isabs(actual) or under(actual, self.get('KHMS_ROOT')) or not same_path(actual, intended):
+            raise KhmsPathError('KHMS_RUNTIME must match the shared absolute path outside KHMS_ROOT')
+        for key in ('KHMS_SHARED_STATE', 'KHMS_NIGHTLY_LOCK', 'KHMS_WEEKLY_LOCK'):
+            raw = self.raw.get(key) or _DEFAULT[key]
+            intended = self._expand(key, raw, (key,))
+            if not same_path(self.get(key), intended):
+                raise KhmsPathError(key + ' must match the shared base configuration')
+
 
     def _expand(self, key, raw, stack):
         def sub(m):
@@ -232,6 +264,9 @@ class Resolved:
         if not val:
             if self.raw.get(key):
                 val = self._expand(key, self.raw[key], stack)
+            elif key == "KHMS_RUNTIME":
+                from khms_runtime import default_runtime
+                val = default_runtime(self.get("KHMS_ROOT"))
             elif key in _DEFAULT and _DEFAULT[key] is not None:
                 val = self._expand(key, _DEFAULT[key], stack)
             else:
@@ -302,7 +337,7 @@ def may_write(path):
         r = resolved()
     except KhmsNoBaseError:          # an environment-only reader with no base: nothing is shared, write nothing
         return False
-    return not any(under(path, r.get(k)) for k in ("KHMS_ROOT", "KHMS_CONFIG_DIR", "KHMS_SHARED_STATE"))
+    return not any(under(path, r.get(k)) for k in ("KHMS_ROOT", "KHMS_CONFIG_DIR", "KHMS_SHARED_STATE", "KHMS_RUNTIME"))
 
 
 def require_may_write(paths, what):
@@ -348,7 +383,8 @@ _DERIVED = {
     "STATE": lambda r: r.get("KHMS_STATE"),
     "SHARED_STATE": lambda r: r.get("KHMS_SHARED_STATE"),
     "COUNTER": lambda r: os.path.join(r.get("KHMS_SHARED_STATE"), "next_id"),
-    "ALLOC_LOCK": lambda r: os.path.join(r.get("KHMS_SHARED_STATE"), "alloc.lock"),
+    "ALLOC_LOCK": lambda r: os.path.join(r.get("KHMS_RUNTIME"), "alloc.lock"),
+    "RUNTIME": lambda r: r.get("KHMS_RUNTIME"),
     "REVIEW_MARKERS": lambda r: os.path.join(r.get("KHMS_SHARED_STATE"), "reviewed"),
     "RECALL_LOG": lambda r: r.get("KHMS_RECALL_LOG"),
     "RECALL_JSONL": lambda r: r.get("KHMS_RECALL_JSONL"),

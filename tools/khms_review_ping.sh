@@ -20,6 +20,12 @@ CODE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 # shellcheck source=khms_paths.sh
 . "$CODE/khms_paths.sh"
 khms_load || exit $?
+if [ "${1:-}" = "--deputy" ]; then
+  shift
+  read -r -a deputy <<< "$(khms_get KHMS_PING_DEPUTY)"
+  [ "${#deputy[@]}" -gt 0 ] || { echo 'review deputy is not configured; pending unchanged' >&2; exit 3; }
+  exec "${deputy[@]}" "$@"
+fi
 BRAIN="$(khms_get KHMS_ROOT)"
 INBOX="$BRAIN/memory/inbox"
 MARKERS="$(khms_get KHMS_SHARED_STATE)/reviewed"
@@ -190,7 +196,7 @@ for d in $DATES; do
     *)
       if [ -f "$INBOX/$d-triage.md" ] && ! is_wip "$d-triage.md"; then
         rev=0
-        if [ "$legacy" = 1 ] || [ -f "$MARKERS/.reviewed-$d-triage" ]; then rev=1; fi
+        if python3 "$CODE/khms_review_state.py" --triage-reviewed "$INBOX/$d-triage.md"; then rev=1; fi
         cen="$(triage_census "$INBOX/$d-triage.md")"
         judged="${cen%% *}"; planned="${cen##* }"
         ratio=""

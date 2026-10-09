@@ -32,6 +32,8 @@ never carded writes
 in its body.  That is a statement in an immutable card, not a flag in a script.
 """
 import os
+import math
+import khms_files
 import re
 import sys
 import unicodedata
@@ -132,7 +134,7 @@ def backward_targets(meta_or_links):
 
 def known_card_ids(know_dir):
     try:
-        return {f[:-3] for f in os.listdir(know_dir)
+        return {f[:-3] for f in khms_files.listdir(know_dir)
                 if f.startswith("K-") and f.endswith(".md")}
     except OSError:
         return set()
@@ -280,6 +282,155 @@ def check_errata_consistency(card_id, meta, body, ledger_ids=None, ledger_owner=
     return None
 
 
+_NUM_RE = re.compile(r"(?<![\w.#/@:\-])-?\d+(?:[.,]\d+)?(?:[eE][-+]?\d+)?")
+_UNIT_SUFFIX = {"", "mm", "cm", "km", "m", "rad", "deg", "°", "%", "khz", "mhz", "ghz",
+                "hz", "ms", "µs", "us", "ns", "s", "mv", "kv", "v", "ma", "a", "mw", "kw",
+                "w", "px"}
+_WORD_RE = re.compile(r"[A-Za-z0-9]+")
+# An inline `[ERRATUM TS-…]` marker stands where a corrected sentence ended: what follows
+# it is the next sentence (K-92603 "…holds the measured one) [ERRATUM TS-00407] (0.567 m
+# being…" read 0.567 as rear_tyre_track's number).
+_SENT_END = re.compile(r"[.;!?](?:\s|$)|\n|—|\s-\s|\[ERRATUM\s+TS-\d{5}\]")
+# Another parameter's assignment ends the key's reach even when the index does not hold
+# that name: K-90260 "desired_linear_vel (… nav2_params.yaml), min_turning_radius=1.3"
+# read 1.3 as desired_linear_vel's (the repo key is minimum_turning_radius).
+_OTHER_NAME_RE = re.compile(r"`?\b[A-Za-z]\w*_\w*`?\s*[=:]")
+# A pointer to the file that holds the value, in the same paragraph — the value is
+# then quoted next to its source and is still current, so it is not flagged.
+_POINTER_RE = re.compile(r"[\w.\-/~]*\w\.(?:ya?ml|xacro|json|py|cpp|hpp|h)\b")
+_WINDOW = 80
+# The key is a TERM, not a subject, when an operator follows it: `kingpin_track/2 =
+# 1.79`, `k_y·e_y = 0`, `curvature_fit_arc_m > 0` — a formula or a condition states no
+# value of the key (2 of 4 false flags in the first 30-sample of round 2).
+_TERM_RE = re.compile(r"\s*(?:[/*+^·×<>≤≥]|!=)")
+
+
+def _card_numbers(text):
+    """[(raw, float)] for the plain numbers in text — not dates, ids, versions, times,
+    hashes; a number glued to letters counts only when the letters are a unit."""
+    out = []
+    for m in _NUM_RE.finditer(text):
+        raw, after = m.group(0), text[m.end():]
+        if re.match(r"[-.:/]\d|\d", after):          # 2026-10-08, 1.2.3, 10:30, 3/4
+            continue
+        if re.match(r"[A-Za-zµ°%]*", after).group(0).lower() not in _UNIT_SUFFIX:
+            continue                                   # 3D, 0x1f, 5abc
+        out.append((raw, float(raw.replace(",", "."))))
+    return out
+
+
+_FACTORS = (1.0, 1000.0, 0.001, 100.0, 180.0 / math.pi, math.pi / 180.0)
+
+
+def _same_value(raw, card, repo):
+    """The card's number is the repo's value at the card's own precision, allowing the
+    conversions a card uses (m↔mm, s↔ms, fraction↔%, rad↔deg): "30°" is 0.5236 rad,
+    "0.7 m" is 0.700, "0.6570" is not 0.700."""
+    mant, _e, exp = raw.lower().partition("e")
+    decimals = len(re.split(r"[.,]", mant)[1]) if re.search(r"[.,]", mant) else 0
+    tol = 0.5 * 10 ** (int(exp or 0) - decimals) + 1e-12
+    return any(abs(abs(card) - abs(repo) * k) <= tol for k in _FACTORS)
+
+
+def _key_hits(text, index, max_words=8):
+    """[(name, start, end)] of repo key names in text: consecutive words joined by a
+    single '_', ' ' or '-'; not part of a longer identifier (no '_' on either side).
+    A two-word name counts only written as the identifier (`max_gap`, not "max gap"):
+    in prose, "set to", "max gap", "not measured", "turning radius" are English far
+    more often than they are the key (measured on the base, see test file). Three and
+    more words may be prose ("rear tyre track" is rear_tyre_track)."""
+    toks = [(m.group(0).lower(), m.start(), m.end()) for m in _WORD_RE.finditer(text)]
+    hits, i = [], 0
+    while i < len(toks):
+        best = None
+        if i == 0 or text[toks[i][1] - 1:toks[i][1]] != "_":
+            words, ident = [toks[i][0]], True
+            for j in range(i + 1, min(i + max_words, len(toks))):
+                sep = text[toks[j - 1][2]:toks[j][1]]
+                if sep not in ("_", " ", "-"):
+                    break
+                words.append(toks[j][0])
+                ident = ident and sep == "_"
+                name = "_".join(words)
+                seg = text[toks[i][1]:toks[j][2]]
+                if (name in index and text[toks[j][2]:toks[j][2] + 1] != "_"
+                        and (ident or len(words) >= 3)
+                        and not (ident and seg.isupper())):   # WHEELBASE_M = code const
+                    best = (name, toks[i][1], toks[j][2], j)
+        if best:
+            hits.append(best[:3])
+            i = best[3] + 1
+        else:
+            i += 1
+    return hits
+
+
+def _statements(body):
+    """The card's own claim split into statements: paragraphs, each `- ` item on its
+    own; the `**QUOTES:**` tail is evidence quoted with its `src=`, not read, and
+    neither is an ERRATUM block — it quotes the retracted wording by design (R1/R2)."""
+    claim = ERRATUM_BLOCK_RE.sub("", body or "")
+    claim = re.split(r"^\*\*QUOTES:?\*\*", claim, maxsplit=1, flags=re.M)[0]
+    units = []
+    for para in re.split(r"\n\s*\n", claim):
+        units += re.split(r"\n(?=\s*[-*] )", para)
+    return units
+
+
+def check_repo_values(card_id, meta, body, index=None):
+    """→ a FLAG message when a statement names a repo key and states a number for it
+    in the same sentence; else None. index: khms_repo_values.load_index() by default.
+
+      * the number is NOT the repo's value → "card says X, repo says Y (file:line)" —
+        a stale-value card, flagged even when it cites the file;
+      * the number IS the repo's value → "value lives in file:line" — unless the same
+        statement already points at that file (the value is quoted next to its source).
+    A key named with no number after it is a pointer and is fine; a number with no key
+    (a measurement: "median 17 Hz on /imu") is never flagged."""
+    if index is None:
+        import khms_repo_values
+        index = khms_repo_values.load_index()
+    if not index:
+        return None
+    found = []
+    for unit in _statements(body):
+        hits = _key_hits(unit, index)
+        pointers = {os.path.basename(p) for p in _POINTER_RE.findall(unit)}
+        for n, (name, _s, end) in enumerate(hits):
+            stop = hits[n + 1][1] if n + 1 < len(hits) else len(unit)
+            window = re.sub(r"^\[\d+\]", "", unit[end:min(stop, end + _WINDOW)])  # key[2]=
+            if _TERM_RE.match(window):
+                continue
+            cuts = [m.start() for m in (_SENT_END.search(window),
+                                        _OTHER_NAME_RE.search(window)) if m]
+            nums = _card_numbers(window[:min(cuts)] if cuts else window)
+            if not nums:
+                continue
+            entries = index[name]
+            match = [e for e in entries for r, v in nums if _same_value(r, v, e.num)]
+            if match:
+                e = match[0]
+                if os.path.basename(e.path) not in pointers:
+                    found.append(f"{name} — value lives in {e.path}:{e.line}")
+            else:
+                repo = ", ".join(f"{e.raw} ({e.path}:{e.line})" for e in entries[:3])
+                more = f" +{len(entries) - 3} more" if len(entries) > 3 else ""
+                found.append(f"{name} — card says {nums[0][0]}, repo says {repo}{more}"
+                             f" — stale value?")
+    if not found:
+        return None
+    uniq = list(dict.fromkeys(found))
+    more = f" (+{len(uniq) - 3} more)" if len(uniq) > 3 else ""
+    return (f"{card_id}: states a value the repo holds: " + "; ".join(uniq[:3]) + more
+            + " — point to the file:key instead of the number (reviewer decides)")
+
+
+def flag_batch(cards, index=None):
+    """cards: [(id, meta, body)] → [flag message]. Flags are reported, never refused."""
+    return [msg for cid, meta, body in cards
+            for msg in (check_repo_values(cid, meta, body, index),) if msg]
+
+
 def lint_batch(cards, known_ids=None, retracted=None, ledger_ids=None):
     """cards: [(id, meta, body)] → [refusal message]. `retracted` / `ledger_ids` from
     load_retracted(); None runs only the correction-edge rule."""
@@ -295,10 +446,16 @@ def lint_batch(cards, known_ids=None, retracted=None, ledger_ids=None):
 
 def _main(argv):
     """CLI: khms_lint.py <know-dir-or-card.md ...> — audit cards already on disk."""
-    import glob
+    import khms_files as glob
     import yaml
+    argv = list(argv or [])
+    values = "--values" in argv
+    argv = [a for a in argv if a != "--values"]
+    import khms_repo_values
+    repo_index = khms_repo_values.load_index() if values else {}
+    flagged = 0
     paths = []
-    for a in argv or []:
+    for a in argv:
         paths += sorted(glob.glob(os.path.join(a, "K-*.md"))) if os.path.isdir(a) else [a]
     if not paths:
         print(__doc__)
@@ -314,7 +471,7 @@ def _main(argv):
     for p in list(paths):
         arch = os.path.join(os.path.dirname(os.path.dirname(p)), "archive", "know")
         if os.path.isdir(arch):
-            known |= {f[:-3] for f in os.listdir(arch) if f.endswith(".md")}
+            known |= {f[:-3] for f in khms_files.listdir(arch) if f.endswith(".md")}
             break
     # the ledger sits beside the base: <brain>/memory/tombstones/LEDGER.md
     brain = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(paths[0]))))
@@ -342,6 +499,13 @@ def _main(argv):
             if msg:
                 bad_err += 1
                 print(msg)
+        if values:
+            flag = check_repo_values(cid, meta, m.group(2), repo_index)
+            if flag:
+                flagged += 1
+                print("FLAG " + flag)
+    if values:
+        print(f"khms_lint: {flagged} flagged / {len(repo_index)} keys indexed")
     print(f"khms_lint: {bad} card(s) with unlinked correction language / {len(paths)} checked")
     print(f"khms_lint: {bad_err} card(s) stating a retracted claim or with inconsistent errata "
           f"({len(retracted)} tombstone(s) in the ledger)")

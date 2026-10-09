@@ -120,7 +120,8 @@ class ApproveRefuses(unittest.TestCase):
         with open(self.counter, "w") as f:
             f.write("90500\n")
         with open(os.path.join(self.know, "K-90042.md"), "w") as f:
-            f.write("---\nid: K-90042\n---\nthe old card\n")
+            f.write("---\nid: K-90042\ntype: fact\nlevel: observation\nstatus: active\ntags: [testing]\n"
+                    "scope: universal\nevidence: measured\nsource: fixture\ndate: 2026-01-01\n---\nthe old card\n")
 
     def tearDown(self):
         self.tmp.cleanup()

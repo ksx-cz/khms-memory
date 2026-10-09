@@ -30,6 +30,7 @@ Exit 0 always when the inbox is readable; 2 on a bad DATE.
 """
 import datetime as dt
 import os
+import khms_files
 import re
 import sys
 
@@ -46,7 +47,7 @@ def _date(s):
 
 
 def select(inbox, today):
-    names = sorted(n for n in os.listdir(inbox) if n.startswith("2") and n.endswith(".md"))
+    names = sorted(n for n in khms_files.listdir(inbox) if n.startswith("2") and n.endswith(".md"))
     dated, undated = [], []
     for n in names:
         m = DATED.match(n)

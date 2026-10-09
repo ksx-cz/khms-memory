@@ -79,7 +79,8 @@ import argparse
 import contextlib
 import datetime as dt
 import fcntl
-import glob
+import khms_lock as KL
+import khms_files as glob
 import hashlib
 import json
 import os
@@ -129,18 +130,49 @@ def _kind_table():
 KIND_ALIASES = _kind_table()
 CANON = {alias: canon for canon, aliases in KIND_ALIASES.items() for alias in aliases}
 
-# A MARK line: optional bullet, optional ISO stamp or HH:MM, optional
-# "(X handoff)" tag, then MARK[kind].  The token must open the line (after
+# Status / progress kinds — never knowledge (K-93929: launched, PASS, merged, deployed,
+# tagged, a board move, the next step).  Measured over journal 2026-09-21..10-08: these
+# are the status kinds actually used; anything not listed here is tracked.
+STATUS_KINDS = frozenset(PT.words("LEDGER_STATUS_KINDS", (
+    "done", "agent-done", "agent-done-check", "agent-partial", "status",
+    "result", "check", "dispatch", "deploy", "merge", "handoff",
+    "plan", "report", "todo", "pending", "spawn", "tokens", "board",
+    "board-reply", "board-archive", "progress")))
+# A kind is a word (Czech letters, digits, `-`, `_`, one optional `→status` tail); a
+# placeholder in prose (`MARK[...]`, `MARK[<kind>]`, `MARK[..]`) is not a mark.
+KIND_SHAPE_RE = re.compile(r"^[^\W\d_][\w-]*(?:→[\w-]+)?$")
+KIND_PLACEHOLDERS = frozenset(("kind", "x", "xxx"))
+
+
+def canon_kind(raw):
+    """-> the canonical tracked kind of a MARK token, or None (status kind, placeholder)."""
+    k = raw.strip("*`:").lower()
+    if k in CANON:
+        return CANON[k]
+    if k in STATUS_KINDS or k in KIND_PLACEHOLDERS or not KIND_SHAPE_RE.match(k):
+        return None
+    return k
+
+# A MARK line: optional bullet, optional ISO stamp or bare date, optional time,
+# optional "(X handoff)" tag, then MARK[kind].  The token must open the line (after
 # those prefixes) — prose that merely MENTIONS `MARK[khms-issue]` (rules,
-# design notes) is not a mark.
+# design notes) is not a mark.  The time may be approximate (#209 A3: `~07:1x`,
+# `≤14:08`, `15:0x` and a bare `2026-09-30` prefix were 18 unparsed knowledge lines).
 MARK_RE = re.compile(
     r"^\s*(?:[-*]\s+)?(?:\*\*)?"
     r"(?:(?P<iso>\d{4}-\d{2}-\d{2}T(?P<isot>\d{2}:\d{2})(?::\d{2})?(?:\.\d+)?"
     r"(?:[+-]\d{2}:?\d{2}|Z)?)\s+)?"
-    r"(?:(?P<hm>\d{1,2}:\d{2})(?::\d{2})?\s+)?"
+    r"(?:\d{4}-\d{2}-\d{2},?\s+)?"
+    r"(?:[~≈≤<>]?(?P<hm>\d{1,2}:\d[\dx])(?::\d{2})?\s+)?"
     r"(?:\([^)\n]{0,80}\)\s+)?"
     r"MARK\[(?P<kind>[^\]\s]+)\](?:\*\*)?\s*(?P<text>.*)$")
 LEAD_TIME_RE = re.compile(r"^(?P<hm>\d{1,2}:\d{2})(?::\d{2})?\b\s*")
+# A LATER MARK token on a line that opens with a MARK (#209 A3): it starts a mark of its
+# own only after a sentence end (`. ; ! ? )` or a dash) and outside backticks — a MARK
+# named mid-sentence ("earlier MARK[finding] about …", "journal 10-01 MARK[vyvraceno] …") or
+# quoted (`MARK[done]`) is a reference, not a mark.
+TOKEN_RE = re.compile(r"(?:\*\*)?MARK\[(?P<kind>[^\]\s]+)\](?:\*\*)?:?\s*")
+LATER_LEAD_RE = re.compile(r"(?:[.;!?)]|\s[—–-])\s*(?:\*\*)?$")
 ID_RE = re.compile(r"\bM-[0-9a-f]{8}\b")
 CARD_ID_RE = re.compile(r"\bK-\d{5}\b")
 JOURNAL_NAME_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})\.md$")
@@ -158,7 +190,6 @@ def _review_dir(root):
     except P.KhmsNoBaseError:
         pass
     return os.path.join(root, "state", "shared", "reviewed")
-
 
 class Paths:
     def __init__(self, root, reviewed=None):
@@ -189,25 +220,42 @@ def mark_id(kind, text):
     return "M-" + h[:8]
 
 
-def parse_line(line):
-    """-> (canonical kind, time 'HH:MM' or '', text) or None."""
+def parse_marks(line):
+    """-> [(canonical kind, time 'HH:MM' or '', text), ...] — every tracked mark of a line.
+    The FIRST mark's text runs to the end of the line exactly as before #209 A3, so its id
+    is unchanged; a later MARK token (after a sentence end, outside backticks) adds a mark
+    whose text starts at that token."""
     m = MARK_RE.match(line)
     if not m:
-        return None
-    kind = CANON.get(m.group("kind").lower())
-    if not kind:
-        return None
-    text = m.group("text").strip()
-    if not text:
-        return None
+        return []
     hm = m.group("isot") or m.group("hm") or ""
+    text = m.group("text").strip()
     if not hm:
         lt = LEAD_TIME_RE.match(text)
         if lt:
             hm = lt.group("hm")
     if hm and len(hm) == 4:
         hm = "0" + hm
-    return kind, hm, text
+    out = []
+    kind = canon_kind(m.group("kind"))
+    if kind and text:
+        out.append((kind, hm, text))
+    rest_at = m.start("text")
+    for t in TOKEN_RE.finditer(line, rest_at):
+        before = line[:t.start()]
+        if before.count("`") % 2 or not LATER_LEAD_RE.search(before):
+            continue
+        k2 = canon_kind(t.group("kind"))
+        t2 = line[t.end():].strip()
+        if k2 and t2:
+            out.append((k2, hm, t2))
+    return out
+
+
+def parse_line(line):
+    """-> (canonical kind, time 'HH:MM' or '', text) of the line's FIRST tracked mark, or None."""
+    p = parse_marks(line)
+    return p[0] if p else None
 
 
 def scan_journal(path):
@@ -224,16 +272,13 @@ def scan_journal(path):
         for n, line in enumerate(fh, 1):
             if "MARK[" not in line:
                 continue
-            p = parse_line(line.rstrip("\n"))
-            if not p:
-                continue
-            kind, hm, text = p
-            mid = mark_id(kind, text)
-            if mid in seen:
-                continue
-            seen.add(mid)
-            out.append({"id": mid, "date": date, "time": hm, "kind": kind,
-                        "text": norm(text), "loc": f"journal/{name}:{n}"})
+            for kind, hm, text in parse_marks(line.rstrip("\n")):
+                mid = mark_id(kind, text)
+                if mid in seen:
+                    continue
+                seen.add(mid)
+                out.append({"id": mid, "date": date, "time": hm, "kind": kind,
+                            "text": norm(text), "loc": f"journal/{name}:{n}"})
     return out
 
 
@@ -358,7 +403,7 @@ def match_cards(marks, cards, floor=None):
 def suggest_cards(marks, cards, floor):
     """-> dict mark id -> (card id, how): HEURISTIC SUGGESTIONS, never coverage.
 
-    review P1-1 (Diblin, 2026-10-01): an id mentioned in a card's prose ("This
+    review P1-1 (2026-10-01): an id mentioned in a card's prose ("This
     card does NOT cover M-12345678"), a card that merely shares the MARK's
     minute, or a quote overlap can only PROPOSE a link — `derive` records it as
     `suggested`, and only the coordinator's `card ID K-x` (or a `marks:`
@@ -528,12 +573,8 @@ def ledger_lock(paths):
     approve path's re-derive — so a sync can never publish a state derived from an
     events file another writer is in the middle of (review P2-6)."""
     os.makedirs(paths.ledger, exist_ok=True)
-    with open(os.path.join(paths.ledger, ".lock"), "a") as fh:
-        fcntl.flock(fh, fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(fh, fcntl.LOCK_UN)
+    with KL.lock('ledger', paths.root):
+        yield
 
 
 def append_events(paths, events):
@@ -571,6 +612,7 @@ def derive(paths, floor, until=None, extra_pending=()):
     suggested = suggest_cards(marks, cards, floor)
     known_cards = {c[0] for c in cards}
     prop = proposed_ids(paths, extra_pending)
+    dups = {}
     for mid, mk in marks.items():
         ev = events.get(mid) or {}
         kind = ev.get("ev")
@@ -579,7 +621,10 @@ def derive(paths, floor, until=None, extra_pending=()):
             gone = set(ev.get("cards") or [])
             linked = [c for c in linked if c not in gone]
         state, card, how, reason = "OPEN", "", "", ""
-        if kind == "dismiss":
+        target = dup_target(ev)
+        if target and not linked:
+            dups[mid] = target          # resolved below, once every target has its state
+        elif kind == "dismiss" and not target:
             state, reason = "DISMISSED", ev.get("reason", "")
         elif kind == "card" and ev.get("card") in known_cards:
             state, card, how = "CARDED", ev["card"], "event"
@@ -598,7 +643,58 @@ def derive(paths, floor, until=None, extra_pending=()):
                 mk["suggested"] = {"card": sg[0], "how": sg[1]}
             if mid in prop:
                 mk["proposed_in"] = prop[mid]
+    resolve_duplicates(marks, dups)
     return marks
+
+
+# "duplicate of M-x" — #209 review R209AC A5.  It used to be a plain DISMISSED: when M-x
+# was later dismissed or reopened, the duplicate stayed dismissed and its content was in
+# no card (66 such dismissals; 8 targets were themselves dismissed, one a khms-issue).
+DUP_RE = re.compile(r"(?i)^(?:nightly verdict accepted at review:\s*)?duplicate of\s+"
+                    r"(M-[0-9a-f]{8})\b")
+
+
+def dup_target(ev):
+    """The mark id an event says this mark duplicates: a `dup` event, or a legacy dismiss
+    whose recorded reason is the night's `duplicate of M-x` verdict."""
+    if ev.get("ev") == "dup":
+        return ev.get("dup_of")
+    if ev.get("ev") == "dismiss":
+        m = DUP_RE.match(ev.get("reason") or "")
+        return m.group(1) if m else None
+    return None
+
+
+def resolve_duplicates(marks, dups):
+    """A duplicate takes the state of its target, followed along a chain of duplicates:
+    target CARDED -> CARDED with the target's card; target OPEN -> OPEN and, while the
+    target waits in an unreviewed proposal, waiting with it; target DISMISSED, unknown or a
+    cycle -> OPEN on its own (the night judges it alone, it is never folded into a dismissal)."""
+    for mid, first in dups.items():
+        t, seen = first, {mid}
+        while t in dups and t not in seen:
+            seen.add(t)
+            t = dups[t]
+        mk = marks[mid]
+        tgt = marks.get(t) if t not in seen else None
+        mk["dup_of"] = first
+        tstate = tgt["state"] if tgt else "UNKNOWN"
+        if tstate == "CARDED":
+            mk.pop("suggested", None)
+            mk.pop("proposed_in", None)
+            mk["state"], mk["card"], mk["how"] = "CARDED", tgt["card"], "dup"
+            mk["reason"] = f"duplicate of {first}" + (f" -> {t}" if t != first else "") \
+                + f", carded in {tgt['card']}"
+            continue
+        mk["state"] = "OPEN"
+        if tstate == "OPEN":
+            mk["reason"] = f"duplicate of {first}, which is OPEN"
+            if tgt.get("proposed_in"):
+                mk["proposed_in"] = tgt["proposed_in"]
+        else:
+            mk["reason"] = (f"duplicate of {first}, whose target is "
+                            f"{'DISMISSED' if tstate == 'DISMISSED' else 'unknown'} — "
+                            f"judged on its own")
 
 
 def carry_count(paths):
@@ -607,18 +703,21 @@ def carry_count(paths):
                 if re.search(r"(?:^|-)cons-\d+\.md$", os.path.basename(f))])
 
 
-TRACKED_KINDS = sorted(KIND_ALIASES)
-NOT_COVERED = ("journals before the floor; MARK kinds outside the tracked list "
-               "(status kinds: done, result, board-reply, ...); knowledge without a MARK "
-               "line")
+TRACKED_KINDS = sorted(KIND_ALIASES)          # the BASE kinds; every non-status kind is tracked
+NOT_COVERED = ("journals before the floor; status MARK kinds (STATUS_KINDS: done, "
+               "agent-done, board-reply, check, merge, deploy, ...); knowledge without a "
+               "MARK line")
 
 
 def summarize(marks, floor, paths=None):
     counts = {"OPEN": 0, "CARDED": 0, "DISMISSED": 0}
     proposed = suggested = 0
     oldest = None
+    new_kinds = {}
     for mk in marks.values():
         counts[mk["state"]] += 1
+        if mk["kind"] not in KIND_ALIASES:
+            new_kinds[mk["kind"]] = new_kinds.get(mk["kind"], 0) + 1
         if mk["state"] == "OPEN":
             if mk.get("suggested"):
                 suggested += 1
@@ -643,7 +742,10 @@ def summarize(marks, floor, paths=None):
             (dt.date.today() - dt.date.fromisoformat(oldest["date"])).days
             if oldest and re.match(r"^\d{4}-\d{2}-\d{2}$", oldest["date"]) else None),
         # what "OPEN 0" does and does not promise (review P2-6)
-        "scope": {"floor": floor, "kinds": TRACKED_KINDS, "not_covered": NOT_COVERED},
+        "scope": {"floor": floor, "kinds": TRACKED_KINDS, "status_kinds": sorted(STATUS_KINDS),
+                  "not_covered": NOT_COVERED},
+        # marks of kinds outside the eight base kinds — tracked since #209 A2
+        "new_kinds": dict(sorted(new_kinds.items(), key=lambda kv: (-kv[1], kv[0]))),
         # consolidate batches waiting in memory/ledger/carry/ — the night's unfinished work
         "carry": carry_count(paths) if paths else None,
         "oldest_open": ({k: oldest[k] for k in ("id", "date", "time", "kind", "text", "loc")}
@@ -667,7 +769,16 @@ def status_line(s):
                  carded=s["carded"], dismissed=s["dismissed"], carry=s.get("carry", "?"), oldest=old,
                  age=M.msg("LEDGER_AGE", days=age) if age is not None else "",
                  generated=s["generated"],
-                 nkinds=len(s.get("scope", {}).get("kinds", TRACKED_KINDS)))
+                 nkinds="all non-status kinds")
+
+
+def _new_kinds_part(nk, top=3):
+    if not nk:
+        return ""
+    items = sorted(nk.items(), key=lambda kv: (-kv[1], kv[0]))
+    shown = ", ".join(f"{k} {n}" for k, n in items[:top])
+    more = f", +{len(items) - top} more kinds" if len(items) > top else ""
+    return f"; outside the base kinds {sum(nk.values())} ({shown}{more})"
 
 
 def write_state(paths, marks, summary):
@@ -683,9 +794,9 @@ def write_state(paths, marks, summary):
     os.replace(tmp, paths.summary)
 
 
-def read_summary(root=DEFAULT_ROOT):
+def read_summary(brain=DEFAULT_ROOT):
     try:
-        with open(Paths(root).summary, encoding="utf-8") as fh:
+        with open(Paths(brain).summary, encoding="utf-8") as fh:
             return json.load(fh)
     except (OSError, ValueError):
         return None
@@ -811,7 +922,12 @@ def cmd_sync(a, paths):
     print(status_line(s))
     print(f"total tracked marks: {s['total']} (floor {floor}"
           f"{', until ' + a.until if a.until else ''}){' [dry: nothing written]' if a.dry else ''}")
-    print(f"scope: kinds {', '.join(TRACKED_KINDS)}; NOT covered: {NOT_COVERED}")
+    nk = s.get("new_kinds") or {}
+    print(f"scope: every MARK kind except status kinds ({', '.join(sorted(STATUS_KINDS))}); "
+          f"base kinds {', '.join(TRACKED_KINDS)}; NOT covered: {NOT_COVERED}")
+    if nk:
+        print(f"tracked kinds outside the base list: "
+              f"{', '.join(f'{k} {n}' for k, n in nk.items())}")
     return 0
 
 
@@ -930,47 +1046,219 @@ def _known_ids(paths, floor):
     return set(collect_marks(paths, floor))
 
 
+# --- "already carded K-x" must be PROVEN by a quote of K-x (#209 review R209AC A1) -------
+# The night's verdict `already carded K-x` used to become CARDED when the file K-x merely
+# existed: 1185 of 4365 CARDED marks (27 %) rested on that unverified model verdict, e.g.
+# M-9fc01dad (the H3 memory-bandwidth refutation, "EMC 0 %") closed onto K-93150, which
+# holds neither.  Now the verdict carries the sentence of K-x that holds the mark
+# (`already carded K-x: "<verbatim sentence of K-x>"`) and that quote is checked against
+# the card (0 tokens, the verify_quotes idea); no quote or no match = no coverage, the mark
+# stays OPEN and the next night writes a candidate (or a verdict with a real quote).
+ALREADY_RE = re.compile(r"(?i)^already carded\s+(K-\d{5})\b\s*[:—–-]?\s*(?P<q>.*)$")
+MIN_CARD_QUOTE = 25
+
+
+def _match_norm(s):
+    s = norm(s).lower()
+    s = re.sub(r"(?<=\d),(?=\d)", ".", s)
+    return s
+
+
+def quote_in_card(quote, card_text):
+    """True when `quote` (outer quote marks stripped, `...` elisions allowed) is verbatim in
+    the card — every segment present, at least MIN_CARD_QUOTE characters in all."""
+    q = norm(quote).strip()
+    if len(q) >= 2 and q[0] in "\"'" and q[-1] in "\"'":
+        q = q[1:-1]
+    segs = [g.strip(" \"'").lower() for g in ELISION_RE.split(_match_norm(q))]
+    segs = [g for g in segs if g]
+    if not segs or sum(len(g) for g in segs) < MIN_CARD_QUOTE:
+        return False
+    body = _match_norm(card_text)
+    return all(g in body for g in segs)
+
+
+# --- the night's NOT CARDED verdicts of a unit (#209 A1, A4) ---------------------------
+# ONE path for both ways a reviewer accepts them: `dismiss --from-inbox FILE`, and closing
+# the unit's review (`mark-reviewed`, `approve_inbox.py`'s marker).  Before A4 (review
+# R209AC) closing the unit did not record them: the marks left "proposed" and the night
+# queued them again — 235 marks were proposed on 2 nights, 28 on 3, all NOT CARDED.
+NOT_CARDED_SEC_RE = re.compile(rf"^{re.escape(NOT_CARDED_HEAD)}.*?$(.*?)(?=^## |\Z)",
+                               re.M | re.S)
+
+
+def not_carded_events(paths, text, known, by):
+    """-> (events, unknown ids, unproven) for the `## MARKS NOT CARDED` section of `text`,
+    or None when the text has no such section.  `already carded K-x` is coverage only with
+    a quote verifiably in K-x; `duplicate of M-x` follows M-x; anything else is a dismissal
+    with the verdict as its reason."""
+    sec = NOT_CARDED_SEC_RE.search(text)
+    if not sec:
+        return None
+    evs, bad, unproven = [], [], []
+    for line in sec.group(1).splitlines():
+        m = re.match(r"^\s*-\s*(M-[0-9a-f]{8})\s*::\s*(.+?)\s*$", line)
+        if not m:
+            continue
+        mid, verdict = m.group(1), m.group(2)
+        if mid not in known:
+            bad.append(mid)
+            continue
+        am = ALREADY_RE.match(verdict)
+        dm = DUP_RE.match(verdict)
+        if am:
+            cid = am.group(1)
+            try:
+                ctext = open(os.path.join(paths.know, cid + ".md"),
+                             encoding="utf-8", errors="replace").read()
+            except OSError:
+                ctext = None
+            if ctext is not None and quote_in_card(am.group("q"), ctext):
+                evs.append({"ts": _now(), "ev": "card", "id": mid, "card": cid,
+                            "by": by, "quote_verified": True,
+                            "reason": f"nightly verdict accepted: {verdict}"})
+            else:
+                unproven.append((mid, cid, "no such card" if ctext is None else
+                                 "no quote" if not am.group("q").strip() else
+                                 "quote not in the card"))
+        elif dm:
+            evs.append({"ts": _now(), "ev": "dup", "id": mid, "dup_of": dm.group(1),
+                        "by": by, "reason": f"nightly verdict accepted at review: {verdict}"})
+        else:
+            evs.append({"ts": _now(), "ev": "dismiss", "id": mid, "by": by,
+                        "reason": f"nightly verdict accepted at review: {verdict}"})
+    return evs, bad, unproven
+
+
+def _same_event(a, b):
+    return all(a.get(k) == b.get(k) for k in ("ev", "card", "dup_of", "reason"))
+
+
+def record_not_carded(paths, text, by, floor=None):
+    """Record the section's verdicts.  Skipped: an id whose last event already says the same
+    (closing a unit twice, or `dismiss --from-inbox` after the close, adds nothing), and an
+    id that is CARDED now — a verdict is about a mark the night did NOT card; once a card
+    holds it (a later unit, a hand card), a "not know-how" verdict recorded on top would
+    turn CARDED into DISMISSED (derive: a dismiss event outranks a `marks:` link; measured
+    2026-10-08 on the reviewed units: 16 such verdicts).
+    -> None without a section, else (recorded, unknown, unproven, skipped_carded)."""
+    marks = derive(paths, floor_of(paths, floor))
+    got = not_carded_events(paths, text, set(marks), by)
+    if got is None:
+        return None
+    evs, bad, unproven = got
+    last = read_events(paths)
+    carded = [e["id"] for e in evs if marks[e["id"]]["state"] == "CARDED"]
+    evs = [e for e in evs if e["id"] not in carded
+           and not (e["id"] in last and _same_event(last[e["id"]], e))]
+    append_events(paths, evs)
+    return evs, bad, unproven, carded
+
+
+def report_not_carded(prog, bad, unproven, carded=()):
+    if carded:
+        print(f"{prog}: {len(carded)} verdict(s) not recorded — the mark is CARDED already: "
+              f"{' '.join(carded)}")
+    if bad:
+        print(f"{prog}: unknown id(s), not recorded: {' '.join(bad)}")
+    if unproven:
+        print(f"{prog}: {len(unproven)} 'already carded' verdict(s) with no verifiable quote "
+              f"of the card — NOT coverage, they stay OPEN for the next night:")
+        for mid, cid, why in unproven:
+            print(f"  {mid} -> {cid}: {why}")
+
+
 def cmd_dismiss(a, paths):
     floor = floor_of(paths, a.floor)
     known = _known_ids(paths, floor)
-    evs, bad = [], []
     if a.from_inbox:
         text = open(a.from_inbox, encoding="utf-8").read()
-        sec = re.search(rf"^{re.escape(NOT_CARDED_HEAD)}.*?$(.*?)(?=^## |\Z)", text, re.M | re.S)
-        if not sec:
+        got = record_not_carded(paths, text, a.by, floor=floor)
+        if got is None:
             print(f"dismiss: no '{NOT_CARDED_HEAD}' section in {a.from_inbox}")
             return 1
-        cards = {os.path.basename(f)[:-3] for f in glob.glob(os.path.join(paths.know, "K-*.md"))}
-        for line in sec.group(1).splitlines():
-            m = re.match(r"^\s*-\s*(M-[0-9a-f]{8})\s*::\s*(.+?)\s*$", line)
-            if not m:
-                continue
-            mid, verdict = m.group(1), m.group(2)
-            if mid not in known:
-                bad.append(mid)
-                continue
-            k = CARD_ID_RE.search(verdict)
-            if re.match(r"(?i)already carded", verdict) and k and k.group(0) in cards:
-                evs.append({"ts": _now(), "ev": "card", "id": mid, "card": k.group(0),
-                            "by": a.by, "reason": f"nightly verdict accepted: {verdict}"})
-            else:
-                evs.append({"ts": _now(), "ev": "dismiss", "id": mid, "by": a.by,
-                            "reason": f"nightly verdict accepted at review: {verdict}"})
+        evs, bad, unproven, carded = got
     else:
         if not a.reason:
             print("dismiss: --reason is required (a dismissal without a reason is a silent loss)")
             return 2
-        for mid in a.ids:
-            if mid not in known:
-                bad.append(mid)
-                continue
-            evs.append({"ts": _now(), "ev": "dismiss", "id": mid, "by": a.by,
-                        "reason": a.reason})
-    if bad:
-        print(f"dismiss: unknown id(s), not recorded: {' '.join(bad)}")
-    append_events(paths, evs)
+        bad = [mid for mid in a.ids if mid not in known]
+        unproven, carded = [], []
+        evs = [{"ts": _now(), "ev": "dismiss", "id": mid, "by": a.by, "reason": a.reason}
+               for mid in a.ids if mid in known]
+        append_events(paths, evs)
+    report_not_carded("dismiss", bad, unproven, carded)
     print(f"dismiss: recorded {len(evs)} event(s) in {paths.events}")
     return 1 if bad and not evs else 0
+
+
+# --- re-check of the verdicts accepted before the quote rule (#209 A1, one-off) ----------
+# 0 tokens: a CARDED-by-verdict mark whose DISTINCTIVE terms (numbers, identifiers, paths,
+# ACRONYMS, camelCase — the words that survive a Czech mark becoming an English card) are
+# mostly absent from K-x is reopened and goes back to the night's queue.  Measured
+# 2026-10-08 on the 1185 such marks: 36 have no distinctive term (kept — cannot be judged
+# lexically), 130 have none of theirs in K-x, 141 under a third, 725 half or more.
+RECHECK_DROP = re.compile(
+    r"\((?:agent|sess|session)\b[^)]*\)|\bM-[0-9a-f]{8}\b|\bK-\d{5}\b"
+    r"|\b\d{4}-\d{2}-\d{2}(?:T[\d:+.-]+)?\b|\b\d{1,2}:\d{2}(?::\d{2})?\b|#\d+")
+RECHECK_TOK = re.compile(r"[0-9A-Za-z\u00c0-\u017e_][0-9A-Za-z\u00c0-\u017e_./%+-]*[0-9A-Za-z\u00c0-\u017e_%]")
+RECHECK_MIN_SHARE = 1 / 3
+
+
+def distinctive_terms(text):
+    t = re.sub(r"(?<=\d),(?=\d)", ".", RECHECK_DROP.sub(" ", text))
+    out = set()
+    for w in RECHECK_TOK.findall(t):
+        if len(w) < 3:
+            continue
+        if (re.search(r"\d", w) or re.search(r"[_/]", w) or re.search(r"\w\.\w", w)
+                or re.fullmatch(r"[A-Z][A-Z0-9-]{2,}", w) or re.search(r"[a-z][A-Z]", w)):
+            out.add(w.lower())
+    return out
+
+
+def cmd_recheck_carded(a, paths):
+    floor = floor_of(paths, a.floor)
+    marks = derive(paths, floor)
+    events = read_events(paths)
+    links = structural_links(read_cards(paths))
+    texts, checked, reopen, unjudged = {}, 0, [], 0
+    for mid, mk in marks.items():
+        ev = events.get(mid) or {}
+        if not (mk["state"] == "CARDED" and mk.get("how") == "event" and ev.get("ev") == "card"
+                and not ev.get("quote_verified") and not links.get(mid)
+                and (ev.get("reason") or "").startswith("nightly verdict accepted: already carded")):
+            continue
+        checked += 1
+        cid = ev["card"]
+        if cid not in texts:
+            try:
+                texts[cid] = _match_norm(open(os.path.join(paths.know, cid + ".md"),
+                                              encoding="utf-8", errors="replace").read())
+            except OSError:
+                texts[cid] = ""
+        terms = distinctive_terms(mk["text"])
+        if not terms:
+            unjudged += 1
+            continue
+        hit = sorted(w for w in terms if w in texts[cid])
+        if len(hit) / len(terms) < RECHECK_MIN_SHARE:
+            miss = sorted(terms - set(hit))
+            reopen.append((mid, cid, len(hit), len(terms), miss))
+    if a.verbose:
+        for mid, cid, h, n, miss in reopen:
+            print(f"  {mid} -> {cid}: {h}/{n} distinctive terms in the card; missing "
+                  f"{', '.join(miss[:6])} | {marks[mid]['text'][:90]}")
+    if a.apply and reopen:
+        append_events(paths, [{"ts": _now(), "ev": "reopen", "id": mid, "by": a.by, "cards": [],
+                               "reason": f"#209 A1 lexical re-check: {h}/{n} distinctive terms "
+                                         f"of the mark in {cid} (missing {', '.join(miss[:6])})"}
+                              for mid, cid, h, n, miss in reopen])
+    print(f"recheck-carded: {checked} mark(s) CARDED by an unquoted 'already carded' verdict; "
+          f"{unjudged} without a distinctive term (kept); "
+          f"{'reopened' if a.apply else 'would reopen (dry, --apply writes)'} {len(reopen)} "
+          f"whose distinctive terms are mostly (< {RECHECK_MIN_SHARE:.2f}) absent from the card")
+    return 0
 
 
 def cmd_card(a, paths):
@@ -1012,9 +1300,31 @@ def cmd_suggest(a, paths):
     return 0
 
 
+def close_unit_review(paths, unit, by, fields, floor=None, prog="review"):
+    """THE way a unit's review is closed — `mark-reviewed` and `approve_inbox.py` both call
+    it.  First the unit's NOT CARDED verdicts are recorded (#209 A4: closing the unit
+    without them sent the marks back to the night's queue), then the marker with the unit's
+    sha256 is written.  A failure while recording leaves the unit unreviewed (raises).
+    -> (marker path, recorded events)."""
+    stem = os.path.basename(unit)[:-3]
+    text = open(unit, encoding="utf-8", errors="replace").read()
+    got = record_not_carded(paths, text, by, floor=floor)
+    recorded = []
+    if got is not None:
+        recorded, bad, unproven, carded = got
+        report_not_carded(prog, bad, unproven, carded)
+        print(f"{prog}: {stem}: recorded {len(recorded)} NOT CARDED verdict event(s)")
+    marker = os.path.join(paths.reviewed, f".reviewed-{stem}-cards")
+    body = f"sha256={sha256_file(unit)}\nunit=memory/inbox/{stem}.md\n"
+    body += "".join(f"{k}={v}\n" for k, v in fields.items())
+    KL.atomic_text(marker, body)
+    return marker, recorded
+
+
 def cmd_mark_reviewed(a, paths):
     """Close the review of ONE unit as it is now (sha256 in the marker) — for a unit the
-    reviewer read and approved nothing from, or approved through a differently named file."""
+    reviewer read and approved nothing from, or approved through a differently named file.
+    The unit's NOT CARDED verdicts are recorded on the way (close_unit_review)."""
     rc = 0
     for u in a.units:
         unit = u if os.path.isabs(u) else os.path.join(paths.root, u)
@@ -1022,13 +1332,9 @@ def cmd_mark_reviewed(a, paths):
             print(f"mark-reviewed: {u} is not a review unit in memory/inbox/")
             rc = 1
             continue
-        stem = os.path.basename(unit)[:-3]
-        os.makedirs(paths.reviewed, exist_ok=True)
-        marker = os.path.join(paths.reviewed, f".reviewed-{stem}-cards")
-        with open(marker, "w", encoding="utf-8") as fh:
-            fh.write(f"sha256={sha256_file(unit)}\nunit=memory/inbox/{stem}.md\n"
-                     f"by={a.by}\nreason={a.reason}\n")
-        print(f"mark-reviewed: {stem} -> {marker}")
+        marker, _ = close_unit_review(paths, unit, a.by, {"by": a.by, "reason": a.reason},
+                                      floor=a.floor, prog="mark-reviewed")
+        print(f"mark-reviewed: {os.path.basename(unit)[:-3]} -> {marker}")
     return rc
 
 
@@ -1062,14 +1368,11 @@ def cmd_floor(a, paths):
     print(floor_of(paths, a.floor))
     return 0
 
-
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--root", "--brain", dest="root", default=None,
-                    help="the base (default: the resolved KHMS_ROOT)")
+    ap.add_argument("--root", "--brain", dest="root", default=None)
     ap.add_argument("--floor", default=None, help="first journal date tracked")
     sub = ap.add_subparsers(dest="cmd", required=True)
-
     s = sub.add_parser("floor")
     s.set_defaults(fn=cmd_floor)
 
@@ -1121,6 +1424,12 @@ def main(argv=None):
     s.add_argument("--by", default="coordinator")
     s.set_defaults(fn=cmd_dismiss)
 
+    s = sub.add_parser("recheck-carded")
+    s.add_argument("--apply", action="store_true")
+    s.add_argument("-v", "--verbose", action="store_true")
+    s.add_argument("--by", default="coordinator")
+    s.set_defaults(fn=cmd_recheck_carded)
+
     s = sub.add_parser("card")
     s.add_argument("id")
     s.add_argument("card")
@@ -1155,9 +1464,8 @@ def main(argv=None):
 
     a = ap.parse_args(argv)
     root = a.root or os.environ.get("MARK_LEDGER_ROOT") or P.get("KHMS_ROOT")
-    reads_only = (a.fn in (cmd_status, cmd_floor, cmd_coverage, cmd_scan, cmd_suggest, cmd_units, cmd_list)
-                  or (a.fn is cmd_sync and a.dry) or (a.fn is cmd_queue and not a.out and not a.chunk))
-    if not reads_only:
+    if a.fn not in (cmd_status, cmd_floor, cmd_queue, cmd_coverage, cmd_scan, cmd_suggest, cmd_units,
+                    cmd_list) and not (a.fn is cmd_sync and a.dry):
         P.require_writable(f"run `mark_ledger.py {a.cmd}`")
     return a.fn(a, Paths(root))
 

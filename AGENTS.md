@@ -36,24 +36,12 @@ deployment (`KHMS_READ_ONLY=1`, rc 4) or an invalid configuration (rc 3) before 
 creates the directories, the ID counter in the configured shared state and an empty tag
 registry. It writes nothing into `memory/know/`.
 
-**Decide now how the base is versioned, and write the choice down.** Two options, and they
-are not equivalent:
-
-- **A git repository.** `git init` inside `$KHMS_ROOT`, commit after every approval. You get
-  history, `log -p` on a single card, `bisect`, blame, and a remote you can clone. This is the
-  default and the better answer whenever it is allowed.
-- **Hardlinked snapshots** — `tools/khms_snapshot.sh`, for a base that must not be in a
-  repository at all (some operators want their knowledge only on their own machine and their
-  own synced folder, with no remote and no clonable history). `--tag` is the commit, `--list`
-  the log, `--diff` the status, `--restore` the checkout, `--prune` the retention policy;
-  unchanged files are hardlinks, so a daily snapshot of a large base costs the bytes that
-  actually changed, and every snapshot is a complete tree you can read with `cat`.
-  What you do NOT get: bisect, blame, per-file history, or a remote. Run it from cron before
-  the nightly and after the morning review, and keep the snapshot root OUTSIDE the base —
-  inside, a synced folder would carry every snapshot too.
-
-Whichever you choose, the point is the same one: a tool that rewrites eleven cards at 03:30
-is recoverable only if something took a copy first.
+**Version history belongs to the storage service.** Do not create local snapshots
+or pre-write copies. Before deployment, verify that the configured server retains
+file versions and test restoring an isolated fixture by content hash. Recovery is
+per file: reconcile the corresponding review receipt, ledger and counter, then
+rebuild views/indexes. Unsynchronized changes and expired versions cannot be
+promised recoverable. Existing pinned experiment evidence is not deleted by tools.
 
 Resulting layout — memorize it, you will refer to it constantly:
 
