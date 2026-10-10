@@ -13,7 +13,7 @@ import mark_ledger as ml
     'done', 'agent-done', 'agent-done-check', 'agent-partial', 'status',
     'result', 'check', 'dispatch', 'deploy', 'merge', 'handoff', 'plan',
     'report', 'todo', 'pending', 'spawn', 'tokens', 'board', 'board-reply',
-    'board-archive', 'progress', 'private-kind', 'měření', 'finding→status',
+    'board-archive', 'progress', 'private-kind', 'm\u011b\u0159en\u00ed', 'finding→status',
 ])
 def test_every_actual_kind_is_accounted_for(tmp_path, kind):
     journal = tmp_path / 'journal'

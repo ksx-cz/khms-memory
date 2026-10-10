@@ -624,6 +624,19 @@ if [ -s "$SWEEP_SOURCE_INDEX" ]; then
   mapfile -t SWEEP_GROUP_FILES < <(ls "$STAGING/nightly-$NK-prepare-group"[0-9]*.txt | sort)
   echo "$(date -Is) prepare: $(wc -l < "$SWEEP_SOURCE_INDEX") primary source chunk(s) -> ${#SWEEP_GROUP_FILES[@]} fresh session(s), <= $SWEEP_GROUP_CHUNKS chunk(s) each" >> "$LOG"
 fi
+# A successful splitter is not proof of complete coverage: verify source identities in order.
+PREPARE_GROUP_INDEX=$STAGING/nightly-$NK-prepare-group-index.txt
+: > "$PREPARE_GROUP_INDEX"
+if [ ${#SWEEP_GROUP_FILES[@]} -gt 0 ]; then
+  cat "${SWEEP_GROUP_FILES[@]}" > "$PREPARE_GROUP_INDEX" || SOURCE_FAILED="prepare group reading failed"
+fi
+if ! cmp -s "$SWEEP_SOURCE_INDEX" "$PREPARE_GROUP_INDEX"; then
+  echo "prepare: grouped chunk identities differ from source index" >> "$SRC_FAILED"
+  SOURCE_FAILED=$(grep -c . "$SRC_FAILED")
+fi
+PREPARE_COMPLETED_INDEX=$STAGING/nightly-$NK-prepare-completed-chunks.txt
+: > "$PREPARE_COMPLETED_INDEX"
+PREPARE_COMPLETED=0
 sweep_group_inputs() {
   local k="$1" n="$2" gf="$3" o="$4" source chunk
   echo "INPUTS:"
@@ -821,6 +834,8 @@ $(sweep_group_inputs "$_k" "$_K" "$_gf" "$_gout")" "${STAGE_ISOLATION[@]}" --mod
     python3 "$CODE/maxtok_check.py" --stage "sweep-$_k" --since "$STAGE_MARK" \
       --projects "$PROJ_DIR" >> "$LOG" 2>&1 || true
     [ "$SWEEP_OK" = "1" ] || break
+    cat "$_gf" >> "$PREPARE_COMPLETED_INDEX"
+    PREPARE_COMPLETED=$((PREPARE_COMPLETED + $(wc -l < "$_gf")))
     [ "$_k" = "1" ] && continue
     shopt -s nullglob
     _gparts=("${_gout%.md}-part"*.md "${_gout%.md}-final.md")
@@ -838,6 +853,11 @@ $(sweep_group_inputs "$_k" "$_K" "$_gf" "$_gout")" "${STAGE_ISOLATION[@]}" --mod
       echo "$(date -Is) sweep part $_k/$_K produced no candidates" >> "$LOG"
     fi
   done
+  if [ "$PREPARE_COMPLETED" -ne "$(wc -l < "$SWEEP_SOURCE_INDEX")" ] \
+     || ! cmp -s "$SWEEP_SOURCE_INDEX" "$PREPARE_COMPLETED_INDEX"; then
+    SWEEP_OK=0
+    echo "$(date -Is) prepare incomplete: $PREPARE_COMPLETED chunk(s) completed, expected $(wc -l < "$SWEEP_SOURCE_INDEX"); source identities must match exactly" >> "$LOG"
+  fi
 else
 RETRY_DEADLINE_EPOCH=$SWEEP_DEADLINE retry_claude_call sweep "$SWEEP_TIMEOUT" "$LOG" "$STAGE_MARK" -- \
   "$AGENT" -p "$SWEEP_PROMPT" "${STAGE_ISOLATION[@]}" --model "$SWEEP_MODEL" --allowedTools $TOOLS || SWEEP_OK=0

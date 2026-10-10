@@ -624,3 +624,36 @@ sys.exit(rc)
     assert not any(call["stage"] == "sweep" for call in calls)
     index = root / f"memory/inbox/.staging/nightly-2099-01-02-{failed_source}-chunks.txt"
     assert len(index.read_text().splitlines()) == 1
+
+
+def test_split_success_with_missing_chunk_blocks_prepare_and_stamp(tmp_path):
+    root, fake = make_base(tmp_path, n_marks=0)
+    tr = tmp_path / "source"
+    tr.mkdir()
+    f = tr / "s.jsonl"
+    f.write_text("".join(json.dumps({"type": "user", "timestamp": "2099-01-01T10:00:00Z",
+                                    "message": {"content": "unmarked calibration " * 100}}) + "\n"
+                         for _ in range(35)))
+    os.utime(f, (time.time() + 3600,) * 2)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    wrapper = bin_dir / "split"
+    wrapper.write_text(f"#!{sys.executable}\n" + r'''
+import pathlib, subprocess, sys
+args = sys.argv[1:]
+rc = subprocess.run(["/usr/bin/split", *args]).returncode
+if rc == 0 and "prepare-group" in args[-1]:
+    prefix = pathlib.Path(args[-1])
+    groups = sorted(prefix.parent.glob(prefix.name + "*.txt"))
+    assert len(groups) > 1
+    groups[-1].unlink()
+sys.exit(rc)
+''')
+    wrapper.chmod(0o755)
+    r = run_night(tmp_path, root, fake, KHMS_TRANSCRIPTS=tr,
+                  PATH=str(bin_dir) + os.pathsep + os.environ["PATH"])
+    assert r.returncode != 0 and "sweep NOT RUN" in log_of(root), log_of(root)
+    assert not (root / "state/shared/last-nightly").exists()
+    call_log = tmp_path / "calls.txt.jsonl"
+    calls = [json.loads(line) for line in call_log.read_text().splitlines()] if call_log.exists() else []
+    assert not any(call["stage"] == "sweep" for call in calls)
