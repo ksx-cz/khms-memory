@@ -114,6 +114,9 @@ DEFAULTS = [
     ("KHMS_ACCOUNT_DIR", ""),              # token accounting: the project's transcript directory ("" = derive)
     # --- morning review ping (khms_review_ping.sh) -----------------------------------------------------
     ("KHMS_PING_DEPUTY", ""),
+    ("KHMS_REVIEW_DEPUTY_TRANSPORT", ""),
+    ("KHMS_JUDGE_EXPERIMENT_CONFIG", ""),
+    ("KHMS_METRICS_CONFIG", ""),
     ("KHMS_PING_SEND", ""),                # argv: delivers the ping text read on stdin ("" = print only)
     ("KHMS_PING_EXTRA", ""),               # argv: project lines to add to the ping, one per stdout line ("" = none)
     # --- standing-base triage (nightly_triage.sh, khms_contradict.py) -----------------------------------
