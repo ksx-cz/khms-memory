@@ -28,16 +28,22 @@ LOG=${WEEKLY_LOG:-$(khms_get KHMS_NIGHT_LOG)}
 mkdir -p "$(dirname "$LOG")"
 WSTAMP=$(khms_get KHMS_WEEK_STAMP)
 # mtime is the completion clock (also used by the review ping), never the inbox date.
+# Due on the seventh calendar date after completion in the scheduler timezone
+# (inherited TZ, otherwise the host timezone). Compare date ordinals in UTC to
+# avoid DST-length days; WEEKLY_DATE only selects the inbox, not this clock.
 # Check cheaply before locking, then again under the lock: another run may have finished.
 weekly_due() {
-  local completed now
+  local completed completed_date today completed_day today_day
   [ -f "$WSTAMP" ] || return 0
   completed=$(stat -c %Y -- "$WSTAMP") || return 0
-  now=$(date +%s)
-  [ "$((now - completed))" -ge 604800 ]
+  completed_date=$(date -d "@$completed" +%F)
+  today=$(date +%F)
+  completed_day=$(TZ=UTC0 date -d "$completed_date" +%s)
+  today_day=$(TZ=UTC0 date -d "$today" +%s)
+  [ "$(((today_day - completed_day) / 86400))" -ge 7 ]
 }
 weekly_skip() {
-  echo "$(date -Is) weekly not due: last success is younger than 7 days ($WSTAMP)" >> "$LOG"
+  echo "$(date -Is) weekly not due: last success is fewer than 7 calendar dates ago ($WSTAMP)" >> "$LOG"
   exit 0
 }
 weekly_due || weekly_skip

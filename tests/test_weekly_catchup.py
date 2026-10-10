@@ -2,6 +2,9 @@
 import os
 import subprocess
 import time
+import shutil
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -111,7 +114,6 @@ def test_due_is_checked_again_after_acquiring_weekly_lock(tmp_path):
     # Simulate a previous holder completing between the initial check and acquisition.
     bindir = tmp_path / "bin"
     bindir.mkdir()
-    import shutil
     real_flock = shutil.which("flock")
     wrapper = bindir / "flock"
     wrapper.write_text('#!/bin/bash\nif [ "$1" = "-n" ] && [ "$2" = "7" ]; then\n'
@@ -144,3 +146,64 @@ def test_merge_quota_leaves_previous_final_output_untouched(tmp_path):
     out.write_text("previous completed proposal")
     assert run(env).returncode == 75
     assert out.read_text() == "previous completed proposal"
+
+
+def simulated_clock(tmp_path, env, now):
+    """Override only wall-clock date calls; preserve GNU date's timestamp parsing."""
+    bindir = tmp_path / "clock-bin"
+    bindir.mkdir(exist_ok=True)
+    wrapper = bindir / "date"
+    wrapper.write_text('#!/bin/bash\ncase "$*" in\n'
+                       '  +%s|+%F|-Is|+%H%M%S) exec "' + shutil.which("date") +
+                       '" -d "@$FAKE_NOW" "$@" ;;\n'
+                       '  *) exec "' + shutil.which("date") + '" "$@" ;;\nesac\n')
+    wrapper.chmod(0o755)
+    env.update(PATH=str(bindir) + os.pathsep + os.environ["PATH"],
+               TZ="Europe/Prague", FAKE_NOW=str(int(now.timestamp())))
+
+
+@pytest.mark.parametrize("completed,now,due", [
+    ("2026-10-01T23:59:00+02:00", "2026-10-08T00:01:00+02:00", True),
+    ("2026-10-01T00:01:00+02:00", "2026-10-07T23:59:00+02:00", False),
+    # Seven local dates span less than 168 hours across the spring DST change.
+    ("2026-03-23T06:00:00+01:00", "2026-03-30T05:00:00+02:00", True),
+    # The UTC date differs: the completion must be interpreted in scheduler TZ.
+    ("2026-10-01T00:30:00+02:00", "2026-10-07T23:59:00+02:00", False),
+    ("2026-10-19T06:00:00+02:00", "2026-10-26T05:00:00+01:00", True),
+])
+def test_calendar_due_boundaries(tmp_path, completed, now, due):
+    root, env = setup_week(tmp_path)
+    s = stamp(root, 0)
+    completed = datetime.fromisoformat(completed)
+    os.utime(s, (completed.timestamp(),) * 2)
+    simulated_clock(tmp_path, env, datetime.fromisoformat(now))
+    result = run(env)
+    assert result.returncode == 0, log_of(root) + result.stderr
+    assert bool(calls(tmp_path)) == due
+
+
+@pytest.mark.parametrize("start", ["2026-03-01", "2026-10-01"])
+def test_84_daily_completions_keep_seven_calendar_day_cycle(tmp_path, start):
+    root, env = setup_week(tmp_path)
+    zone = ZoneInfo("Europe/Prague")
+    first = datetime.fromisoformat(start).replace(hour=4, tzinfo=zone)
+    s = stamp(root, 0)
+    os.utime(s, (first.timestamp(),) * 2)
+    weekly_days = []
+    false_alarms = 0
+    # Night duration varies; weekly itself completes later than its due check.
+    for day in range(1, 85):
+        now = first + timedelta(days=day, minutes=(day * 37) % 180)
+        simulated_clock(tmp_path, env, now)
+        env["WEEKLY_DATE"] = now.date().isoformat()
+        before = len(calls(tmp_path))
+        result = run(env)
+        assert result.returncode == 0, log_of(root) + result.stderr
+        if len(calls(tmp_path)) > before:
+            weekly_days.append(day)
+            completed = now + timedelta(minutes=90)
+            os.utime(s, (completed.timestamp(),) * 2)
+        # The deployed stale threshold remains 7 elapsed days + 1 hour.
+        false_alarms += now.timestamp() - s.stat().st_mtime > 7 * 86400 + 3600
+    assert weekly_days == list(range(7, 85, 7))
+    assert false_alarms == 0
