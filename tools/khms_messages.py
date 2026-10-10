@@ -65,8 +65,8 @@ DEFAULTS = {
     "LEDGER_NO_STATE": "MARK LEDGER: no state -- run mark_ledger.py sync",
     "LEDGER_STATUS": ("MARK LEDGER (since {floor}): OPEN {open} (queued {queued}, proposed in an unreviewed "
                       "inbox/carry {proposed}{suggested}) · CARDED {carded} · DISMISSED {dismissed} · carry "
-                      "{carry} batch(es) · {oldest}{age} · state of {generated} · scope: only MARKs of "
-                      "{nkinds} kinds since {floor} -- not covered: status MARKs, journals before the floor, "
+                      "{carry} batch(es) · {oldest}{age} · state of {generated} · scope: all actual MARK "
+                      "kinds since {floor} -- not covered: journals before the floor, "
                       "knowledge without a MARK line"),
     "LEDGER_SUGGESTED": ", with a card suggestion {n}",
     "LEDGER_AGE": " (age {days} d)",
@@ -88,8 +88,8 @@ DEFAULTS = {
     "HOOK_LEDGER_SUGGESTED": ", with a card proposal {n} -- a proposal is not coverage, `mark_ledger.py suggest`",
     "HOOK_LEDGER_LINE": ("MARK LEDGER (since {floor}): OPEN {open} (queued {queued}, in the unreviewed inbox/carry "
                          "{proposed}{suggested}) \u00b7 CARDED {carded} \u00b7 DISMISSED {dismissed} \u00b7 carry "
-                         "{carry} batches \u00b7 {oldest} \u00b7 state of {generated} \u00b7 scope: only the "
-                         "tracked MARK kinds since {floor}; outside it: status MARKs, journals before the floor, "
+                         "{carry} batches \u00b7 {oldest} \u00b7 state of {generated} \u00b7 scope: all actual "
+                         "MARK kinds since {floor}; outside it: journals before the floor, "
                          "findings without a MARK line -- OPEN 0 does not mean \"nothing was lost\""),
     "HOOK_LEDGER_ERROR": "MARK LEDGER: report failed ({exc}) -- run tools/mark_ledger.py status",
     "HOOK_INBOX_UNREVIEWED": ("KHMS: UNREVIEWED INBOX: {files} -- do the review (approve_inbox.py, "

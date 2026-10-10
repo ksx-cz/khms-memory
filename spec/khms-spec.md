@@ -261,18 +261,21 @@ recalibrate against your own logs, and recalibrations are recorded as cards.
 ### 9.1 Session capture
 On a decision, a stated requirement, a failed attempt or a solved problem: append one line to
 today's journal — `MARK[kind] one-line summary (sess id)`. A full inline card only for
-`measured` knowledge with immediate usefulness. Everything else waits for the nightly sweep;
-the MARKs tell it where to dig.
+`measured` knowledge with immediate usefulness. Every actual journal MARK, including an unfamiliar
+kind, enters the coverage ledger and is owned by the nightly record stage.
 
 ### 9.2 Nightly sweep (daily, after transcript archival)
-Inputs, all deterministic and free: a delta transcript digest (message texts, tool names and
-exit states, errors, MARKs — tool outputs and thinking stay in the raw layer), every journal
-file touched since the last successful run, and the day's git log. Large inputs are split into
+Prepare inputs: a delta transcript digest (message texts, including plan passages, tool names,
+exit states and errors — tool outputs and thinking stay in the raw layer) and the day's git log,
+with explicit MARK records excluded. Prepare never reads journals; journal MARKs belong solely
+to the record stage. Large inputs are split into
 chunks that the reading tool can actually read whole; an input handed over in one oversized
 file is read as a self-chosen prefix, silently.
 
-Stages: (a) a cheap model extracts every candidate card per §4 — over-generation is fine,
-verbatim source quotes are mandatory; (b) a mechanical quote verifier greps every quote against
+Stages: (a) prepare extracts unmarked knowledge as candidate cards per §4; the record stage
+processes queued journal MARKs by stable id, producing a candidate or an explicit NOT CARDED reason
+for each. Status-only records remain accounted for without requiring a knowledge card.
+Over-generation is fine; verbatim source quotes are mandatory. (b) a mechanical quote verifier greps every quote against
 the source it names and lists unbacked specifics; (c) a mid-tier model enforces that report,
 deduplicates, enforces the schema, links candidates to existing cards using the topic views of
 the touched tags, flags contradictions and cross-topic synergies, and appends a factual day

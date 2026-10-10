@@ -423,6 +423,25 @@ for _repo in "${GIT_REPOS[@]}"; do
   git -C "$_repo" log "${_gsince[@]}" --stat --date=iso >> "$GITLOG" 2>/dev/null \
     || echo "git: $_repo cannot be read" >> "$SRC_FAILED"
 done
+# Prepare sees unmarked source records only. Keep unmarked passages before a MARK,
+# but suppress its continuations through a blank separator, digest record or git commit.
+# This is explicit source filtering, not semantic dedup of paraphrases.
+python3 - "$DIGEST" "$GITLOG" <<'PYUNMARKED' || echo "prepare: unmarked source filtering failed" >> "$SRC_FAILED"
+import pathlib, re, sys
+for filename in sys.argv[1:]:
+    path = pathlib.Path(filename)
+    kept, marked = [], False
+    for line in path.read_text(encoding="utf-8").splitlines(keepends=True):
+        if re.match(r"^commit [0-9a-f]+|^\[.*?\] (?:USER|ASSISTANT|TOOL):|^===== SESSION", line):
+            marked = False
+        if re.search(r"MARK\[[^]\s]+\]", line):
+            marked = True
+        if marked and not line.strip():
+            marked = False
+        if not marked:
+            kept.append(line)
+    path.write_text("".join(kept), encoding="utf-8")
+PYUNMARKED
 SOURCE_FAILED=""
 if [ -s "$SRC_FAILED" ]; then
   SOURCE_FAILED=$(grep -c . "$SRC_FAILED")
@@ -507,7 +526,7 @@ done
 
 SIZE=$(stat -c%s "$DIGEST")
 NO_WINDOW=0
-if [ "$SIZE" -lt 200 ] && [ ! -s "$GITLOG" ] && [ ! -s "$JSRC" ]; then
+if [ "$SIZE" -lt 200 ] && [ ! -s "$GITLOG" ]; then
   if [ "$QUEUE_N" -eq 0 ] && [ "$CARRY_N" -eq 0 ] && [ -z "$SOURCE_FAILED" ]; then
     echo "$(date -Is) nothing new (digest ${SIZE}B), queue empty, carry empty — nothing to distil" >> "$LOG"
     if [ "$DRYRUN" != "1" ]; then
@@ -600,8 +619,8 @@ if [ -s "$CHUNK_INDEX" ]; then
   fi
 fi
 # sweep_group_inputs <k, 1-based> <K> <group index file> <output file> — the INPUTS block of
-# sweep part k. Part 1 also cards the journal's MARK anchors and the git log; the other parts
-# get both as grep-only context, so a MARK is never carded K times.
+# sweep part k. Part 1 owns the git log; later parts use it as grounding context.
+# No part receives journals: every journal MARK belongs to the record stage.
 sweep_group_inputs() {
   local k="$1" n="$2" gf="$3" o="$4"
   echo "INPUTS:"
@@ -611,10 +630,8 @@ sweep_group_inputs() {
   sed 's|^|  * |' "$gf"
   echo "- transcript digest, whole file — GREP ONLY, never Read it whole: $DIGEST"
   if [ "$k" = "1" ]; then
-    echo "- journal (all journal files touched since last run, concatenated): $JSRC"
     echo "- $GITLOG_INPUT"
   else
-    echo "- journal — CONTEXT ONLY (grep it around a digest hit): its MARK anchors are carded by PART 1, do not card them here: $JSRC"
     echo "- the day's git log — CONTEXT ONLY (grep it; quote as src=gitlog only to ground a digest card), carded by PART 1: $GITLOG"
   fi
   echo "OUTPUT FILE: $o"
@@ -701,11 +718,11 @@ if [ "$DRYRUN" = "1" ]; then
     "$SWEEP_TIMEOUT" "$(date -d @"$SWEEP_DEADLINE" +%H:%M)" "$((SWEEP_DEADLINE - RUN_START_EPOCH))" \
     "$(grep -c . "$SWEEP_FAILED_FILE" 2>/dev/null || echo 0)"
   echo
+  echo "prepare journal tokens: 0 (journal records belong to the MARK ledger/stage)"
   echo "--- SWEEP stage INPUTS block (verbatim, as the prompt receives it) ---"
   cat <<EOF
 INPUTS:
 - $DIGEST_INPUT
-- journal (all journal files touched since last run, concatenated): $JSRC
 - $GITLOG_INPUT
 OUTPUT FILE: $SWEEP
 EOF
@@ -762,7 +779,6 @@ SWEEP_PROMPT="$SWEEP_BASE
 
 INPUTS:
 - $DIGEST_INPUT
-- journal (all journal files touched since last run, concatenated): $JSRC
 - $GITLOG_INPUT
 OUTPUT FILE: $SWEEP"
 # reassemble <target> <part files...> — the merge described at 2a, as a function since #209
@@ -896,18 +912,6 @@ if [ ${#PARTS[@]} -gt 0 ]; then
   reassemble "$SWEEP" "${PARTS[@]}"
 fi
 
-# 2a') ATTRIBUTION — 0 tokens (board #209). Every sweep candidate whose `src=journal` quote is a
-# verbatim span of a tracked MARK gets a `MARKS: <id>` line. Those marks are then held by
-# tonight's proposal; the rest of the queue goes to the MARK stage below.
-ledger attribute "$SWEEP" >> "$LOG" 2>&1 \
-  || echo "$(date -Is) mark attribution FAILED (non-fatal) — the MARK stage will see marks the sweep may already cover" >> "$LOG"
-# 2a'') EXACTLY ONCE ACROSS RUNS (KHMSFIX): the sweep reads every journal FILE touched since the
-# stamp, so marks a pending carry batch or an unreviewed unit already holds come back as new
-# candidates. A candidate whose MARKS ids are ALL held (or carded/dismissed) leaves the list
-# here, 0 tokens; its text is kept in $STAGING for the record.
-ledger dedup "$SWEEP" --moved-to "$STAGING/nightly-$NK-dedup.md" >> "$LOG" 2>&1 \
-  || echo "$(date -Is) mark dedup FAILED (non-fatal) — held marks may be proposed twice" >> "$LOG"
-
 # 2b) mechanical grounding check — non-fatal, its report is an INPUT to consolidate.
 # Deliberately not fatal: a sweep with some ungrounded cards is still worth consolidating, and the
 # consolidate stage is instructed to strip exactly what this report names.
@@ -925,7 +929,19 @@ run_quotecheck() {   # run_quotecheck <file> -> appends to $QREPORT
     >> "$QREPORT" 2>&1 || true
 }
 
-# 2c) THE MARK STAGE (board #209). Queued OPEN marks that no sweep candidate covers go to the
+# A prepare candidate must never claim journal grounding, even if a model ignores its prompt.
+# Enforce before record-stage candidates join the shared list; legacy carry stays untouched.
+python3 - "$SWEEP" <<'PYPREPARE'
+import pathlib, re, sys
+p = pathlib.Path(sys.argv[1])
+if p.exists():
+    blocks = re.split(r"(?m)(?=^#{2,3} +[A-Z]\d+[a-z]?\b)", p.read_text(encoding="utf-8"))
+    p.write_text("".join(b for b in blocks if not re.search(r"src=journal\s*::", b)), encoding="utf-8")
+PYPREPARE
+python3 "$CODE/verify_quotes.py" "$SWEEP" --source digest="$DIGEST" --source gitlog="$GITLOG" \
+  >> "$QREPORT" 2>&1 || true
+
+# 2c) THE MARK STAGE (board #209). Queued OPEN journal marks go to the
 # model in chunks of $MARK_CHUNK: every id must end in a candidate (`MARKS:` line) or in a
 # `## MARKS NOT CARDED` line with a reason. A chunk that fails is NOT merged (a cut-off
 # candidate must not drag its ids into a drop) — its marks simply stay OPEN for tomorrow, and so
@@ -935,9 +951,9 @@ MARKS_PROMPT_FILE=$CODE/prompts/nightly-marks.md
 MCHUNKS=()
 if [ -f "$MARKS_PROMPT_FILE" ] && [ "$QUEUE_N" -gt 0 ] && [ -n "$AGENT_BIN" ]; then
   mapfile -t MCHUNKS < <(ledger queue --chunk "$MARK_CHUNK" --outdir "$STAGING" \
-                           --prefix "nightly-$NK-markchunk" --pending "$SWEEP" 2>>"$LOG") || MCHUNKS=()
+                           --prefix "nightly-$NK-markchunk" 2>>"$LOG") || MCHUNKS=()
 fi
-echo "$(date -Is) === marks === ${#MCHUNKS[@]} chunk(s) of <= $MARK_CHUNK queued mark(s) not covered by the sweep" >> "$LOG"
+echo "$(date -Is) === marks === ${#MCHUNKS[@]} chunk(s) of <= $MARK_CHUNK queued mark(s) owned by the record stage" >> "$LOG"
 MK=0
 for MC in "${MCHUNKS[@]}"; do
   [ -f "$MC" ] || continue

@@ -9,6 +9,7 @@ capped at 20 cards, the overflow went to a section nothing read again, and no li
 piece of knowledge had been lost. Every tracked journal MARK now has an id in a ledger
 (`tools/mark_ledger.py`), and it stays OPEN — and comes back to this queue every night — until a card
 covers it or the coordinator dismisses it with a reason. You are handed a chunk of that queue.
+This record stage exclusively owns journal MARKs; the prepare sweep never reads journals.
 
 ## Inputs (paths at the end of this prompt)
 - the MARK QUEUE chunk: one line per mark —

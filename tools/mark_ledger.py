@@ -10,7 +10,7 @@ a knowledge item that is neither carded nor consciously dismissed simply stopped
 since: no daily card limit at all, everything in the queue is processed, and every tracked MARK is
 accounted for.
 
-WHAT.  Every journal MARK of a knowledge-bearing kind gets a stable id and ends in exactly one state:
+WHAT.  Every actual journal MARK, of any kind, gets a stable id and ends in exactly one state:
 
     CARDED     a card in memory/know/ covers it (card id recorded)
     DISMISSED  the reviewer dismissed it at morning review, with a reason, through this tool
@@ -41,8 +41,7 @@ marker directory, KHMS_SHARED_STATE/reviewed) counts only while it still describ
 `sha256=<hash of the unit>` (approve writes it), and a legacy marker without a hash counts only when
 the unit is not newer than the marker.  Anything appended after a review is unreviewed again.
 
-WHAT THE LEDGER DOES NOT COVER (printed by `sync`/`status`): journals before the floor, MARK kinds
-outside the tracked kind table, and knowledge that never got a MARK line.  "OPEN 0" therefore means
+WHAT THE LEDGER DOES NOT COVER (printed by `sync`/`status`): journals before the floor and knowledge that never got a MARK line.  "OPEN 0" therefore means
 "every tracked MARK since the floor is carded or dismissed", not "nothing was lost anywhere".
 
 MARK KINDS.  The tracked kinds and their spellings are a table (canonical kind -> aliases).  The
@@ -61,7 +60,6 @@ Subcommands (all accept --root DIR, the base; default: the resolved KHMS_ROOT):
     floor                 the floor date in effect
     queue [--out F] [--chunk N --outdir D --prefix P] [--since DATE] [--until DATE]
                           OPEN, not-proposed marks, oldest first
-    dedup FILE [--moved-to F]   drop candidates whose MARKs are all already held
     attribute FILE        add `MARKS:` lines to candidates whose journal quotes
                           match a mark (0 tokens), in place
     coverage FILE --queue Q   how many queue ids FILE accounts for
@@ -97,10 +95,8 @@ DEFAULT_ROOT = P.soft("ROOT")
 DEFAULT_FLOOR = "1970-01-01"
 
 # --- which MARKs are knowledge -------------------------------------------------
-# Knowledge kinds: decisions, findings, requirements, gotchas, errors, knowledge-base issues,
-# measurements and refutations. Status kinds (done, result, board replies, spawned agents, token
-# reports, ...) are not knowledge and are not tracked. A deployment replaces this table with
-# LEDGER_KINDS (see the docstring); its canonical names are part of the mark ids.
+# Canonical aliases preserve existing IDs; unlisted real kinds are tracked under their
+# own names. Status/progress MARKs require an explicit review verdict too.
 DEFAULT_KINDS = {
     "decision": ("decision", "decided"),
     "finding": ("finding", "found", "solved", "problem"),
@@ -130,14 +126,6 @@ def _kind_table():
 KIND_ALIASES = _kind_table()
 CANON = {alias: canon for canon, aliases in KIND_ALIASES.items() for alias in aliases}
 
-# Status / progress kinds — never knowledge (K-93929: launched, PASS, merged, deployed,
-# tagged, a board move, the next step).  Measured over journal 2026-09-21..10-08: these
-# are the status kinds actually used; anything not listed here is tracked.
-STATUS_KINDS = frozenset(PT.words("LEDGER_STATUS_KINDS", (
-    "done", "agent-done", "agent-done-check", "agent-partial", "status",
-    "result", "check", "dispatch", "deploy", "merge", "handoff",
-    "plan", "report", "todo", "pending", "spawn", "tokens", "board",
-    "board-reply", "board-archive", "progress")))
 # A kind is a word (Czech letters, digits, `-`, `_`, one optional `→status` tail); a
 # placeholder in prose (`MARK[...]`, `MARK[<kind>]`, `MARK[..]`) is not a mark.
 KIND_SHAPE_RE = re.compile(r"^[^\W\d_][\w-]*(?:→[\w-]+)?$")
@@ -145,11 +133,11 @@ KIND_PLACEHOLDERS = frozenset(("kind", "x", "xxx"))
 
 
 def canon_kind(raw):
-    """-> the canonical tracked kind of a MARK token, or None (status kind, placeholder)."""
+    """-> the canonical tracked kind of a MARK token, or None (prose placeholder)."""
     k = raw.strip("*`:").lower()
     if k in CANON:
         return CANON[k]
-    if k in STATUS_KINDS or k in KIND_PLACEHOLDERS or not KIND_SHAPE_RE.match(k):
+    if k in KIND_PLACEHOLDERS or not KIND_SHAPE_RE.match(k):
         return None
     return k
 
@@ -166,6 +154,14 @@ MARK_RE = re.compile(
     r"(?:[~≈≤<>]?(?P<hm>\d{1,2}:\d[\dx])(?::\d{2})?\s+)?"
     r"(?:\([^)\n]{0,80}\)\s+)?"
     r"MARK\[(?P<kind>[^\]\s]+)\](?:\*\*)?\s*(?P<text>.*)$")
+# Timestamped journal entries may record narrative before their first actual MARK.
+# Require a timestamp and a sentence boundary, so prose examples stay excluded.
+ENTRY_RE = re.compile(
+    r"^\s*(?:[-*]\s+)?(?:\*\*)?"
+    r"(?:\d{4}-\d{2}-\d{2}T(?P<isot>\d{2}:\d{2})(?::\d{2})?"
+    r"(?:\.\d+)?(?:[+-]\d{2}:?\d{2}|Z)?\s+|"
+    r"(?:\d{4}-\d{2}-\d{2},?\s+)?"
+    r"[~≈≤<>]?(?P<hm>\d{1,2}:\d[\dx])(?::\d{2})?\s+)")
 LEAD_TIME_RE = re.compile(r"^(?P<hm>\d{1,2}:\d{2})(?::\d{2})?\b\s*")
 # A LATER MARK token on a line that opens with a MARK (#209 A3): it starts a mark of its
 # own only after a sentence end (`. ; ! ? )` or a dash) and outside backticks — a MARK
@@ -227,7 +223,22 @@ def parse_marks(line):
     whose text starts at that token."""
     m = MARK_RE.match(line)
     if not m:
-        return []
+        entry = ENTRY_RE.match(line)
+        if not entry:
+            return []
+        hm = entry.group("isot") or entry.group("hm") or ""
+        if len(hm) == 4:
+            hm = "0" + hm
+        out = []
+        for token in TOKEN_RE.finditer(line, entry.end()):
+            before = line[:token.start()]
+            if before.count("`") % 2 or not LATER_LEAD_RE.search(before):
+                continue
+            kind = canon_kind(token.group("kind"))
+            text = line[token.end():].strip()
+            if kind and text:
+                out.append((kind, hm, text))
+        return out
     hm = m.group("isot") or m.group("hm") or ""
     text = m.group("text").strip()
     if not hm:
@@ -535,9 +546,9 @@ def pending_files(paths):
     return files
 
 
-def proposed_ids(paths, extra=()):
+def proposed_ids(paths):
     prop = {}
-    for f in list(pending_files(paths)) + list(extra):
+    for f in pending_files(paths):
         try:
             text = open(f, encoding="utf-8", errors="replace").read()
         except OSError:
@@ -599,7 +610,7 @@ def floor_of(paths, arg):
     return DEFAULT_FLOOR
 
 
-def derive(paths, floor, until=None, extra_pending=()):
+def derive(paths, floor, until=None):
     """State of every tracked mark.  CARDED only by a structured link — the card's
     `marks:` frontmatter or the coordinator's `card` event; the LAST event of an id
     wins; a `reopen` ignores the `marks:` links of the cards it names (the ones that
@@ -611,7 +622,7 @@ def derive(paths, floor, until=None, extra_pending=()):
     links = structural_links(cards)
     suggested = suggest_cards(marks, cards, floor)
     known_cards = {c[0] for c in cards}
-    prop = proposed_ids(paths, extra_pending)
+    prop = proposed_ids(paths)
     dups = {}
     for mid, mk in marks.items():
         ev = events.get(mid) or {}
@@ -703,10 +714,8 @@ def carry_count(paths):
                 if re.search(r"(?:^|-)cons-\d+\.md$", os.path.basename(f))])
 
 
-TRACKED_KINDS = sorted(KIND_ALIASES)          # the BASE kinds; every non-status kind is tracked
-NOT_COVERED = ("journals before the floor; status MARK kinds (STATUS_KINDS: done, "
-               "agent-done, board-reply, check, merge, deploy, ...); knowledge without a "
-               "MARK line")
+TRACKED_KINDS = sorted(KIND_ALIASES)  # base canonical kinds, not a tracking allowlist
+NOT_COVERED = "journals before the floor; knowledge without an actual MARK line"
 
 
 def summarize(marks, floor, paths=None):
@@ -742,7 +751,7 @@ def summarize(marks, floor, paths=None):
             (dt.date.today() - dt.date.fromisoformat(oldest["date"])).days
             if oldest and re.match(r"^\d{4}-\d{2}-\d{2}$", oldest["date"]) else None),
         # what "OPEN 0" does and does not promise (review P2-6)
-        "scope": {"floor": floor, "kinds": TRACKED_KINDS, "status_kinds": sorted(STATUS_KINDS),
+        "scope": {"floor": floor, "kinds": TRACKED_KINDS, "status_kinds": [], "all_kinds": True,
                   "not_covered": NOT_COVERED},
         # marks of kinds outside the eight base kinds — tracked since #209 A2
         "new_kinds": dict(sorted(new_kinds.items(), key=lambda kv: (-kv[1], kv[0]))),
@@ -769,7 +778,7 @@ def status_line(s):
                  carded=s["carded"], dismissed=s["dismissed"], carry=s.get("carry", "?"), oldest=old,
                  age=M.msg("LEDGER_AGE", days=age) if age is not None else "",
                  generated=s["generated"],
-                 nkinds="all non-status kinds")
+                 nkinds="all actual MARK")
 
 
 def _new_kinds_part(nk, top=3):
@@ -877,53 +886,22 @@ def attribute_text(text, marks):
     return "".join(out), touched
 
 
-def dedup_text(text, held):
-    """Candidates whose `MARKS:` ids are ALL already held — CARDED/DISMISSED, or proposed
-    in an unreviewed unit or a carry batch — leave the candidate list (0 tokens).  A sweep
-    reads every journal FILE touched since the stamp, so a second run on the same day (or a
-    journal appended after the night) re-proposes marks a pending batch already holds;
-    without this they were consolidated and proposed twice (KHMSFIX, review P1-2's
-    exactly-once).  Candidates without a MARKS line are untouched.  Returns
-    (new text, [(label, ids, removed block)])."""
-    heads = list(CAND_RE.finditer(text))
-    if not heads:
-        return text, []
-    out, pos, moved = [], 0, []
-    for i, h in enumerate(heads):
-        start = h.start()
-        end = heads[i + 1].start() if i + 1 < len(heads) else len(text)
-        tm = TRAILER_RE.search(text, h.end(), end)
-        if tm:
-            end = tm.start()
-        block = text[start:end]
-        out.append(text[pos:start])
-        have = MARKS_LINE_RE.search(block)
-        ids = ID_RE.findall(have.group(1)) if have else []
-        if ids and all(i_ in held for i_ in ids):
-            moved.append((h.group(1).split(":")[0].lstrip("# ").strip(), ids, block))
-        else:
-            out.append(block)
-        pos = end
-    out.append(text[pos:])
-    return "".join(out), moved
-
-
 # --- CLI ----------------------------------------------------------------------------
 def cmd_sync(a, paths):
     floor = floor_of(paths, a.floor)
     if a.dry:
-        marks = derive(paths, floor, a.until, a.pending or ())
+        marks = derive(paths, floor, a.until)
         s = summarize(marks, floor, paths)
     else:
         with ledger_lock(paths):
-            marks = derive(paths, floor, a.until, a.pending or ())
+            marks = derive(paths, floor, a.until)
             s = summarize(marks, floor, paths)
             write_state(paths, marks, s)
     print(status_line(s))
     print(f"total tracked marks: {s['total']} (floor {floor}"
           f"{', until ' + a.until if a.until else ''}){' [dry: nothing written]' if a.dry else ''}")
     nk = s.get("new_kinds") or {}
-    print(f"scope: every MARK kind except status kinds ({', '.join(sorted(STATUS_KINDS))}); "
+    print("scope: every actual MARK kind; "
           f"base kinds {', '.join(TRACKED_KINDS)}; NOT covered: {NOT_COVERED}")
     if nk:
         print(f"tracked kinds outside the base list: "
@@ -939,7 +917,7 @@ def cmd_status(a, paths):
 
 def cmd_queue(a, paths):
     floor = floor_of(paths, a.floor)
-    marks = derive(paths, floor, a.until, a.pending or ())
+    marks = derive(paths, floor, a.until)
     q = queue_marks(marks, a.since, a.until)
     if a.chunk:
         os.makedirs(a.outdir, exist_ok=True)
@@ -980,32 +958,6 @@ def cmd_attribute(a, paths):
                 fh.write(new)
         total += n
         print(f"attribute: {n} candidate(s) got MARKS ids from journal quotes in {f}")
-    return 0
-
-
-def cmd_dedup(a, paths):
-    floor = floor_of(paths, a.floor)
-    marks = derive(paths, floor)
-    held = {mid: (mk.get("card") or mk.get("reason") or mk.get("proposed_in") or mk["state"])
-            for mid, mk in marks.items()
-            if mk["state"] != "OPEN" or mk.get("proposed_in")}
-    text = open(a.file, encoding="utf-8").read()
-    new, moved = dedup_text(text, held)
-    if moved and not a.dry:
-        if a.moved_to:
-            with open(a.moved_to, "a", encoding="utf-8") as fh:
-                for lab, ids, block in moved:
-                    fh.write(f"<!-- {lab}: every MARK already held: "
-                             f"{'; '.join(f'{i} -> {held[i]}' for i in ids)} -->\n{block}\n")
-        tmp = a.file + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as fh:
-            fh.write(new)
-        os.replace(tmp, a.file)
-    print(f"dedup: {len(moved)} candidate(s) whose MARKs are all already carded or proposed "
-          f"left {a.file}{' (dry)' if a.dry else ''}"
-          f"{' -> ' + a.moved_to if moved and a.moved_to else ''}")
-    for lab, ids, _b in moved:
-        print(f"  {lab}: {' '.join(ids)}")
     return 0
 
 
@@ -1379,7 +1331,6 @@ def main(argv=None):
     s = sub.add_parser("sync")
     s.add_argument("--dry", action="store_true")
     s.add_argument("--until", default=None)
-    s.add_argument("--pending", nargs="*", help="extra files counted as pending proposals")
     s.set_defaults(fn=cmd_sync)
 
     s = sub.add_parser("status")
@@ -1392,19 +1343,12 @@ def main(argv=None):
     s.add_argument("--prefix", default="marks")
     s.add_argument("--since", default=None)
     s.add_argument("--until", default=None)
-    s.add_argument("--pending", nargs="*")
     s.set_defaults(fn=cmd_queue)
 
     s = sub.add_parser("attribute")
     s.add_argument("files", nargs="+")
     s.add_argument("--dry", action="store_true")
     s.set_defaults(fn=cmd_attribute)
-
-    s = sub.add_parser("dedup")
-    s.add_argument("file")
-    s.add_argument("--moved-to", default=None)
-    s.add_argument("--dry", action="store_true")
-    s.set_defaults(fn=cmd_dedup)
 
     s = sub.add_parser("coverage")
     s.add_argument("files", nargs="+")

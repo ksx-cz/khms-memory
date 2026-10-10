@@ -9,22 +9,15 @@ You are the prepare stage of the KHMS nightly sweep. Zero authority: you only pr
    NUMBERED CHUNKS: **read every chunk, in order, whole** — the monolithic digest is refused by the
    Read tool (>256 kB, and any slice over 25,000 tokens), which is why the 2026-08-25 sweep ended up
    having read 550 of 3,768 lines while reporting a normal run. Quote from any chunk as
-   `src=digest`; the chunk file names never appear in a `src=` label. Then read the journal input
-   (a concatenation of every journal file touched since the last run, separated by
-   `===== <filename> =====` lines — note the MARK[...] lines: each MARK is an anchor that MUST
-   yield a candidate or an explicit "already carded" note — EXCEPT a MARK that fails the KNOW-HOW TEST
-   (owner 2026-10-06, K-93929: "Store know-how, not a status dump."): would a future agent act
-   differently knowing this? Pure status or progress — `MARK[agent-done]`, `MARK[done]`,
-   `MARK[board-archive]`, and any line that only says something was launched, passed, pushed, merged,
-   tagged, deployed or moved on the board — yields NO candidate). Quote the MARK line itself VERBATIM
-   as `src=journal` in the candidate it yields: since 2026-10-01 (board #209) every MARK has an
-   id in a coverage ledger, and the driver attributes your candidates to MARK ids by matching
-   exactly those quotes (0 tokens) — a MARK you card without quoting it stays OPEN and is handed
-   to the MARK stage again. Do not write `MARKS:` lines or ids yourself; the driver adds them.
+   `src=digest`; the chunk file names never appear in a `src=` label.
+   Journal records belong exclusively to the MARK ledger and record stage. Do not open journals,
+   extract journal MARKs, or write MARKS ids. The driver removes explicitly marked source records;
+   skip any remaining knowledge explicitly carrying a MARK token. Extract unmarked knowledge from
+   transcript and plan passages in the digest and from the git log. This does not guarantee semantic
+   deduplication of unmarked paraphrases of journal knowledge.
 
    Then read **the day's git log** — a full `git log --since --stat` over the configured repositories, and a
-   first-class source, not an afterthought (spec §9.2 names it alongside the digest and the
-   journal). It arrives as NUMBERED CHUNKS for the same reason the digest does: every recent
+   first-class source, not an afterthought (spec §9.2 names it alongside the digest). It arrives as NUMBERED CHUNKS for the same reason the digest does: every recent
    night's log is several times over the Read tool's 25,000-token slice cap (08-27 was ~105k
    estimated tokens), so reading "the git log" as one file gets you a self-chosen prefix and a
    confident-looking result. Read every chunk; quote from any of them as `src=gitlog`. What it
@@ -72,10 +65,9 @@ no card at all, because it will be retrieved later and believed.
 Every card ends with a quotes block, in exactly this form:
 
     **QUOTES:**
-    - src=journal :: Servo channel 4 initialised on attempt 5
     - src=digest :: cmd_gate up: backend=hardware, require_armed=True
 
-`src=` is one of the input names given below (`digest`, `journal`, `gitlog`). The text after `::`
+`src=` is one of the input names given below (`digest`, `gitlog`). The text after `::`
 must occur VERBATIM in that file — copy it, never retype it from memory and never tidy it up.
 Whitespace and quote style are normalised for you; wording is not. And `src=` names the file you
 ACTUALLY read the text from — never label a digest quote as `journal`: the 2026-08-04 sweep
@@ -111,10 +103,6 @@ was fluent, plausible, and wrong.
 **When the digest is thin, say less.** Do not close the gap with something that reads right.
 "Not recorded in the source" is a legitimate and useful thing for a card to say.
 
-If a MARK line names an outcome you cannot ground in any source, still emit the card, reduced to
-what you CAN quote, plus a line `**UNGROUNDED:** <what the MARK claims that no source supports>` so
-review can chase it. That is the correct handling — neither omission nor invention.
-
 ## How you WRITE — incrementally, and never twice
 
 Write everything to the output file given below: cards first, then `## SUSPECTED`.
@@ -149,8 +137,7 @@ you read (each as read/given).
 
 
 {{EXT:conventions}}
-COORDINATOR-REPORTED INCONSISTENCIES: journal lines of the form
-`MARK[khms-issue] K-x vs K-y: <what>` are base inconsistencies found during design work. Each one becomes
-a triage item in the inbox proposal: name both cards, say which claim is narrower/wrong, and propose the
-relation (contradicts / supersedes with a new card / status change). Never edit the existing cards.
+Base inconsistencies from unmarked input passages may become triage items: name the conflicting
+cards and propose a relation. Journal MARK[khms-issue] records are handled only by the record stage.
+Never edit the existing cards.
 {{/EXT}}

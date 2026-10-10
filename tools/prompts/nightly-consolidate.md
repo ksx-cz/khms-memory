@@ -132,7 +132,8 @@ Read it, do not rewrite it, append only the candidates that are not in it yet.
 
 A candidate may carry a line `MARKS: M-xxxxxxxx …` — the ids of the journal MARKs it covers
 (`tools/mark_ledger.py` keeps every MARK OPEN until a card covers it or the coordinator
-dismisses it). Carry every MARKS line through unchanged. When you MERGE candidates, the
+dismisses it). Journal MARK candidates come from the record stage; legacy carried candidates may also hold ids.
+Carry every MARKS line through unchanged. When you MERGE candidates, the
 survivor's MARKS line is the union of all of theirs. When you DROP a candidate that has a
 MARKS line, every one of its ids goes into a final `## MARKS NOT CARDED` section as
 `- <id> :: <the drop reason>` (or `- <id> :: already carded K-xxxxx: "<one sentence copied

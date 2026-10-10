@@ -39,10 +39,14 @@ def card(label, text, extra=""):
             f"NEAREST: CARDID (0.0300)\n**QUOTES:**\n- src=journal :: {text}\n\n")
 if stage == "marks":
     body = "# marks\n"
+    dropped = []
     for i, line in enumerate(open(field(r"^- MARK QUEUE chunk: (.+)$")), 1):
         m = re.match(r"^- (M-[0-9a-f]{8}) \|[^|]*\|[^|]*\|[^|]*\| (.*)$", line)
-        if m:
+        if m and "status line" in m.group(2):
+            dropped.append(f"- {m.group(1)} :: not know-how: status line")
+        elif m:
             body += card(f"M{i}", m.group(2), f"MARKS: {m.group(1)}\n")
+    body += "## MARKS NOT CARDED\n" + "\n".join(dropped) + "\n"
     open(out, "w").write(body)
 elif stage == "consolidate":
     text = open(field(r"^- sweep candidates[^:]*: (.+)$")).read()
@@ -129,11 +133,11 @@ def test_every_mark_reaches_the_inbox_and_the_ledger_with_no_cap(tmp_path):
     log = log_of(root)
     assert r.returncode == 0, log + r.stderr
     us = units(root)
-    assert len(us) == 5 and cards_in(us) == 30, (us, log)          # 30 candidates in batches of 7
+    assert len(us) == 6 and cards_in(us) == 30, (us, log)          # 30 candidates in batches of 7
     assert "DEFERRED" not in "".join(u.read_text() for u in us)
     marks = [json.loads(ln) for ln in open(root / "memory/ledger/marks.jsonl")]
-    assert len(marks) == 30 and {m["kind"] for m in marks} == set(KINDS) - {"done"}
-    assert all(m["state"] == "OPEN" and m.get("proposed_in") for m in marks), marks[:2]
+    assert len(marks) == 31 and {m["kind"] for m in marks} == set(KINDS) | {"done"}
+    assert all(m["state"] == "OPEN" and m.get("proposed_in") for m in marks if m["kind"] != "done"), marks[:2]
     assert (root / "state/shared/last-nightly").read_text().strip(), "the window was not stamped"
     assert "nightly done" in log and "INCOMPLETE" not in log
 
@@ -155,6 +159,8 @@ def test_configured_sources_are_read(tmp_path):
     subprocess.run(["git", "-C", str(repo), "add", "a.txt"], check=True)
     subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t",
                     "commit", "-qm", "widget calibration committed"], check=True)
+    subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t",
+                    "commit", "--allow-empty", "-qm", "MARK[finding] secret marked commit"], check=True)
     tr = tmp_path / "transcripts-src" / "proj-widgets"
     tr.mkdir(parents=True)
     (tr / "s1.jsonl").write_text(json.dumps({"type": "user", "timestamp": "2099-01-01T10:00:00Z",
@@ -168,6 +174,7 @@ def test_configured_sources_are_read(tmp_path):
     assert r.returncode == 0, log_of(root)
     staging = root / "memory/inbox/.staging"
     assert "widget calibration committed" in (staging / "nightly-2099-01-02-git.txt").read_text()
+    assert "secret marked commit" not in (staging / "nightly-2099-01-02-git.txt").read_text()
     assert "calibrate widget 9" in (staging / "nightly-2099-01-02-digest.txt").read_text()
     assert "triage-ran --limit 0" in log_of(root)
 
@@ -178,7 +185,7 @@ def test_a_failed_batch_is_carried_reported_and_finished_the_next_night(tmp_path
     r = run_night(tmp_path, root, fake, FAKE_FAIL="consolidate", CONSOLIDATE_BATCH="5")
     log = log_of(root)
     assert r.returncode == 1 and "nightly INCOMPLETE" in log and "consolidate-" in log, log
-    assert units(root) == []
+    assert cards_in(units(root)) == 0
     carried = list((root / "memory/ledger/carry").rglob("cons-*.md"))
     assert len(carried) == 2, carried
     assert (root / "state/shared/last-nightly").exists()            # the window itself is persisted
@@ -189,7 +196,13 @@ def test_a_failed_batch_is_carried_reported_and_finished_the_next_night(tmp_path
 
 def test_a_failed_sweep_is_reported_unstamped_and_recorded(tmp_path):
     root, fake = make_base(tmp_path, n_marks=3)
-    r = run_night(tmp_path, root, fake, FAKE_FAIL="sweep")
+    tr = tmp_path / "source"
+    tr.mkdir()
+    f = tr / "s.jsonl"
+    f.write_text(json.dumps({"type": "user", "timestamp": "2099-01-01T10:00:00Z",
+                             "message": {"content": "unmarked fact " * 30}}) + "\n")
+    os.utime(f, (time.time() + 3600,) * 2)
+    r = run_night(tmp_path, root, fake, FAKE_FAIL="sweep", KHMS_TRANSCRIPTS=tr)
     log = log_of(root)
     assert r.returncode == 1 and "sweep FAILED after retries" in log and "nightly INCOMPLETE" in log, log
     assert not (root / "state/shared/last-nightly").exists()
@@ -463,3 +476,42 @@ def test_an_unconfigured_source_is_off_not_failed(tmp_path):
     r = run_night(tmp_path, root, fake)
     log = log_of(root)
     assert r.returncode == 0 and "source FAILED" not in log and "source git: OFF" in log, log
+
+
+def test_prepare_receives_zero_journal_tokens_and_no_marked_source_records(tmp_path):
+    root, fake = make_base(tmp_path, n_marks=2)
+    tr = tmp_path / "source"
+    tr.mkdir()
+    records = ["unmarked widget calibration " + "useful knowledge " * 30,
+               "MARK[finding] marked transcript secret\ncontinuation of marked secret"]
+    f = tr / "s.jsonl"
+    f.write_text("".join(json.dumps({"type": "assistant", "timestamp": "2099-01-01T10:00:00Z",
+                                    "message": {"content": text}}) + "\n" for text in records))
+    os.utime(f, (time.time() + 3600,) * 2)
+    r = run_night(tmp_path, root, fake, "--dry", KHMS_TRANSCRIPTS=tr)
+    assert r.returncode == 0, r.stderr
+    block = r.stdout.split("--- SWEEP stage INPUTS block", 1)[1].split("--- CONSOLIDATE", 1)[0]
+    assert "journal" not in block.lower(), block
+    digest = (root / "memory/inbox/.staging/nightly-2099-01-02-dry-digest.txt").read_text()
+    assert "unmarked widget calibration" in digest
+    assert "marked transcript secret" not in digest and "continuation of marked secret" not in digest
+    assert "prepare journal tokens: 0" in r.stdout
+
+
+def test_prepare_cannot_inject_journal_candidates(tmp_path):
+    root, fake = make_base(tmp_path, n_marks=1)
+    tr = tmp_path / "source"
+    tr.mkdir()
+    f = tr / "s.jsonl"
+    f.write_text(json.dumps({"type": "user", "timestamp": "2099-01-01T10:00:00Z",
+                             "message": {"content": "unmarked calibration " * 30}}) + "\n")
+    os.utime(f, (time.time() + 3600,) * 2)
+    # Deliberately disobedient fake prepare output: real journal text is not permission to ingest it.
+    fake.write_text(FAKE.replace('js = field(r"^- journal[^:]*: (.+)$")',
+                                'js = os.environ["INJECT_JOURNAL"]'))
+    r = run_night(tmp_path, root, fake, KHMS_TRANSCRIPTS=tr,
+                  INJECT_JOURNAL=root / "journal/2099-01-01.md")
+    assert r.returncode == 0, log_of(root)
+    assert cards_in(units(root)) == 1
+    text = "".join(p.read_text() for p in units(root))
+    assert "### C1:" not in text and "MARKS: M-" in text
