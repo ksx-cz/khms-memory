@@ -21,7 +21,7 @@ KINDS = ["decision", "finding", "requirement", "gotcha", "error", "khms-issue", 
 
 FAKE = r'''#!/usr/bin/env python3
 # Fake agent CLI: sweep / MARK stage / consolidate, by the shape of the prompt (`-p <prompt>`).
-import os, re, sys
+import json, os, re, sys
 args = sys.argv[1:]
 prompt = args[args.index("-p") + 1] if "-p" in args else ""
 def field(rx):
@@ -32,6 +32,8 @@ stage = ("marks" if "MARK QUEUE chunk:" in prompt else
          "consolidate" if "sweep candidates" in prompt else "sweep")
 with open(os.environ["FAKE_CALLS"], "a") as fh:
     fh.write(stage + " " + os.path.basename(out) + "\n")
+with open(os.environ["FAKE_CALLS"] + ".jsonl", "a") as fh:
+    fh.write(json.dumps({"stage": stage, "prompt": prompt, "args": args, "pid": os.getpid()}) + "\n")
 if os.environ.get("FAKE_FAIL") == stage:
     sys.exit(1)
 def card(label, text, extra=""):
@@ -515,3 +517,110 @@ def test_prepare_cannot_inject_journal_candidates(tmp_path):
     assert cards_in(units(root)) == 1
     text = "".join(p.read_text() for p in units(root))
     assert "### C1:" not in text and "MARKS: M-" in text
+
+
+@pytest.mark.parametrize("group_size", [1, 2])
+def test_prepare_calls_one_fresh_process_per_digest_and_git_chunk(tmp_path, group_size):
+    root, fake = make_base(tmp_path, n_marks=0)
+    tr = tmp_path / "source"
+    tr.mkdir()
+    f = tr / "s.jsonl"
+    f.write_text("".join(json.dumps({"type": "user", "timestamp": "2099-01-01T10:00:00Z",
+                                    "message": {"content": "widget unmarked calibration " * 80}}) + "\n"
+                         for _ in range(45)))
+    os.utime(f, (time.time() + 3600,) * 2)
+    repo = tmp_path / "repo"
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t",
+                    "commit", "--allow-empty", "-qm", "git calibration " * 2000], check=True)
+    r = run_night(tmp_path, root, fake, KHMS_TRANSCRIPTS=tr, KHMS_GIT_REPOS=repo,
+                  SWEEP_GROUP_CHUNKS=group_size)
+    assert r.returncode == 0, log_of(root) + r.stderr
+    staging = root / "memory/inbox/.staging"
+    expected = {}
+    for source, suffix in (("digest", "digest"), ("gitlog", "git")):
+        for p in (staging / f"nightly-2099-01-02-{suffix}-chunks.txt").read_text().splitlines():
+            expected[p] = source
+    calls = [json.loads(line) for line in (tmp_path / "calls.txt.jsonl").read_text().splitlines()]
+    sweep = [call for call in calls if call["stage"] == "sweep"]
+    assert len(sweep) == (len(expected) + group_size - 1) // group_size
+    assert len({call["pid"] for call in sweep}) == len(sweep)
+    seen = []
+    for call in sweep:
+        block = call["prompt"].rsplit("INPUTS:", 1)[1]
+        paths = re.findall(r"^  \* (.+)$", block, re.M)
+        assert 1 <= len(paths) <= group_size, block
+        assert all(f"src={expected[path]}" in block for path in paths)
+        assert "whole file" not in block and "journal" not in block
+        assert "--resume" not in call["args"] and "--continue" not in call["args"]
+        seen.extend(paths)
+    assert sorted(seen) == sorted(expected)
+
+
+@pytest.mark.parametrize("source", ["digest", "gitlog"])
+def test_prepare_singleton_sources_use_one_owned_chunk(tmp_path, source):
+    root, fake = make_base(tmp_path, n_marks=0)
+    extra = {}
+    if source == "digest":
+        tr = tmp_path / "source"
+        tr.mkdir()
+        f = tr / "s.jsonl"
+        f.write_text(json.dumps({"type": "user", "timestamp": "2099-01-01T10:00:00Z",
+                                 "message": {"content": "unmarked calibration " * 30}}) + "\n")
+        os.utime(f, (time.time() + 3600,) * 2)
+        extra["KHMS_TRANSCRIPTS"] = tr
+    else:
+        repo = tmp_path / "repo"
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t",
+                        "commit", "--allow-empty", "-qm", "calibration commit"], check=True)
+        extra["KHMS_GIT_REPOS"] = repo
+    r = run_night(tmp_path, root, fake, **extra)
+    assert r.returncode == 0, log_of(root) + r.stderr
+    calls = [json.loads(line) for line in (tmp_path / "calls.txt.jsonl").read_text().splitlines()]
+    sweep = [c for c in calls if c["stage"] == "sweep"]
+    assert len(sweep) == 1
+    inputs = sweep[0]["prompt"].rsplit("INPUTS:", 1)[1]
+    assert len(re.findall(r"^  \* (.+)$", inputs, re.M)) == 1
+    assert f"src={source}" in inputs and "whole file" not in inputs
+
+
+@pytest.mark.parametrize("failed_source", ["digest", "git"])
+def test_failed_chunker_with_partial_index_keeps_window_and_never_sweeps(tmp_path, failed_source):
+    root, fake = make_base(tmp_path, n_marks=0)
+    tr = tmp_path / "source"
+    tr.mkdir()
+    f = tr / "s.jsonl"
+    f.write_text("".join(json.dumps({"type": "user", "timestamp": "2099-01-01T10:00:00Z",
+                                    "message": {"content": "unmarked knowledge " * 100}}) + "\n"
+                         for _ in range(35)))
+    os.utime(f, (time.time() + 3600,) * 2)
+    repo = tmp_path / "repo"
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t",
+                    "commit", "--allow-empty", "-qm", "calibration " * 3000], check=True)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    wrapper = bin_dir / "python3"
+    wrapper.write_text(f"#!{sys.executable}\n" + r'''
+import os, pathlib, subprocess, sys
+args = sys.argv[1:]
+rc = subprocess.run([sys.executable, *args]).returncode
+if args and pathlib.Path(args[0]).name == "digest_chunk.py" and args[1].endswith("-" + os.environ["FAIL_CHUNK_SOURCE"] + ".txt"):
+    index = pathlib.Path(args[args.index("--index") + 1])
+    rows = index.read_text().splitlines()
+    assert len(rows) > 1
+    index.write_text(rows[0] + "\n")
+    sys.exit(1)
+sys.exit(rc)
+''')
+    wrapper.chmod(0o755)
+    r = run_night(tmp_path, root, fake, KHMS_TRANSCRIPTS=tr, KHMS_GIT_REPOS=repo,
+                  PATH=str(bin_dir) + os.pathsep + os.environ["PATH"], FAIL_CHUNK_SOURCE=failed_source)
+    assert r.returncode != 0 and "sweep NOT RUN" in log_of(root), log_of(root)
+    assert not (root / "state/shared/last-nightly").exists()
+    call_log = tmp_path / "calls.txt.jsonl"
+    calls = [json.loads(line) for line in call_log.read_text().splitlines()] if call_log.exists() else []
+    assert not any(call["stage"] == "sweep" for call in calls)
+    index = root / f"memory/inbox/.staging/nightly-2099-01-02-{failed_source}-chunks.txt"
+    assert len(index.read_text().splitlines()) == 1

@@ -270,7 +270,11 @@ exit states and errors — tool outputs and thinking stay in the raw layer) and 
 with explicit MARK records excluded. Prepare never reads journals; journal MARKs belong solely
 to the record stage. Large inputs are split into
 chunks that the reading tool can actually read whole; an input handed over in one oversized
-file is read as a self-chosen prefix, silently.
+file is read as a self-chosen prefix, silently. By default each digest or git chunk is owned by
+one fresh prepare session (`SWEEP_GROUP_CHUNKS=1`, explicitly configurable). Parts retain
+source labels and see neither whole-source paths nor other parts. Chunking failure blocks prepare;
+there is no unbounded fallback. This bounds primary source input per session, not total model
+context: instructions, schema, tags and generated output also occupy context.
 
 Stages: (a) prepare extracts unmarked knowledge as candidate cards per §4; the record stage
 processes queued journal MARKs by stable id, producing a candidate or an explicit NOT CARDED reason

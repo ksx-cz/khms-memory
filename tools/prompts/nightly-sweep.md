@@ -5,28 +5,19 @@ You are the prepare stage of the KHMS nightly sweep. Zero authority: you only pr
 1. Read `{{KHMS_SPEC}}` sections 4 and 5 — the card
    schema and types. That is your sorting instruction.
 2. Read the tag registry `{{KHMS_ROOT}}/memory/views/tags.md`.
-3. Read your inputs (paths given at the end of this prompt). The transcript digest arrives as
-   NUMBERED CHUNKS: **read every chunk, in order, whole** — the monolithic digest is refused by the
-   Read tool (>256 kB, and any slice over 25,000 tokens), which is why the 2026-08-25 sweep ended up
-   having read 550 of 3,768 lines while reporting a normal run. Quote from any chunk as
-   `src=digest`; the chunk file names never appear in a `src=` label.
-   Journal records belong exclusively to the MARK ledger and record stage. Do not open journals,
-   extract journal MARKs, or write MARKS ids. The driver removes explicitly marked source records;
-   skip any remaining knowledge explicitly carrying a MARK token. Extract unmarked knowledge from
-   transcript and plan passages in the digest and from the git log. This does not guarantee semantic
-   deduplication of unmarked paraphrases of journal knowledge.
-
-   Then read **the day's git log** — a full `git log --since --stat` over the configured repositories, and a
-   first-class source, not an afterthought (spec §9.2 names it alongside the digest). It arrives as NUMBERED CHUNKS for the same reason the digest does: every recent
-   night's log is several times over the Read tool's 25,000-token slice cap (08-27 was ~105k
-   estimated tokens), so reading "the git log" as one file gets you a self-chosen prefix and a
-   confident-looking result. Read every chunk; quote from any of them as `src=gitlog`. What it
-   is FOR: commit messages and changed-file lists are the record of what was actually built that
-   day, and they ground claims the transcript only gestures at. When the input says the log is
-   EMPTY, it is empty — do not cite `src=gitlog` at all.
-
-   Say in your final message how many digest chunks and how many git-log chunks you read, out of
-   how many you were given.
+3. This fresh prepare session owns ONLY the primary source chunks listed in INPUTS.
+   Default: one readable chunk. Read each listed chunk whole; quote it ONLY with its given
+   `src=digest` or `src=gitlog` label. The driver merges independently written part outputs.
+   Do not discover or open other chunks, whole-source files, input indices, journals, or earlier
+   part outputs. Extract unmarked knowledge from this part's transcript/plan or git text only.
+   Journal records belong exclusively to the MARK ledger and record stage. Do not extract MARKs
+   or write MARKS ids; skip any remaining explicitly marked source knowledge. This does not
+   guarantee semantic deduplication of unmarked paraphrases of journal knowledge.
+   The chunk bound covers primary source input; instructions and generated output also use context.
+   Chunk boundaries can omit prior session attribution or a git commit header. When this chunk
+   lacks an AGENT-RUN Issue/Role or commit hash/date, say attribution/commit identity is unavailable
+   in this chunk. Never infer or invent it, and never open another chunk to reconstruct it.
+   Finish this part without waiting for or reconstructing the rest of the night.
 
 Extract EVERY candidate knowledge item as a draft card per the schema: failed attempts
 (action→outcome), solved problems (problem→solution), decisions with rationale, requirements stated
@@ -132,8 +123,7 @@ If the day is too big for one pass, keep the numbering going (`A1..`, `B1..`) in
 files rather than rewriting the main one — the driver merges part files afterwards and skips
 duplicates by label.
 
-Final message: just the output path, the card count, and how many digest chunks and git-log chunks
-you read (each as read/given).
+Final message: just the output path. The driver counts and merges candidates.
 
 
 {{EXT:conventions}}

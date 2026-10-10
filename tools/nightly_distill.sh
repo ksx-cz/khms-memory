@@ -79,18 +79,11 @@ done
 # instead of swapping code under a running night. A dry run writes nothing at all — not even the
 # lock file — so it takes no lock, exactly as it takes no night lock below.
 [ "$DRYRUN" = "1" ] || khms_code_lock || exit $?
-# NO DIGEST CAP (the principal's rule in the reference deployment: no daily card limit at all —
-# simply process everything in the queue). An earlier MAX_DIGEST_BYTES = 8 MiB cut a
-# bigger digest with `head -c`: the tail of the day was never swept, one log line and a NOTE
-# inside the cut file were the only trace, and nothing carried the rest. The digest is now
-# chunked WHOLE (1b), and when it holds more chunks than one sweep call reads, the sweep runs
-# as several calls — one per group of SWEEP_GROUP_CHUNKS chunks (1b', 2) — whose candidates
-# are merged into the one sweep file the rest of the night works from. 80 chunks: the largest
-# digest one sweep call has read whole was 73/73 chunks (2026-09-23, 1.46 MB); every night
-# since 2026-09-18 was 2–73 chunks, i.e. ONE call with the prompt exactly as before. A group
-# that fails fails the sweep (no split, no stamp: the window is swept again the next night),
-# so a partial sweep can never pass for a whole one.
-SWEEP_GROUP_CHUNKS=${SWEEP_GROUP_CHUNKS:-80}
+# Prepare bounds primary source input per fresh session. The default is ONE readable chunk;
+# operators may explicitly group more with SWEEP_GROUP_CHUNKS. Prompt/schema and generated
+# output add context, so this is an input-chunk bound, not an absolute model context guarantee.
+SWEEP_GROUP_CHUNKS=${SWEEP_GROUP_CHUNKS:-1}
+[[ "$SWEEP_GROUP_CHUNKS" =~ ^[1-9][0-9]*$ ]] || { echo "SWEEP_GROUP_CHUNKS must be a positive integer" >&2; exit 2; }
 
 # Wall-clock caps on the two model stages. UNBOUNDED WAS THE 2026-08-15 FAILURE: the sweep call
 # went to sleep after writing its last chunk (21 s CPU across 77 min elapsed) and never returned,
@@ -587,56 +580,14 @@ STAGE_MARK=$STAGING/.stage-start
 # both refusals and ended up having read lines 1-550 of 3,768 — 15 % of its input — while its
 # output looked like a normal night. The same blindness hit 2026-08-22 (328 kB -> 6 digest quotes
 # against 49 on a small night). Chunks are sized with >=30 % margin under both caps.
-# Non-fatal: if the chunker fails, the stage falls back to the monolith, which is what it had
-# before — a chunker bug must not cost a night.
+# Chunk failure is fatal to prepare: an unbounded monolith would break the input contract.
 CHUNK_INDEX=$STAGING/nightly-$NK-digest-chunks.txt
 : > "$CHUNK_INDEX"
 python3 "$CODE/digest_chunk.py" "$DIGEST" "$STAGING" "nightly-$NK-digest" \
   --index "$CHUNK_INDEX" >> "$LOG" 2>&1 \
-  || echo "$(date -Is) digest chunking FAILED (non-fatal) — sweep falls back to the monolith" >> "$LOG"
-if [ -s "$CHUNK_INDEX" ]; then
-  DIGEST_INPUT="transcript digest, SPLIT INTO READABLE CHUNKS — READ EVERY ONE, IN ORDER (the
-  monolith below is too large for the Read tool; quote all of them as src=digest):
-$(sed 's|^|  * |' "$CHUNK_INDEX")
-- transcript digest, whole file — GREP ONLY, never Read it whole: $DIGEST"
-else
-  DIGEST_INPUT="transcript digest: $DIGEST"
-fi
-
-# 1b') SWEEP GROUPS (see SWEEP_GROUP_CHUNKS above). A digest of at most SWEEP_GROUP_CHUNKS
-# chunks — every night measured so far — is ONE sweep call, prompt unchanged. A bigger one is
-# split, in order, into groups of that many chunks, each swept by its own call (step 2).
-SWEEP_GROUP_FILES=()
-SWEEP_GOUTS=()
-if [ -s "$CHUNK_INDEX" ]; then
-  _nchunks=$(grep -c . "$CHUNK_INDEX" || true)
-  if [ "$_nchunks" -gt "$SWEEP_GROUP_CHUNKS" ]; then
-    rm -f "$STAGING/nightly-$NK-digest-group"[0-9]*.txt
-    split -l "$SWEEP_GROUP_CHUNKS" -d -a 3 --additional-suffix=.txt "$CHUNK_INDEX" \
-      "$STAGING/nightly-$NK-digest-group"
-    mapfile -t SWEEP_GROUP_FILES < <(ls "$STAGING/nightly-$NK-digest-group"[0-9]*.txt | sort)
-    echo "$(date -Is) digest: $_nchunks chunk(s) > $SWEEP_GROUP_CHUNKS per sweep call -> ${#SWEEP_GROUP_FILES[@]} sweep part(s), every chunk in exactly one" >> "$LOG"
-  fi
-fi
-# sweep_group_inputs <k, 1-based> <K> <group index file> <output file> — the INPUTS block of
-# sweep part k. Part 1 owns the git log; later parts use it as grounding context.
-# No part receives journals: every journal MARK belongs to the record stage.
-sweep_group_inputs() {
-  local k="$1" n="$2" gf="$3" o="$4"
-  echo "INPUTS:"
-  echo "- transcript digest, PART $k OF $n — the digest is too large for one sweep call, so it is"
-  echo "  swept in $n parts of <= $SWEEP_GROUP_CHUNKS chunks, each by its own call. YOUR PART'S"
-  echo "  CHUNKS — READ EVERY ONE, IN ORDER (quote all of them as src=digest):"
-  sed 's|^|  * |' "$gf"
-  echo "- transcript digest, whole file — GREP ONLY, never Read it whole: $DIGEST"
-  if [ "$k" = "1" ]; then
-    echo "- $GITLOG_INPUT"
-  else
-    echo "- the day's git log — CONTEXT ONLY (grep it; quote as src=gitlog only to ground a digest card), carded by PART 1: $GITLOG"
-  fi
-  echo "OUTPUT FILE: $o"
-}
-
+  || { echo "digest: chunking failed (partial index is not a complete window)" >> "$SRC_FAILED";
+       SOURCE_FAILED=$(grep -c . "$SRC_FAILED");
+       echo "$(date -Is) digest chunking FAILED — prepare will not read a partial index or monolith" >> "$LOG"; }
 # 1c) CHUNK THE GIT LOG — same Read-tool caps, same silent blindness, and it is a SPECIFIED
 # nightly input (spec §9.2: "delta transcript digest, today's journal, the day's git log").
 # Measured on the four most recent nights, `--stat` git logs are ALL over the 25,000-token
@@ -644,27 +595,46 @@ sweep_group_inputs() {
 # 08-27 158.4 kB (~105k) — the last one four times the cap. A stage handed the monolith can
 # only Read a self-chosen prefix of it, which is how 2026-08-27 produced 7 `src=gitlog` quotes
 # where 2026-08-26 produced 108 off the same kind of day. Same chunker, same >=30 % margin,
-# same non-fatal fallback: a chunker bug must not cost a night.
+# same fail-closed chunking contract; no monolith fallback for prepare.
 GITLOG_INDEX=$STAGING/nightly-$NK-git-chunks.txt
 : > "$GITLOG_INDEX"
 if [ -s "$GITLOG" ]; then
   python3 "$CODE/digest_chunk.py" "$GITLOG" "$STAGING" "nightly-$NK-git" \
     --index "$GITLOG_INDEX" >> "$LOG" 2>&1 \
-    || echo "$(date -Is) gitlog chunking FAILED (non-fatal) — stages fall back to the monolith" >> "$LOG"
+    || { echo "gitlog: chunking failed (partial index is not a complete window)" >> "$SRC_FAILED";
+         SOURCE_FAILED=$(grep -c . "$SRC_FAILED");
+         echo "$(date -Is) gitlog chunking FAILED — prepare will not read a partial index or monolith" >> "$LOG"; }
 fi
-if [ -s "$GITLOG_INDEX" ]; then
-  GITLOG_INPUT="the day's git log ($GITLOG_WHAT), SPLIT INTO
-  READABLE CHUNKS — READ EVERY ONE, IN ORDER (the monolith below is too large for the Read
-  tool; quote all of them as src=gitlog):
-$(sed 's|^|  * |' "$GITLOG_INDEX")
-- the day's git log, whole file — GREP ONLY, never Read it whole: $GITLOG"
-elif [ -s "$GITLOG" ]; then
-  GITLOG_INPUT="the day's git log ($GITLOG_WHAT), quote as src=gitlog: $GITLOG"
-else
-  # An empty file is still passed by path: verify_quotes.py is given gitlog= either way, and a
-  # stage that is told "empty" cannot invent commits it thinks ought to be there.
-  GITLOG_INPUT="the day's git log: $GITLOG — EMPTY (no commits in this window). Do not cite src=gitlog."
+# 1d) Prepare groups own explicit source-labelled chunks, including git chunks.
+# Always use the part machinery, even for one chunk. No full index or other source is
+# attached to a part. Each CLI invocation starts fresh (no resume/continue arguments).
+SWEEP_GROUP_FILES=()
+SWEEP_GOUTS=()
+SWEEP_SOURCE_INDEX=$STAGING/nightly-$NK-prepare-chunks.txt
+: > "$SWEEP_SOURCE_INDEX"
+if { [ -s "$DIGEST" ] && [ ! -s "$CHUNK_INDEX" ]; } || { [ -s "$GITLOG" ] && [ ! -s "$GITLOG_INDEX" ]; }; then
+  SOURCE_FAILED="prepare chunking failed — no unbounded monolith fallback"
 fi
+while IFS= read -r _chunk; do printf 'digest\t%s\n' "$_chunk"; done < "$CHUNK_INDEX" >> "$SWEEP_SOURCE_INDEX"
+while IFS= read -r _chunk; do printf 'gitlog\t%s\n' "$_chunk"; done < "$GITLOG_INDEX" >> "$SWEEP_SOURCE_INDEX"
+if [ -s "$SWEEP_SOURCE_INDEX" ]; then
+  rm -f "$STAGING/nightly-$NK-prepare-group"[0-9]*.txt
+  split -l "$SWEEP_GROUP_CHUNKS" -d -a 3 --additional-suffix=.txt "$SWEEP_SOURCE_INDEX" \
+    "$STAGING/nightly-$NK-prepare-group"
+  mapfile -t SWEEP_GROUP_FILES < <(ls "$STAGING/nightly-$NK-prepare-group"[0-9]*.txt | sort)
+  echo "$(date -Is) prepare: $(wc -l < "$SWEEP_SOURCE_INDEX") primary source chunk(s) -> ${#SWEEP_GROUP_FILES[@]} fresh session(s), <= $SWEEP_GROUP_CHUNKS chunk(s) each" >> "$LOG"
+fi
+sweep_group_inputs() {
+  local k="$1" n="$2" gf="$3" o="$4" source chunk
+  echo "INPUTS:"
+  echo "- prepare PART $k OF $n, a fresh session owning ONLY these <= $SWEEP_GROUP_CHUNKS primary source chunks:"
+  while IFS=$'\t' read -r source chunk; do
+    echo "- primary source chunk (quote only as src=$source):"
+    echo "  * $chunk"
+  done < "$gf"
+  echo "- Read only the listed primary chunks. Do not open other source files, indices, or earlier part outputs."
+  echo "OUTPUT FILE: $o"
+}
 
 # consolidate_inputs <batch file> <batch's night D> <index tonight, 1-based> <output file>
 # The INPUTS block of ONE consolidate batch. A batch carried from an earlier night D is
@@ -720,12 +690,9 @@ if [ "$DRYRUN" = "1" ]; then
   echo
   echo "prepare journal tokens: 0 (journal records belong to the MARK ledger/stage)"
   echo "--- SWEEP stage INPUTS block (verbatim, as the prompt receives it) ---"
-  cat <<EOF
-INPUTS:
-- $DIGEST_INPUT
-- $GITLOG_INPUT
-OUTPUT FILE: $SWEEP
-EOF
+  for _i in "${!SWEEP_GROUP_FILES[@]}"; do
+    sweep_group_inputs "$((_i + 1))" "${#SWEEP_GROUP_FILES[@]}" "${SWEEP_GROUP_FILES[$_i]}" "$SWEEP"
+  done
   echo
   echo "--- CONSOLIDATE stage: one call PER BATCH of $CONSOLIDATE_BATCH candidates (no card cap) ---"
   echo "  carried batches from earlier nights (done FIRST): $CARRY_N"
@@ -778,8 +745,7 @@ source "$CODE/nightly_retry.sh"
 SWEEP_PROMPT="$SWEEP_BASE
 
 INPUTS:
-- $DIGEST_INPUT
-- $GITLOG_INPUT
+- No primary source chunks available. Produce no candidates.
 OUTPUT FILE: $SWEEP"
 # reassemble <target> <part files...> — the merge described at 2a, as a function since #209
 # follow-up: every sweep PART has its own part files too.
@@ -829,7 +795,7 @@ elif [ "$NO_WINDOW" = "1" ]; then
   # queue and the carry (step 1a decided there is something in one of them).
   : > "$SWEEP"
   echo "$(date -Is) sweep SKIPPED — nothing new in the window" >> "$LOG"
-elif [ ${#SWEEP_GROUP_FILES[@]} -gt 1 ]; then
+elif [ ${#SWEEP_GROUP_FILES[@]} -gt 0 ]; then
   # 2-parts) one sweep call per part (1b'). Part 1 writes $SWEEP itself; part k writes its own
   # file, which is reassembled with its own part files and merged into $SWEEP with its labels
   # moved to k000+ (a clash is renamed by nightly_batch.py merge, never dropped). The first
