@@ -178,11 +178,19 @@ def scan_reach(brain, ids):
     """The audit's definition: a card is TOUCHED if it was ever injected or was
     ever a recall top hit."""
     touched = set()
-    inj = read(P.INJECT_LOG)
-    for blob in INJECT_RE.findall(inj):
-        touched |= set(CARD_ID_RE.findall(blob))
-    touched |= set(TOP_RE.findall(inj))
-    touched |= set(TOP_RE.findall(read(P.RECALL_LOG)))
+    unavailable = []
+    for path, injection_log in ((P.INJECT_LOG, True), (P.RECALL_LOG, False)):
+        try:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    if injection_log:
+                        for blob in INJECT_RE.findall(line):
+                            touched.update(CARD_ID_RE.findall(blob))
+                    touched.update(TOP_RE.findall(line))
+        except OSError as exc:
+            unavailable.append(f"{path}: {exc.strerror}")
+    if unavailable:
+        raise OSError("; ".join(unavailable))
     return touched & ids
 
 
@@ -200,7 +208,12 @@ def main(argv=None):
     proposals, applied, n_preview = triage_files(a.brain, a.since)
     t = scan_triage(proposals, applied)
     statuses, edges, ids, fog = scan_base(a.brain)
-    touched = scan_reach(a.brain, ids)
+    reach_error = None
+    try:
+        touched = scan_reach(a.brain, ids)
+    except OSError as exc:
+        touched = None
+        reach_error = str(exc)
     n_files = sum(len(v) for v in proposals.values())
     n_app = sum(len(v) for v in applied.values())
 
@@ -247,9 +260,12 @@ def main(argv=None):
           f"supersede/refute edges in the whole base")
     print()
     print(f"REACH ({P.INJECT_LOG} + {P.RECALL_LOG} — injected OR top hit)")
-    n_never = len(ids) - len(touched)
-    pct = (100.0 * n_never / len(ids)) if ids else 0.0
-    print(f"  cards never touched: {n_never} / {len(ids)} ({pct:.1f} %)")
+    if touched is None:
+        print(f"  cards never touched: unavailable (retrieval log unreadable: {reach_error})")
+    else:
+        n_never = len(ids) - len(touched)
+        pct = (100.0 * n_never / len(ids)) if ids else 0.0
+        print(f"  cards never touched: {n_never} / {len(ids)} ({pct:.1f} %)")
     print()
     big = sorted(((len(v), k) for k, v in t["clusters"].items()
                   if len(v) >= a.cluster_min), reverse=True)

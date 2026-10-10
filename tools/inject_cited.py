@@ -117,7 +117,12 @@ def main(argv=None):
         print("inject_cited: off -- no transcript directory (set KHMS_TRANSCRIPTS or pass --transcripts)",
               file=sys.stderr)
         return 2
-    injects = load_injects(a.inject_log, a.since)
+    try:
+        injects = load_injects(a.inject_log, a.since)
+    except OSError as exc:
+        print(f"inject_cited: unavailable -- cannot read injection log {a.inject_log}: "
+              f"{exc.strerror}", file=sys.stderr)
+        return 2
     if not injects:
         print("no INJECT records in the window")
         return 0
