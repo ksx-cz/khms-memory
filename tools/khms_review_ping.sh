@@ -270,10 +270,22 @@ if [ -s "$SFAIL" ]; then
   PENDING="${PENDING:+$PENDING + }$(M PING_SWEEP_FAILED n="$_sn" first="$_sfirst" last="$_slast")"
 fi
 
-# Same watchdog for the weekly (stamps KHMS_WEEK_STAMP on success).
-# 10140 min = 7 d + 1 h: a failed Sunday fires from Monday 04:17 on; a healthy
-# stamp never crosses the threshold before its next refresh.
-if [ ! -f "$WSTAMP" ] || [ -n "$(find "$WSTAMP" -mmin +10140 2>/dev/null)" ]; then
+# Weekly synthesis is due seven calendar dates after completion in the scheduler
+# timezone (inherited TZ, otherwise host timezone). A morning ping can precede
+# that day's completion: alarm only once the whole due date has passed, at +8.
+# Compare UTC ordinals of local dates so spring/autumn DST cannot change the
+# boundary. mtime owns this clock; stamp text and KHMS_PING_TODAY select no clock.
+weekly_missed() {
+  local completed completed_date today completed_day today_day
+  [ -f "$WSTAMP" ] || return 0
+  completed=$(stat -c %Y -- "$WSTAMP") || return 0
+  completed_date=$(date -d "@$completed" +%F)
+  today=$(date +%F)
+  completed_day=$(TZ=UTC0 date -d "$completed_date" +%s)
+  today_day=$(TZ=UTC0 date -d "$today" +%s)
+  [ "$(((today_day - completed_day) / 86400))" -ge 8 ]
+}
+if weekly_missed; then
   WLAST=$([ -f "$WSTAMP" ] && cat "$WSTAMP" || M PING_NEVER)
   PENDING="${PENDING:+$PENDING + }$(M PING_WEEK_MISSED last="$WLAST")"
 fi

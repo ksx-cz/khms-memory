@@ -8,6 +8,9 @@ watchdogs on the night/week stamps and the failed-sweep file -- each in the reso
 import os
 import subprocess
 import time
+import shutil
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -158,3 +161,83 @@ def test_tmux_adapter_reports_an_absent_session_as_rc3(tmp_path):
     p = subprocess.run(["bash", TMUXA, "agent"], input="[AUTO-PING] x\n", text=True, capture_output=True,
                        env=dict(os.environ, KHMS_TMUX_BIN=tm), timeout=60)
     assert p.returncode == 3 and "send-keys" not in log.read_text()
+
+
+def clock_ping(tmp_path, root, now):
+    """Freeze wall-clock date while retaining date's timezone-aware epoch parser."""
+    bindir = tmp_path / "clock-bin"
+    bindir.mkdir(exist_ok=True)
+    wrapper = bindir / "date"
+    wrapper.write_text('#!/bin/bash\ncase "$*" in\n'
+                       '  +%s|+%F|-Is) exec "' + shutil.which("date") +
+                       '" -d "@$FAKE_NOW" "$@" ;;\n'
+                       '  *) exec "' + shutil.which("date") + '" "$@" ;;\nesac\n')
+    wrapper.chmod(0o755)
+    # The old weekly watchdog uses find's clock instead of date; freeze that too
+    # so RED proves its elapsed-hour policy, independent of today's real date.
+    finder = bindir / "find"
+    finder.write_text('#!/bin/bash\n'
+                      'case "$1" in\n'
+                      '  */last-weekly) epoch=$(stat -c %Y -- "$1"); '
+                      'if (( (FAKE_NOW - epoch) / 60 > 10140 )); then echo "$1"; fi ;;\n'
+                      '  *) exec "' + shutil.which("find") + '" "$@" ;;\nesac\n')
+    finder.chmod(0o755)
+    return ping(tmp_path, root, KHMS_PING_DRYRUN="1", TZ="Europe/Prague",
+                FAKE_NOW=str(int(datetime.fromisoformat(now).timestamp())),
+                PATH=str(bindir) + os.pathsep + os.environ["PATH"])
+
+
+@pytest.mark.parametrize("completed,due_morning,due_end,missed_morning", [
+    ("2026-03-23T06:00:00+01:00", "2026-03-30T05:00:00+02:00",
+     "2026-03-30T23:59:59+02:00", "2026-03-31T00:00:00+02:00"),
+    ("2026-10-19T06:00:00+02:00", "2026-10-26T06:30:00+01:00",
+     "2026-10-26T23:59:59+01:00", "2026-10-27T00:00:00+01:00"),
+    ("2026-10-01T00:30:00+02:00", "2026-10-08T06:30:00+02:00",
+     "2026-10-08T23:59:59+02:00", "2026-10-09T00:00:00+02:00"),
+])
+def test_weekly_watchdog_allows_due_day_then_flags_failed_completion(
+        tmp_path, base, completed, due_morning, due_end, missed_morning):
+    weekly = base / "state/shared/last-weekly"
+    # Contents deliberately disagree with mtime: only completion mtime owns the clock.
+    weekly.write_text("2099-12-31T23:59:00+00:00\n")
+    epoch = datetime.fromisoformat(completed).timestamp()
+    os.utime(weekly, (epoch, epoch))
+    before = (weekly.read_bytes(), weekly.stat().st_mtime_ns)
+    for now in (due_morning, due_end):
+        p = clock_ping(tmp_path, base, now)
+        assert p.returncode == 0, p.stderr
+        assert "THE WEEKLY RUN DID NOT FINISH" not in p.stdout, p.stdout
+    p = clock_ping(tmp_path, base, missed_morning)
+    assert p.returncode == 0, p.stderr
+    assert "THE WEEKLY RUN DID NOT FINISH" in p.stdout, p.stdout
+    assert (weekly.read_bytes(), weekly.stat().st_mtime_ns) == before
+    # A successful due-day refresh clears the next morning's alarm across either DST.
+    epoch = datetime.fromisoformat(due_end).timestamp()
+    os.utime(weekly, (epoch, epoch))
+    assert "THE WEEKLY RUN DID NOT FINISH" not in clock_ping(tmp_path, base, missed_morning).stdout
+
+
+def test_nightly_watchdog_keeps_elapsed_policy(tmp_path, base):
+    nightly = base / "state/shared/last-nightly"
+    now = time.time()
+    for age, missed in ((19 * 3600, False), (21 * 3600, True)):
+        os.utime(nightly, (now - age,) * 2)
+        p = clock_ping(tmp_path, base, "2026-10-26T06:30:00+01:00")
+        assert p.returncode == 0, p.stderr
+        assert ("THE NIGHT RUN DID NOT FINISH" in p.stdout) == missed, p.stdout
+
+
+@pytest.mark.parametrize("start", ["2026-03-16", "2026-10-12"])
+def test_repeated_weekly_success_has_no_dst_false_alarm(tmp_path, base, start):
+    weekly = base / "state/shared/last-weekly"
+    first = datetime.fromisoformat(start).replace(hour=6, tzinfo=ZoneInfo("Europe/Prague"))
+    os.utime(weekly, (first.timestamp(),) * 2)
+    for day in range(1, 29):
+        # Ping before completion, whose time varies; refresh every seventh date.
+        morning = first + timedelta(days=day, minutes=30)
+        p = clock_ping(tmp_path, base, morning.isoformat())
+        assert p.returncode == 0, p.stderr
+        assert "THE WEEKLY RUN DID NOT FINISH" not in p.stdout, (day, p.stdout)
+        if day % 7 == 0:
+            completed = morning + timedelta(hours=1 + day % 3)
+            os.utime(weekly, (completed.timestamp(),) * 2)

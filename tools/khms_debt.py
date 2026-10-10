@@ -178,12 +178,11 @@ def scan_reach(brain, ids):
     """The audit's definition: a card is TOUCHED if it was ever injected or was
     ever a recall top hit."""
     touched = set()
-    inj = read(os.path.join(brain, "tools", ".inject.log"))
+    inj = read(P.INJECT_LOG)
     for blob in INJECT_RE.findall(inj):
         touched |= set(CARD_ID_RE.findall(blob))
     touched |= set(TOP_RE.findall(inj))
-    touched |= set(TOP_RE.findall(read(os.path.join(brain, "tools",
-                                                    ".recall.log"))))
+    touched |= set(TOP_RE.findall(read(P.RECALL_LOG)))
     return touched & ids
 
 
@@ -247,7 +246,7 @@ def main(argv=None):
     print(f"  DEBT: {t['rows']} confirmed contradictions vs {hard} "
           f"supersede/refute edges in the whole base")
     print()
-    print("REACH (tools/.inject.log + tools/.recall.log — injected OR top hit)")
+    print(f"REACH ({P.INJECT_LOG} + {P.RECALL_LOG} — injected OR top hit)")
     n_never = len(ids) - len(touched)
     pct = (100.0 * n_never / len(ids)) if ids else 0.0
     print(f"  cards never touched: {n_never} / {len(ids)} ({pct:.1f} %)")
