@@ -5,7 +5,7 @@
 # the wrong card), which is just as checkable as any other quote — verify_quotes.py resolves
 # src=K-xxxxx to the card itself. Writes memory/inbox/DATE-weekly.md. Never touches memory/know/.
 # See spec/khms-spec.md §9.4.
-# Usage: weekly_synthesis.sh   (no arguments; run once a week by the deployment's scheduler; log: KHMS_NIGHT_LOG)
+# Usage: weekly_synthesis.sh   (no arguments; run daily by the deployment's scheduler; due every 7 days; log: KHMS_NIGHT_LOG)
 #
 # Locations and models come from khms_paths.sh: KHMS_ROOT (data), KHMS_WEEKLY_LOCK + KHMS_NIGHTLY_LOCK +
 # KHMS_WEEK_STAMP (shared state), KHMS_NIGHT_LOG, KHMS_AGENT, KHMS_WEEK_PART_MODEL, KHMS_WEEK_MODEL,
@@ -26,6 +26,21 @@ khms_code_lock || exit $?
 AGENT=$(khms_get KHMS_AGENT)
 LOG=${WEEKLY_LOG:-$(khms_get KHMS_NIGHT_LOG)}
 mkdir -p "$(dirname "$LOG")"
+WSTAMP=$(khms_get KHMS_WEEK_STAMP)
+# mtime is the completion clock (also used by the review ping), never the inbox date.
+# Check cheaply before locking, then again under the lock: another run may have finished.
+weekly_due() {
+  local completed now
+  [ -f "$WSTAMP" ] || return 0
+  completed=$(stat -c %Y -- "$WSTAMP") || return 0
+  now=$(date +%s)
+  [ "$((now - completed))" -ge 604800 ]
+}
+weekly_skip() {
+  echo "$(date -Is) weekly not due: last success is younger than 7 days ($WSTAMP)" >> "$LOG"
+  exit 0
+}
+weekly_due || weekly_skip
 STAGING=$ROOT/memory/inbox/.staging
 mkdir -p "$STAGING"
 DATE=${WEEKLY_DATE:-$(date +%F)}
@@ -66,6 +81,8 @@ WEEKLY_PART_CHUNKS=${WEEKLY_PART_CHUNKS:-6}
 WEEKLY_PART_TIMEOUT=${WEEKLY_PART_TIMEOUT:-45m}
 WEEKLY_MERGE_TIMEOUT=${WEEKLY_MERGE_TIMEOUT:-120m}
 WEEKLY_PART_ATTEMPTS=${WEEKLY_PART_ATTEMPTS:-2}
+# Same account-limit vocabulary as nightly_retry.sh; quota exhaustion is not transient.
+RETRY_LIMIT_RE=${RETRY_LIMIT_RE:-"hit your [a-z0-9 -]*limit|usage limit reached"}
 # Parts only extract findings with quotes (the nightly extraction's kind of work, mid tier); the
 # merge is the synthesis and runs on the strong tier (KHMS_WEEK_MODEL).
 WEEKLY_PART_MODEL=${WEEKLY_PART_MODEL:-$(khms_get KHMS_WEEK_PART_MODEL)}
@@ -78,6 +95,7 @@ mkdir -p "$(dirname "$WLOCK")"
 
 exec 7>>"$WLOCK"
 flock -n 7 || { echo "$(date -Is) weekly already running, exit" >> "$LOG"; exit 0; }
+weekly_due || weekly_skip
 
 echo "$(date -Is) weekly start" >> "$LOG"
 # render_prompt <name>: prompts/<name>.md with its fields and private extension slots filled
@@ -92,9 +110,11 @@ weekly_fail() {   # weekly_fail <why> — the run fails visibly and leaves no ou
   echo "$line" >> "$LOG"
   echo "$line" >&2
   if [ -f "$OUT" ]; then mv -f "$OUT" "$STAGING/weekly-$DATE-FAILED-$(date +%H%M%S).md"; fi
-  exit 1
+  exit "${2:-1}"
 }
-OUT=$ROOT/memory/inbox/$DATE-weekly.md
+FINAL_OUT=$ROOT/memory/inbox/$DATE-weekly.md
+# The model and review gates write privately; publish only the completed proposal.
+OUT=$STAGING/weekly-$DATE-merge.md
 AGENT_BIN=$(command -v -- "$AGENT" 2>/dev/null || true)
 [ -n "$AGENT_BIN" ] || weekly_fail "AGENT UNAVAILABLE: '$AGENT' (KHMS_AGENT) is not an executable command"
 
@@ -201,6 +221,13 @@ run_proven() {
       --strict-mcp-config --tools Read Write Edit Glob Grep \
       --allowedTools Read Write Edit Glob Grep > "$call_out" 2>&1 || rc=$?
     cat "$call_out" >> "$LOG"
+    # A quota response may be returned with CLI success; text is authoritative here.
+    if grep -qiE "$RETRY_LIMIT_RE" "$call_out"; then
+      RUN_PROVEN_WHY="$label USAGE LIMIT on attempt $attempt/$WEEKLY_PART_ATTEMPTS (rc=$rc): $(grep -m1 -iE "$RETRY_LIMIT_RE" "$call_out" | head -c 200) — not retried; no further model calls"
+      echo "$(date -Is) $RUN_PROVEN_WHY" >> "$LOG"
+      rm -f "$out"
+      return 75
+    fi
     said=$(grep -v '^[[:space:]]*$' "$call_out" | tail -1 | cut -c1-200 || true)
     tr=$(find "$TRANSCRIPT_ROOT" -name "$sid.jsonl" -type f 2>/dev/null | head -1)
     # Report, not gate: `|| true` so this cannot kill the script under `set -e`.
@@ -252,7 +279,7 @@ $(sed 's|^|  * |' "$_gf")
 OUTPUT FILE: $_pout"
     echo "$(date -Is) weekly part $_k/$_K: $(grep -c . "$_gf") chunk(s) -> $_pout" >> "$LOG"
     run_proven "weekly-part-$_k" "$WEEKLY_PART_TIMEOUT" "$_gf" "$_pout" "$_prompt" "$WEEKLY_PART_MODEL" \
-      || weekly_fail "part $_k/$_K failed every attempt ($_gf) — last: $RUN_PROVEN_WHY"
+      || { _rc=$?; weekly_fail "part $_k/$_K failed ($_gf) — last: $RUN_PROVEN_WHY" "$_rc"; }
     PART_FILES+=("$_pout")
   done
 else
@@ -286,7 +313,7 @@ INPUTS:
 OUTPUT FILE: $OUT"
 echo "$(date -Is) weekly merge: $(grep -c . "$HDR_INDEX") header chunk(s) + ${#PART_FILES[@]} part file(s) -> $OUT" >> "$LOG"
 run_proven "weekly-merge" "$WEEKLY_MERGE_TIMEOUT" "$MERGE_REQ" "$OUT" "$MERGE_PROMPT" "$WEEKLY_MODEL" \
-  || weekly_fail "the merge failed every attempt — last: $RUN_PROVEN_WHY"
+  || { _rc=$?; weekly_fail "the merge failed — last: $RUN_PROVEN_WHY" "$_rc"; }
 
 # Grounding check: src=K-xxxxx quotes are resolved to the cards themselves, so a
 # misattributed claim is caught by a tool rather than at review by eye.
@@ -332,7 +359,8 @@ fi
 
 # Completion stamp — a review ping alerts when this goes stale (>7 d + 1 h), so a weekly
 # that died no longer hides behind "no proposal file, nothing pending".
-WSTAMP=$(khms_get KHMS_WEEK_STAMP)
+mv -f "${OUT%.md}-quotecheck.txt" "${FINAL_OUT%.md}-quotecheck.txt"
+mv -f "$OUT" "$FINAL_OUT"
 mkdir -p "$(dirname "$WSTAMP")"
 date -Is > "$WSTAMP"
-echo "$(date -Is) weekly done -> $OUT" >> "$LOG"
+echo "$(date -Is) weekly done -> $FINAL_OUT" >> "$LOG"
