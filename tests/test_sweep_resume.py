@@ -171,3 +171,59 @@ def test_a_dry_run_shows_the_resume_and_changes_nothing_of_the_frozen_list(tmp_p
     assert dry.returncode == 0 and "RESUMING the frozen list 2099-01-02" in dry.stdout, dry.stdout[-2000:]
     assert {p.name: p.read_bytes() for p in prep.iterdir()} == frozen
 
+
+
+# Review FIX (Diblin, 2026-10-11), defect 1: the frozen record proved only the LIST of input paths, so a chunk whose
+# BYTES changed at the same path was resumed against: the old part output was reused and the stamp advanced. The
+# frozen record now carries the content sha256 of every frozen input; a mismatch sets the whole list aside and the
+# window is collected again from the unmoved stamp (no part's old output is reused, nothing is skipped).
+import pytest  # noqa: E402
+
+
+def _frozen_inputs(root):
+    staging = root / "memory/inbox/.staging"
+    idx = staging / "nightly-2099-01-02-prepare-chunks.txt"
+    return {"chunk": lambda: __import__("pathlib").Path(idx.read_text().splitlines()[0].split("\t")[1]),
+            "digest": lambda: staging / "nightly-2099-01-02-digest.txt",
+            "journals": lambda: staging / "nightly-2099-01-02-journals.md"}
+
+
+@pytest.mark.parametrize("which", ["chunk", "digest", "journals"])
+def test_a_frozen_input_whose_bytes_changed_at_the_same_path_is_set_aside_and_never_reused(tmp_path, which):
+    root, fake, tr = make_parts_base(tmp_path)
+    first = run(tmp_path, root, fake, KHMS_TRANSCRIPTS=tr, KILL_PART=2)       # part 1 complete, part 2 killed
+    assert first.returncode == -9, (first.returncode, log_of(root)[-3000:])
+    staging = root / "memory/inbox/.staging"
+    prep = staging / ".prepare-2099-01-02"
+    assert (prep / "done-001").exists()
+    src = _frozen_inputs(root)[which]()
+    src.write_text(src.read_text() + "\nCHANGED INPUT CONTENT AFTER CHECKPOINT\n")   # same path, other bytes
+    mark = n_calls(tmp_path)
+    second = run(tmp_path, root, fake, KHMS_TRANSCRIPTS=tr, NIGHTLY_DATE="2099-01-03")
+    log = log_of(root)
+    assert second.returncode == 0, log[-4000:]
+    assert "frozen list 2099-01-02 is DAMAGED" in log and f"{src.name} changed" in log, log[-3000:]
+    calls = sweep_calls(tmp_path, mark)
+    assert [k for k, _n, _p in calls] == list(range(1, calls[0][1] + 1)), calls   # part 1 is NOT reused
+    assert all("2099-01-03" in p for _k, _n, paths in calls for p in paths)
+    assert list(staging.glob(".prepare-2099-01-02.damaged-*"))
+    # the stamp is the re-collected window's end (this run's start), written only after its own parts ran
+    stamp = (root / "state/shared/last-nightly").read_text().strip()
+    assert re.search(re.escape(stamp) + r" nightly start \(night key 2099-01-03\)", log), (stamp, log[-2000:])
+    assert "resuming the frozen prepare list" not in log and "the frozen list 2099-01-02 is complete" not in log
+
+
+def test_a_journal_that_grew_after_the_freeze_is_not_damage(tmp_path):
+    # positive control for the test above: the ledger grounding (journals-ledger.md) is refreshed on purpose
+    # at every resume, so a live journal that grew must NOT set the frozen list aside
+    root, fake, tr = make_parts_base(tmp_path)
+    assert run(tmp_path, root, fake, KHMS_TRANSCRIPTS=tr, KILL_PART=2).returncode == -9
+    (root / "journal").mkdir(exist_ok=True)
+    with open(root / "journal" / "2099-01-02.md", "a", encoding="utf-8") as fh:
+        fh.write("\n- a later line written after the freeze\n")
+    mark = n_calls(tmp_path)
+    second = run(tmp_path, root, fake, KHMS_TRANSCRIPTS=tr, NIGHTLY_DATE="2099-01-03")
+    log = log_of(root)
+    assert second.returncode == 0 and "DAMAGED" not in log, log[-3000:]
+    calls = sweep_calls(tmp_path, mark)
+    assert [k for k, _n, _p in calls][0] == 2 and all("2099-01-02" in p for _k, _n, ps in calls for p in ps)

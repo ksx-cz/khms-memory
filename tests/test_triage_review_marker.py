@@ -92,7 +92,7 @@ def test_the_marker_repair_is_a_dry_run_first_idempotent_and_refuses_what_it_can
         os.utime(u, (old, old))
         if applied_after is not None:
             a = inbox / name.replace(".md", ".applied.md")
-            a.write_text("applied\n")
+            a.write_text(f"# apply_triage — {name} (APPLIED 2099-01-01T00:00:00+00:00)\n")
             t = old + (60 if applied_after else -60)
             os.utime(a, (t, t))
         return u
@@ -129,3 +129,86 @@ def test_the_marker_repair_is_a_dry_run_first_idempotent_and_refuses_what_it_can
 
     wrong = repair(base, tmp_path, f"{suffixed}={'2' * 64}")    # the unit is not the one the caller checked
     assert wrong.returncode == 1 and "REFUSED" in wrong.stdout, wrong.stdout
+
+
+# Review FIX (Diblin, 2026-10-11), defect 2: `apply_triage.py --dry-run` writes the same `<stem>.applied.md` (K-05302),
+# so its existence and mtime are no proof that the review was applied. The repair now requires the report's header to
+# say APPLIED for THIS unit, and checks and writes under the `cards` lock the apply writer holds.
+import fcntl  # noqa: E402
+import threading  # noqa: E402
+
+
+def dry_apply(unit, base, tmp):
+    return subprocess.run([sys.executable, str(TOOLS / "apply_triage.py"), str(unit), "--dry-run"],
+                          env=env_for(base, tmp), text=True, capture_output=True, timeout=60)
+
+
+def test_a_dry_run_report_is_not_proof_of_application(tmp_path):
+    base = make_base(tmp_path)
+    inbox, rev = base / "memory" / "inbox", base / "state" / "shared" / "reviewed"
+    unit = inbox / "2099-01-01-probe-triage.md"
+    unit.write_text(TRIAGE, encoding="utf-8")
+    d = dry_apply(unit, base, tmp_path)                              # the REAL dry-run writer
+    assert d.returncode == 0, d.stderr
+    report = unit.with_name(unit.stem + ".applied.md")
+    assert "(DRY RUN " in report.read_text().splitlines()[0]
+    assert not reviewed(unit, base, tmp_path)
+    r = repair(base, tmp_path, "--apply", f"{unit}={sha(unit)}")
+    assert r.returncode == 1 and "REFUSED" in r.stdout and "DRY RUN" in r.stdout, r.stdout + r.stderr
+    assert not (rev / ".reviewed-2099-01-01-probe-triage").exists()
+    assert not reviewed(unit, base, tmp_path)
+
+    # a malformed report and a report of ANOTHER unit are refused the same way
+    for name, header in (("2099-01-02-m-triage.md", "applied\n"),
+                         ("2099-01-03-w-triage.md", "# apply_triage — 2099-01-09-other-triage.md "
+                                                    "(APPLIED 2099-01-01T00:00:00+00:00)\n")):
+        u = inbox / name
+        u.write_text(TRIAGE, encoding="utf-8")
+        u.with_name(u.stem + ".applied.md").write_text(header, encoding="utf-8")
+        r = repair(base, tmp_path, "--apply", u)
+        assert r.returncode == 1 and "REFUSED" in r.stdout, (name, r.stdout + r.stderr)
+        assert not (rev / f".reviewed-{u.stem}").exists()
+
+
+def test_a_real_apply_is_proof_and_the_repair_is_idempotent(tmp_path):
+    base = make_base(tmp_path)
+    rev = base / "state" / "shared" / "reviewed"
+    unit = base / "memory" / "inbox" / "2099-01-01-coordinator-triage.md"
+    unit.write_text(TRIAGE, encoding="utf-8")
+    assert apply(unit, base, tmp_path).returncode == 0              # the REAL apply writer
+    marker = rev / ".reviewed-2099-01-01-coordinator-triage"
+    marker.unlink()                                                  # as under the old date-named writer
+    assert not reviewed(unit, base, tmp_path)
+    r = repair(base, tmp_path, "--apply", f"{unit}={sha(unit)}")
+    assert r.returncode == 0 and "WROTE" in r.stdout, r.stdout + r.stderr
+    assert reviewed(unit, base, tmp_path)
+    before = (marker.read_bytes(), marker.stat().st_mtime_ns)
+    again = repair(base, tmp_path, "--apply", f"{unit}={sha(unit)}")
+    assert again.returncode == 0 and "ALREADY" in again.stdout, again.stdout + again.stderr
+    assert (marker.read_bytes(), marker.stat().st_mtime_ns) == before
+
+
+def test_the_repair_checks_and_writes_under_the_cards_lock(tmp_path):
+    base = make_base(tmp_path)
+    rev = base / "state" / "shared" / "reviewed"
+    unit = base / "memory" / "inbox" / "2099-01-01-l-triage.md"
+    unit.write_text(TRIAGE, encoding="utf-8")
+    assert apply(unit, base, tmp_path).returncode == 0
+    marker = rev / ".reviewed-2099-01-01-l-triage"
+    marker.unlink()
+    where = subprocess.run([sys.executable, "-c", "import khms_lock as L; print(L.runtime())"],
+                           cwd=str(TOOLS), env=env_for(base, tmp_path), text=True, capture_output=True, timeout=60)
+    assert where.returncode == 0, where.stderr
+    lockfile = Path(where.stdout.strip()) / "cards.lock"
+    lockfile.parent.mkdir(parents=True, exist_ok=True)
+    with open(lockfile, "a") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)                               # the apply writer's lock, held
+        out = {}
+        t = threading.Thread(target=lambda: out.update(r=repair(base, tmp_path, "--apply", unit)))
+        t.start()
+        t.join(4)
+        assert t.is_alive() and not marker.exists(), "the repair wrote while the cards lock was held"
+        fcntl.flock(fh, fcntl.LOCK_UN)
+    t.join(60)
+    assert out["r"].returncode == 0 and "WROTE" in out["r"].stdout, out["r"].stdout + out["r"].stderr
+    assert reviewed(unit, base, tmp_path)

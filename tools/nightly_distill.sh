@@ -326,7 +326,12 @@ done
 # next window two nights long -- the same failure every night on a growing window. Now the run that
 # collects a window FREEZES its list of prepare inputs before the first part starts:
 #   $STAGING/.prepare-<SK>/FROZEN   since=, end= (the window), group_chunks=, parts=, index_sha256=
-#                                   (sha256 of nightly-<SK>-prepare-chunks.txt, the ordered input list);
+#                                   (sha256 of nightly-<SK>-prepare-chunks.txt, the ordered input list),
+#                                   and one `input=<sha256><TAB><path>` line per frozen input: every primary
+#                                   chunk of that list and the window's own sources (digest, git log, their
+#                                   chunk indices, the window's journals) -- their CONTENT, not only their
+#                                   names (review FIX 2026-10-11: a list of paths let a chunk whose bytes
+#                                   changed at the same path resume against an old part output);
 #   $STAGING/.prepare-<SK>/done-NNN one COMPLETION RECORD per finished part (written by rename after the
 #                                   part's call and its reassembly): group_sha256 of its input list and
 #                                   output_sha256 of nightly-<SK>-sweep-gNN.md ("absent" when none).
@@ -336,13 +341,26 @@ done
 # redone from nothing, a finished part is never run twice -- and builds the sweep file from the part
 # outputs in order. The stamp moves to the frozen END only when every part is complete and the window is
 # committed to the carry queue (step 2e), so no input of the window is ever skipped; the run after that
-# collects the next window from there. A list the stamp already covers is removed; a damaged one is set
-# aside and its window collected again from the (unmoved) stamp.
+# collects the next window from there. A list the stamp already covers is removed; a damaged one -- an input
+# missing, or an input whose content sha256 differs from the frozen one -- is set aside WHOLE and its window
+# collected again from the (unmoved) stamp, before any completion record is consumed. Redoing only the part
+# whose chunk changed is not done on purpose: the changed bytes no longer match the digest the chunk was cut
+# from, nor the grounding the finished parts quoted, so no single part can be shown to be the window's;
+# re-collecting from the stamp rebuilds the window from its real sources, skips nothing and reuses nothing.
+# The ledger grounding (nightly-<SK>-journals-ledger.md) is NOT frozen: a resume refreshes it on purpose.
 SK=$NK
 WINDOW_END=$RUN_START
 RESUME=""
 sha_of() { sha256sum "$1" 2>/dev/null | cut -d' ' -f1; }
 frozen_get() { sed -n "s/^$2=//p" "$1/FROZEN" 2>/dev/null | head -1; }
+frozen_inputs() {  # frozen_inputs <key> -> every input path whose CONTENT the frozen record vouches for
+  local f
+  for f in digest.txt git.txt digest-chunks.txt git-chunks.txt journals.md; do echo "$STAGING/nightly-$1-$f"; done
+  cut -f2 "$STAGING/nightly-$1-prepare-chunks.txt"
+}
+frozen_input_sha() {  # frozen_input_sha <dir> <path> -> the content sha256 frozen for that path, or nothing
+  awk -F'\t' -v p="$2" '$1 ~ /^input=/ && $2 == p { sub(/^input=/, "", $1); print $1; exit }' "$1/FROZEN"
+}
 frozen_check() {   # frozen_check <dir> <key> -> 0, or 1 with the reason on stdout
   local d="$1" k="$2" idx="$STAGING/nightly-$2-prepare-chunks.txt" src chunk f
   local -a g
@@ -357,6 +375,11 @@ frozen_check() {   # frozen_check <dir> <key> -> 0, or 1 with the reason on stdo
   for f in digest.txt git.txt digest-chunks.txt git-chunks.txt journals.md; do
     [ -e "$STAGING/nightly-$k-$f" ] || { echo "grounding input nightly-$k-$f is missing"; return 1; }
   done
+  while IFS= read -r f; do
+    src=$(frozen_input_sha "$d" "$f")
+    [ -n "$src" ] || { echo "input $f has no content sha256 in the frozen record"; return 1; }
+    [ "$(sha_of "$f")" = "$src" ] || { echo "input $f changed (its content sha256 is not the frozen one)"; return 1; }
+  done < <(frozen_inputs "$k")
   return 0
 }
 shopt -s nullglob
@@ -909,6 +932,9 @@ elif [ ${#SWEEP_GROUP_FILES[@]} -gt 0 ]; then
     mkdir -p "$PREP_DIR"
     printf 'since=%s\nend=%s\ngroup_chunks=%s\nparts=%s\nindex_sha256=%s\n' "$SINCE" "$WINDOW_END" \
       "$SWEEP_GROUP_CHUNKS" "$_K" "$(sha_of "$SWEEP_SOURCE_INDEX")" > "$PREP_DIR/FROZEN.tmp"
+    frozen_inputs "$SK" | while IFS= read -r _f; do
+      printf 'input=%s\t%s\n' "$(sha_of "$_f")" "$_f"
+    done >> "$PREP_DIR/FROZEN.tmp"
     mv "$PREP_DIR/FROZEN.tmp" "$PREP_DIR/FROZEN"
     echo "$(date -Is) prepare: input list frozen in $PREP_DIR ($_K part(s), window $SINCE -> $WINDOW_END)" >> "$LOG"
   fi

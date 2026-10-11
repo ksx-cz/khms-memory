@@ -118,8 +118,11 @@ parts than one night's `SWEEP_BUDGET_MIN` covers, the finished parts are kept:
 - Before part 1, the run freezes the window's input list in
   `memory/inbox/.staging/.prepare-<night key>/FROZEN` — `since=`, `end=` (the
   window), `group_chunks=`, `parts=` and `index_sha256=` of the ordered input list
-  `nightly-<night key>-prepare-chunks.txt`. The window's inputs (digest, git log,
-  chunks, part lists) stay in staging under that run's night key.
+  `nightly-<night key>-prepare-chunks.txt`, plus one `input=<sha256><TAB><path>`
+  line per frozen input — every primary chunk and the window's own digest, git
+  log, their chunk indices and journals — so the record vouches for the inputs'
+  CONTENT, not only their names. The window's inputs stay in staging under that
+  run's night key.
 - Each finished part gets a completion record `done-NNN` beside `FROZEN`, renamed
   into place after its call and reassembly: the sha256 of its part list and of its
   output `nightly-<night key>-sweep-gNN.md`. A part without a valid record (killed,
@@ -129,5 +132,10 @@ parts than one night's `SWEEP_BUDGET_MIN` covers, the finished parts are kept:
   order. Only when the whole list is complete and committed to the carry queue
   does the stamp move — to the frozen `end`, so the next window starts exactly
   there and no input is skipped. A list the stamp already covers is removed; a
-  damaged one (an input missing or changed) is set aside as `.damaged-<time>` and
-  its window is collected again from the unmoved stamp.
+  damaged one (an input missing, or its content sha256 not the frozen one) is set
+  aside WHOLE as `.damaged-<time>` before any completion record is used, and its
+  window is collected again from the unmoved stamp: a changed chunk no longer
+  matches the digest it was cut from or the grounding the finished parts quoted,
+  so redoing just its part could not be shown to sweep the window. The ledger
+  grounding `nightly-<night key>-journals-ledger.md` is not frozen — a resume
+  refreshes it on purpose (journals only grow).
