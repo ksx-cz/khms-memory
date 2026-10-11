@@ -109,7 +109,9 @@ SWEEP_TIMEOUT=${SWEEP_TIMEOUT:-75m}
 # timeout. No sweep part and no retry attempt STARTS after it, and a started attempt is clipped to
 # it (RETRY_DEADLINE_EPOCH in nightly_retry.sh). 150: the single-call sweep measured 9–38 min, so
 # a healthy night is far inside it, and it leaves the consolidate budget (CARD_BUDGET_MIN, +180)
-# half an hour of its own. A sweep stopped by it FAILS like any other (no stamp, window kept), and
+# half an hour of its own. A sweep stopped by it FAILS like any other (no stamp, window kept; since
+# #173 its finished parts are KEPT and the next run continues the frozen list -- see THE FROZEN PREPARE
+# LIST below), and
 # every failed sweep is recorded in KHMS_SWEEP_FAILED, which a morning review ping reads aloud
 # until a sweep succeeds — a part that always fails on a growing window surfaces instead of
 # looping silently.
@@ -318,6 +320,74 @@ for _w in "$CARRY"/*/WINDOW; do
   fi
 done
 
+# THE FROZEN PREPARE LIST (#173; first night on the shared code, 2026-10-11). A window whose sweep has
+# more parts than one night's SWEEP_BUDGET_MIN covers (that night: 42 one-chunk parts at 6-7 min, cut by
+# the 150-min deadline at part 23) used to be thrown away whole: nothing kept, nothing stamped, and the
+# next window two nights long -- the same failure every night on a growing window. Now the run that
+# collects a window FREEZES its list of prepare inputs before the first part starts:
+#   $STAGING/.prepare-<SK>/FROZEN   since=, end= (the window), group_chunks=, parts=, index_sha256=
+#                                   (sha256 of nightly-<SK>-prepare-chunks.txt, the ordered input list);
+#   $STAGING/.prepare-<SK>/done-NNN one COMPLETION RECORD per finished part (written by rename after the
+#                                   part's call and its reassembly): group_sha256 of its input list and
+#                                   output_sha256 of nightly-<SK>-sweep-gNN.md ("absent" when none).
+# SK is the night key of the run that collected the window; its staging inputs (digest, git log, chunks,
+# part lists) stay where that run wrote them. The NEXT run finds the list here and, instead of collecting
+# a new window, runs only the parts without a valid record -- a part killed mid-call has none and is
+# redone from nothing, a finished part is never run twice -- and builds the sweep file from the part
+# outputs in order. The stamp moves to the frozen END only when every part is complete and the window is
+# committed to the carry queue (step 2e), so no input of the window is ever skipped; the run after that
+# collects the next window from there. A list the stamp already covers is removed; a damaged one is set
+# aside and its window collected again from the (unmoved) stamp.
+SK=$NK
+WINDOW_END=$RUN_START
+RESUME=""
+sha_of() { sha256sum "$1" 2>/dev/null | cut -d' ' -f1; }
+frozen_get() { sed -n "s/^$2=//p" "$1/FROZEN" 2>/dev/null | head -1; }
+frozen_check() {   # frozen_check <dir> <key> -> 0, or 1 with the reason on stdout
+  local d="$1" k="$2" idx="$STAGING/nightly-$2-prepare-chunks.txt" src chunk f
+  local -a g
+  [ -s "$idx" ] || { echo "its input list $idx is missing"; return 1; }
+  [ "$(sha_of "$idx")" = "$(frozen_get "$d" index_sha256)" ] || { echo "its input list $idx changed"; return 1; }
+  shopt -s nullglob; g=("$STAGING/nightly-$k-prepare-group"[0-9]*.txt); shopt -u nullglob
+  [ "${#g[@]}" = "$(frozen_get "$d" parts)" ] || { echo "${#g[@]} part list(s) on disk, $(frozen_get "$d" parts) frozen"; return 1; }
+  cat "${g[@]}" | cmp -s - "$idx" || { echo "its part lists differ from its input list"; return 1; }
+  while IFS=$'\t' read -r src chunk; do
+    [ -f "$chunk" ] || { echo "input chunk $chunk ($src) is missing"; return 1; }
+  done < "$idx"
+  for f in digest.txt git.txt digest-chunks.txt git-chunks.txt journals.md; do
+    [ -e "$STAGING/nightly-$k-$f" ] || { echo "grounding input nightly-$k-$f is missing"; return 1; }
+  done
+  return 0
+}
+shopt -s nullglob
+for _pd in "$STAGING"/.prepare-*/; do
+  _pd=${_pd%/}; _fk=${_pd##*/.prepare-}
+  case "$_fk" in *.damaged-*) continue ;; esac
+  if [ ! -f "$_pd/FROZEN" ]; then   # a freeze that died before its rename: nothing was kept under it
+    [ "$DRYRUN" = "1" ] || rm -rf "$_pd"
+    continue
+  fi
+  _fend=$(frozen_get "$_pd" end)
+  if [ "$(date -d "$_fend" +%s 2>/dev/null || echo 0)" -le "$(date -d "$SINCE" +%s 2>/dev/null || echo 0)" ]; then
+    echo "$(date -Is) prepare: frozen list $_fk (window end $_fend) is already covered by the stamp $SINCE — removed" >> "$LOG"
+    [ "$DRYRUN" = "1" ] || rm -rf "$_pd"
+    continue
+  fi
+  if ! _why=$(frozen_check "$_pd" "$_fk"); then
+    _aside="$_pd.damaged-$(date +%Y%m%dT%H%M%S)"
+    echo "$(date -Is) prepare: frozen list $_fk is DAMAGED ($_why) — set aside as $_aside; its window is collected again from the stamp $SINCE, so nothing is skipped (its finished parts are swept again)" >> "$LOG"
+    [ "$DRYRUN" = "1" ] || mv "$_pd" "$_aside"
+    continue
+  fi
+  RESUME=$_fk; SK=$_fk; WINDOW_END=$_fend
+  SINCE=$(frozen_get "$_pd" since)
+  SWEEP_GROUP_CHUNKS=$(frozen_get "$_pd" group_chunks)
+  _fdone=("$_pd"/done-[0-9]*)
+  echo "$(date -Is) prepare: resuming the frozen prepare list $SK (window $SINCE -> $WINDOW_END, $(frozen_get "$_pd" parts) part(s), ${#_fdone[@]} with a completion record) — no new window is collected tonight; the stamp moves to $WINDOW_END once the list is complete" >> "$LOG"
+  break
+done
+shopt -u nullglob
+
 # 0) THE RECORD THE JOURNALS QUOTE FROM. A journal that puts words in the principal's mouth can
 # only be caught against the chat history, and in the reference deployment the local copy of it
 # was once 39 days stale — a month was ungroundable, and the first diagnosis of a mis-quote
@@ -353,8 +423,15 @@ else
 fi
 fi
 
-# 1) deterministic inputs
-DIGEST=$STAGING/nightly-$NK-digest.txt
+# 1) deterministic inputs -- collected for a NEW window only; a resumed frozen list has its own (SK)
+DIGEST=$STAGING/nightly-$SK-digest.txt
+JSRC=$STAGING/nightly-$SK-journals.md
+GITLOG=$STAGING/nightly-$SK-git.txt
+JOURNAL=$ROOT/journal/$DATE.md
+SRC_FAILED=$STAGING/nightly-$NK-source-failed.txt
+: > "$SRC_FAILED"
+read -r -a GIT_REPOS <<< "$(khms_get KHMS_GIT_REPOS)"
+if [ -z "$RESUME" ]; then
 : > "$DIGEST"
 # SOURCE: agent session transcripts (KHMS_TRANSCRIPTS, space-separated directories; only paths
 # containing KHMS_PROJECT_SLUG when it is set). Unconfigured = no transcript source tonight, said in
@@ -367,8 +444,6 @@ DIGEST=$STAGING/nightly-$NK-digest.txt
 # F2: an unreadable git repository advanced the stamp and its commits were never read again). Each failure
 # is one line in $SRC_FAILED; a failed source makes the sweep FAIL below (window kept, stamp untouched),
 # while the queue and the carry from earlier, fully collected windows still proceed.
-SRC_FAILED=$STAGING/nightly-$NK-source-failed.txt
-: > "$SRC_FAILED"
 read -r -a TRANSCRIPT_DIRS <<< "$(khms_get KHMS_TRANSCRIPTS)"
 SLUG=$(khms_get KHMS_PROJECT_SLUG)
 if [ ${#TRANSCRIPT_DIRS[@]} -eq 0 ]; then
@@ -392,8 +467,6 @@ done
 # distilled is YESTERDAY, whose journal is complete — while $DATE.md is empty or missing.
 # Every sweep 07-25..07-29 therefore ran with a nascent journal or none, and the MARK
 # anchors never fired on time. $JOURNAL stays as the day-summary APPEND TARGET only.
-JOURNAL=$ROOT/journal/$DATE.md
-JSRC=$STAGING/nightly-$NK-journals.md
 : > "$JSRC"
 { find "$ROOT/journal" -name '2*.md' -newermt "$SINCE" -type f \
     || echo "journal: listing $ROOT/journal failed" >> "$SRC_FAILED"; } | sort | while read -r j; do
@@ -402,9 +475,7 @@ JSRC=$STAGING/nightly-$NK-journals.md
 done
 # SOURCE: the commits of KHMS_GIT_REPOS since the stamp (`git log --since --stat`). One repository is
 # the log exactly as `git log` prints it; several are each headed `===== <repo> =====`.
-GITLOG=$STAGING/nightly-$NK-git.txt
 : > "$GITLOG"
-read -r -a GIT_REPOS <<< "$(khms_get KHMS_GIT_REPOS)"
 if [ ${#GIT_REPOS[@]} -eq 0 ]; then
   echo "$(date -Is) source git: OFF (KHMS_GIT_REPOS not configured)" >> "$LOG"
 fi
@@ -435,6 +506,7 @@ for filename in sys.argv[1:]:
             kept.append(line)
     path.write_text("".join(kept), encoding="utf-8")
 PYUNMARKED
+fi   # a new window's inputs
 SOURCE_FAILED=""
 if [ -s "$SRC_FAILED" ]; then
   SOURCE_FAILED=$(grep -c . "$SRC_FAILED")
@@ -506,20 +578,23 @@ CARRY_N=$(carry_batches | wc -l)
 # Journal source for GROUNDING: the window's journals plus every journal from the ledger floor
 # on — a queued mark from an older day is quoted from its own file, and a verifier handed only
 # tonight's window would call every such quote ABSENT and strip it.
+# A resumed list is grounded against the journals as they are NOW (they only grow), in the frozen run's
+# own file, which is where a batch of its carry directory is grounded later (consolidate_inputs).
 JVERIFY=$STAGING/nightly-$NK-journals-ledger.md
-cp "$JSRC" "$JVERIFY"
+if [ -n "$RESUME" ] && [ "$DRYRUN" != "1" ]; then JVERIFY=$STAGING/nightly-$SK-journals-ledger.md; fi
+if [ -n "$RESUME" ]; then : > "$JVERIFY"; else cp "$JSRC" "$JVERIFY"; fi
 LFLOOR=$(ledger floor 2>>"$LOG" || echo 1970-01-01)
 find "$ROOT/journal" -name '2*.md' -type f | sort | while read -r j; do
   b=${j##*/}
   [[ "$b" < "$LFLOOR" ]] && continue
-  grep -qxF "===== $b =====" "$JSRC" && continue
+  grep -qxF "===== $b =====" "$JVERIFY" && continue
   printf '\n===== %s =====\n' "$b" >> "$JVERIFY"
   cat "$j" >> "$JVERIFY"
 done
 
 SIZE=$(stat -c%s "$DIGEST")
 NO_WINDOW=0
-if [ "$SIZE" -lt 200 ] && [ ! -s "$GITLOG" ]; then
+if [ "$SIZE" -lt 200 ] && [ ! -s "$GITLOG" ] && [ -z "$RESUME" ]; then
   if [ "$QUEUE_N" -eq 0 ] && [ "$CARRY_N" -eq 0 ] && [ -z "$SOURCE_FAILED" ]; then
     echo "$(date -Is) nothing new (digest ${SIZE}B), queue empty, carry empty — nothing to distil" >> "$LOG"
     if [ "$DRYRUN" != "1" ]; then
@@ -559,8 +634,8 @@ TOOLS="Read Write Edit Glob Grep"
 # 2026-10-06..07 in consolidate and MARK stages. --tools limits the offered set to $TOOLS and
 # --strict-mcp-config drops MCP; probe: the stage lists exactly "Edit, Glob, Grep, Read, Write".
 STAGE_ISOLATION=(--setting-sources "" --effort high --strict-mcp-config --tools $TOOLS)
-QREPORT=$STAGING/nightly-$NK-quotecheck.txt
-SWEEP=$STAGING/nightly-$NK-sweep.md
+QREPORT=$STAGING/nightly-$SK-quotecheck.txt
+SWEEP=$STAGING/nightly-$SK-sweep.md
 # Tonight's proposals: every consolidated batch is published as its OWN immutable inbox unit
 # memory/inbox/<night key>-bNN.md (review P1-3); this staging file only concatenates the units
 # this run has published so far, for the next batch's dedup.
@@ -581,7 +656,10 @@ STAGE_MARK=$STAGING/.stage-start
 # output looked like a normal night. The same blindness hit 2026-08-22 (328 kB -> 6 digest quotes
 # against 49 on a small night). Chunks are sized with >=30 % margin under both caps.
 # Chunk failure is fatal to prepare: an unbounded monolith would break the input contract.
-CHUNK_INDEX=$STAGING/nightly-$NK-digest-chunks.txt
+CHUNK_INDEX=$STAGING/nightly-$SK-digest-chunks.txt
+GITLOG_INDEX=$STAGING/nightly-$SK-git-chunks.txt
+SWEEP_SOURCE_INDEX=$STAGING/nightly-$SK-prepare-chunks.txt
+if [ -z "$RESUME" ]; then
 : > "$CHUNK_INDEX"
 python3 "$CODE/digest_chunk.py" "$DIGEST" "$STAGING" "nightly-$NK-digest" \
   --index "$CHUNK_INDEX" >> "$LOG" 2>&1 \
@@ -596,7 +674,6 @@ python3 "$CODE/digest_chunk.py" "$DIGEST" "$STAGING" "nightly-$NK-digest" \
 # only Read a self-chosen prefix of it, which is how 2026-08-27 produced 7 `src=gitlog` quotes
 # where 2026-08-26 produced 108 off the same kind of day. Same chunker, same >=30 % margin,
 # same fail-closed chunking contract; no monolith fallback for prepare.
-GITLOG_INDEX=$STAGING/nightly-$NK-git-chunks.txt
 : > "$GITLOG_INDEX"
 if [ -s "$GITLOG" ]; then
   python3 "$CODE/digest_chunk.py" "$GITLOG" "$STAGING" "nightly-$NK-git" \
@@ -609,19 +686,22 @@ fi
 # Always use the part machinery, even for one chunk. No full index or other source is
 # attached to a part. Each CLI invocation starts fresh (no resume/continue arguments).
 SWEEP_GROUP_FILES=()
-SWEEP_GOUTS=()
-SWEEP_SOURCE_INDEX=$STAGING/nightly-$NK-prepare-chunks.txt
 : > "$SWEEP_SOURCE_INDEX"
+while IFS= read -r _chunk; do printf 'digest\t%s\n' "$_chunk"; done < "$CHUNK_INDEX" >> "$SWEEP_SOURCE_INDEX"
+while IFS= read -r _chunk; do printf 'gitlog\t%s\n' "$_chunk"; done < "$GITLOG_INDEX" >> "$SWEEP_SOURCE_INDEX"
+fi   # a new window's chunking
 if { [ -s "$DIGEST" ] && [ ! -s "$CHUNK_INDEX" ]; } || { [ -s "$GITLOG" ] && [ ! -s "$GITLOG_INDEX" ]; }; then
   SOURCE_FAILED="prepare chunking failed — no unbounded monolith fallback"
 fi
-while IFS= read -r _chunk; do printf 'digest\t%s\n' "$_chunk"; done < "$CHUNK_INDEX" >> "$SWEEP_SOURCE_INDEX"
-while IFS= read -r _chunk; do printf 'gitlog\t%s\n' "$_chunk"; done < "$GITLOG_INDEX" >> "$SWEEP_SOURCE_INDEX"
-if [ -s "$SWEEP_SOURCE_INDEX" ]; then
-  rm -f "$STAGING/nightly-$NK-prepare-group"[0-9]*.txt
+if [ -n "$RESUME" ]; then
+  # the frozen part lists, as the collecting run split them (frozen_check proved them complete)
+  mapfile -t SWEEP_GROUP_FILES < <(ls "$STAGING/nightly-$SK-prepare-group"[0-9]*.txt | sort)
+  echo "$(date -Is) prepare: frozen list $SK: $(wc -l < "$SWEEP_SOURCE_INDEX") primary source chunk(s) in ${#SWEEP_GROUP_FILES[@]} part(s), <= $SWEEP_GROUP_CHUNKS chunk(s) each" >> "$LOG"
+elif [ -s "$SWEEP_SOURCE_INDEX" ]; then
+  rm -f "$STAGING/nightly-$SK-prepare-group"[0-9]*.txt
   split -l "$SWEEP_GROUP_CHUNKS" -d -a 3 --additional-suffix=.txt "$SWEEP_SOURCE_INDEX" \
-    "$STAGING/nightly-$NK-prepare-group"
-  mapfile -t SWEEP_GROUP_FILES < <(ls "$STAGING/nightly-$NK-prepare-group"[0-9]*.txt | sort)
+    "$STAGING/nightly-$SK-prepare-group"
+  mapfile -t SWEEP_GROUP_FILES < <(ls "$STAGING/nightly-$SK-prepare-group"[0-9]*.txt | sort)
   echo "$(date -Is) prepare: $(wc -l < "$SWEEP_SOURCE_INDEX") primary source chunk(s) -> ${#SWEEP_GROUP_FILES[@]} fresh session(s), <= $SWEEP_GROUP_CHUNKS chunk(s) each" >> "$LOG"
 fi
 # A successful splitter is not proof of complete coverage: verify source identities in order.
@@ -701,10 +781,16 @@ if [ "$DRYRUN" = "1" ]; then
     "$SWEEP_TIMEOUT" "$(date -d @"$SWEEP_DEADLINE" +%H:%M)" "$((SWEEP_DEADLINE - RUN_START_EPOCH))" \
     "$(grep -c . "$SWEEP_FAILED_FILE" 2>/dev/null || echo 0)"
   echo
+  if [ -n "$RESUME" ]; then
+    echo "prepare: RESUMING the frozen list $SK (window $SINCE -> $WINDOW_END) from $STAGING/.prepare-$SK — parts with a valid completion record are not called again"
+  else
+    echo "prepare: a new window $SINCE -> $RUN_START; its input list is frozen in $STAGING/.prepare-$SK before part 1"
+  fi
   echo "prepare journal tokens: 0 (journal records belong to the MARK ledger/stage)"
   echo "--- SWEEP stage INPUTS block (verbatim, as the prompt receives it) ---"
   for _i in "${!SWEEP_GROUP_FILES[@]}"; do
-    sweep_group_inputs "$((_i + 1))" "${#SWEEP_GROUP_FILES[@]}" "${SWEEP_GROUP_FILES[$_i]}" "$SWEEP"
+    sweep_group_inputs "$((_i + 1))" "${#SWEEP_GROUP_FILES[@]}" "${SWEEP_GROUP_FILES[$_i]}" \
+      "$STAGING/nightly-$SK-sweep-g$(printf %02d "$((_i + 1))").md"
   done
   echo
   echo "--- CONSOLIDATE stage: one call PER BATCH of $CONSOLIDATE_BATCH candidates (no card cap) ---"
@@ -809,20 +895,50 @@ elif [ "$NO_WINDOW" = "1" ]; then
   : > "$SWEEP"
   echo "$(date -Is) sweep SKIPPED — nothing new in the window" >> "$LOG"
 elif [ ${#SWEEP_GROUP_FILES[@]} -gt 0 ]; then
-  # 2-parts) one sweep call per part (1b'). Part 1 writes $SWEEP itself; part k writes its own
-  # file, which is reassembled with its own part files and merged into $SWEEP with its labels
-  # moved to k000+ (a clash is renamed by nightly_batch.py merge, never dropped). The first
-  # failing part — call or merge — fails the whole sweep and no later part is started.
+  # 2-parts) ONE SWEEP CALL PER PART, EACH PART A TRANSACTION AGAINST THE FROZEN LIST (see THE FROZEN
+  # PREPARE LIST above). Part k writes nightly-<SK>-sweep-gNN.md (and reassembles its own -part files
+  # into it); its completion record is renamed into place only after that, so a part killed at any
+  # point before it has no record and starts again from nothing next time. A part with a valid record
+  # is skipped. Only when EVERY part of the list is complete is $SWEEP built -- from scratch, part 1 as
+  # it is, part k merged with its labels moved to k000+ (a clash is renamed by nightly_batch.py merge,
+  # never dropped) -- so a repeated build gives the same file. The first failing part (call, deadline,
+  # usage limit) stops the loop; what finished stays finished for the next run.
   _K=${#SWEEP_GROUP_FILES[@]}
+  PREP_DIR=$STAGING/.prepare-$SK
+  if [ -z "$RESUME" ]; then
+    mkdir -p "$PREP_DIR"
+    printf 'since=%s\nend=%s\ngroup_chunks=%s\nparts=%s\nindex_sha256=%s\n' "$SINCE" "$WINDOW_END" \
+      "$SWEEP_GROUP_CHUNKS" "$_K" "$(sha_of "$SWEEP_SOURCE_INDEX")" > "$PREP_DIR/FROZEN.tmp"
+    mv "$PREP_DIR/FROZEN.tmp" "$PREP_DIR/FROZEN"
+    echo "$(date -Is) prepare: input list frozen in $PREP_DIR ($_K part(s), window $SINCE -> $WINDOW_END)" >> "$LOG"
+  fi
+  part_out() { echo "$STAGING/nightly-$SK-sweep-g$(printf %02d "$1").md"; }
+  part_complete() {   # part_complete <record> <part list> <output> -> 0 when the record proves the part done
+    local o=absent
+    [ -f "$1" ] || return 1
+    [ "$(sed -n 's/^group_sha256=//p' "$1")" = "$(sha_of "$2")" ] || return 1
+    if [ -e "$3" ]; then o=$(sha_of "$3"); fi
+    [ "$(sed -n 's/^output_sha256=//p' "$1")" = "$o" ]
+  }
+  _kept=0
   for _k in $(seq 1 "$_K"); do
     _gf=${SWEEP_GROUP_FILES[$((_k - 1))]}
-    if [ "$_k" = "1" ]; then _gout=$SWEEP; else _gout=$STAGING/nightly-$NK-sweep-g$(printf %02d "$_k").md; fi
+    _gout=$(part_out "$_k")
+    _rec=$PREP_DIR/done-$(printf %03d "$_k")
+    if part_complete "$_rec" "$_gf" "$_gout"; then
+      _kept=$((_kept + 1))
+      cat "$_gf" >> "$PREPARE_COMPLETED_INDEX"
+      PREPARE_COMPLETED=$((PREPARE_COMPLETED + $(wc -l < "$_gf")))
+      continue
+    fi
     if limit_stop "sweep parts $_k..$_K"; then SWEEP_OK=0; break; fi
     if [ "$(date +%s)" -ge "$SWEEP_DEADLINE" ]; then
       SWEEP_OK=0
       echo "$(date -Is) sweep part $_k/$_K NOT STARTED — the sweep deadline $(date -d @"$SWEEP_DEADLINE" +%H:%M) (+${SWEEP_BUDGET_MIN} min) has passed; the sweep is incomplete" >> "$LOG"
       break
     fi
+    # no valid record: whatever an earlier, killed attempt left is not this part's output
+    rm -f "$_rec" "$_gout" "${_gout%.md}-part"*.md "${_gout%.md}-final.md"
     echo "$(date -Is) sweep part $_k/$_K: $(grep -c . "$_gf") chunk(s) -> $_gout" >> "$LOG"
     if ! RETRY_DEADLINE_EPOCH=$SWEEP_DEADLINE retry_claude_call "sweep-$_k" "$SWEEP_TIMEOUT" "$LOG" "$STAGE_MARK" -- \
          "$AGENT" -p "$SWEEP_BASE
@@ -834,29 +950,37 @@ $(sweep_group_inputs "$_k" "$_K" "$_gf" "$_gout")" "${STAGE_ISOLATION[@]}" --mod
     python3 "$CODE/maxtok_check.py" --stage "sweep-$_k" --since "$STAGE_MARK" \
       --projects "$PROJ_DIR" >> "$LOG" 2>&1 || true
     [ "$SWEEP_OK" = "1" ] || break
-    cat "$_gf" >> "$PREPARE_COMPLETED_INDEX"
-    PREPARE_COMPLETED=$((PREPARE_COMPLETED + $(wc -l < "$_gf")))
-    [ "$_k" = "1" ] && continue
     shopt -s nullglob
     _gparts=("${_gout%.md}-part"*.md "${_gout%.md}-final.md")
     shopt -u nullglob
     if [ ${#_gparts[@]} -gt 0 ]; then reassemble "$_gout" "${_gparts[@]}"; fi
-    if [ -s "$_gout" ]; then
-      if python3 "$BATCH_TOOL" merge "$SWEEP" "$_gout" --relabel-base $((_k * 1000)) >> "$LOG" 2>&1; then
-        SWEEP_GOUTS+=("$_gout")
-      else
-        SWEEP_OK=0
-        echo "$(date -Is) sweep part $_k/$_K merge FAILED — its candidates are not in $SWEEP, so the sweep is incomplete" >> "$LOG"
-        break
-      fi
-    else
-      echo "$(date -Is) sweep part $_k/$_K produced no candidates" >> "$LOG"
-    fi
+    _o=absent; if [ -e "$_gout" ]; then _o=$(sha_of "$_gout"); fi
+    printf 'part=%s\ngroup_sha256=%s\noutput_sha256=%s\nat=%s\n' "$_k" "$(sha_of "$_gf")" "$_o" "$(date -Is)" > "$_rec.tmp"
+    mv "$_rec.tmp" "$_rec"
+    _kept=$((_kept + 1))
+    cat "$_gf" >> "$PREPARE_COMPLETED_INDEX"
+    PREPARE_COMPLETED=$((PREPARE_COMPLETED + $(wc -l < "$_gf")))
   done
   if [ "$PREPARE_COMPLETED" -ne "$(wc -l < "$SWEEP_SOURCE_INDEX")" ] \
      || ! cmp -s "$SWEEP_SOURCE_INDEX" "$PREPARE_COMPLETED_INDEX"; then
     SWEEP_OK=0
-    echo "$(date -Is) prepare incomplete: $PREPARE_COMPLETED chunk(s) completed, expected $(wc -l < "$SWEEP_SOURCE_INDEX"); source identities must match exactly" >> "$LOG"
+    echo "$(date -Is) prepare incomplete: $PREPARE_COMPLETED chunk(s) completed, expected $(wc -l < "$SWEEP_SOURCE_INDEX"); source identities must match exactly — $_kept of $_K part(s) kept with a completion record in $PREP_DIR; the next run continues this frozen list before it collects a new window" >> "$LOG"
+  else
+    # every part is complete: build the sweep file from the part outputs, in order, from nothing
+    : > "$SWEEP.tmp"
+    for _k in $(seq 1 "$_K"); do
+      _gout=$(part_out "$_k")
+      if [ ! -s "$_gout" ]; then
+        echo "$(date -Is) sweep part $_k/$_K produced no candidates" >> "$LOG"
+      elif [ "$_k" = "1" ]; then
+        cp "$_gout" "$SWEEP.tmp"
+      elif ! python3 "$BATCH_TOOL" merge "$SWEEP.tmp" "$_gout" --relabel-base $((_k * 1000)) >> "$LOG" 2>&1; then
+        SWEEP_OK=0
+        echo "$(date -Is) sweep part $_k/$_K merge FAILED — its candidates are not in $SWEEP, so the sweep is incomplete (the parts stay complete; the next run builds the sweep file again)" >> "$LOG"
+        break
+      fi
+    done
+    if [ "$SWEEP_OK" = "1" ]; then mv "$SWEEP.tmp" "$SWEEP"; else rm -f "$SWEEP.tmp"; fi
   fi
 else
 RETRY_DEADLINE_EPOCH=$SWEEP_DEADLINE retry_claude_call sweep "$SWEEP_TIMEOUT" "$LOG" "$STAGE_MARK" -- \
@@ -871,12 +995,16 @@ fi
 if [ "$SWEEP_OK" -ne 1 ]; then
   FAILED_STAGES="$FAILED_STAGES sweep"
   # One line per failed sweep; read aloud by a morning review ping, removed on success.
-  echo "$RUN_START night=$NK window-since=$SINCE parts=${#SWEEP_GROUP_FILES[@]} digest=${SIZE}B${SOURCE_FAILED:+ sources-failed=$SOURCE_FAILED}" >> "$SWEEP_FAILED_FILE"
+  echo "$RUN_START night=$NK window-since=$SINCE parts=${#SWEEP_GROUP_FILES[@]}${_kept:+ kept=$_kept} frozen=${PREP_DIR:-none} digest=${SIZE}B${SOURCE_FAILED:+ sources-failed=$SOURCE_FAILED}" >> "$SWEEP_FAILED_FILE"
   _nfail=$(grep -c . "$SWEEP_FAILED_FILE" 2>/dev/null || echo 1)
   if [ "$_nfail" -ge 2 ]; then
     echo "$(date -Is) SWEEP FAILED ${_nfail} NIGHTS IN A ROW (first: $(head -1 "$SWEEP_FAILED_FILE" | cut -d' ' -f1)) — the window since $SINCE keeps growing; a part that fails every night needs a human, see $SWEEP_FAILED_FILE" >> "$LOG"
   fi
-  echo "$(date -Is) sweep FAILED after retries — no candidates produced, consolidate skipped for tonight (see the retry lines above for what was tried); not stamped, so the next run's window still covers tonight" >> "$LOG"
+  if [ -n "${PREP_DIR:-}" ] && [ -f "$PREP_DIR/FROZEN" ]; then
+    echo "$(date -Is) sweep FAILED after retries — the window is not complete, so it is not consolidated tonight; ${_kept:-0} of ${#SWEEP_GROUP_FILES[@]} part(s) are KEPT in $PREP_DIR and the next run continues that frozen list (not stamped)" >> "$LOG"
+  else
+    echo "$(date -Is) sweep FAILED after retries — no candidates produced, consolidate skipped for tonight (see the retry lines above for what was tried); not stamped, so the next run's window still covers tonight" >> "$LOG"
+  fi
 else
 if [ -s "$SWEEP_FAILED_FILE" ]; then
   echo "$(date -Is) sweep OK — clearing the record of $(grep -c . "$SWEEP_FAILED_FILE") earlier failed sweep(s) ($SWEEP_FAILED_FILE)" >> "$LOG"
@@ -892,7 +1020,7 @@ rm -f "$SWEEP_FAILED_FILE"
 # whose temp label is not already present are taken, so a part that was already merged by hand — or
 # by the sweep's own merge.py — cannot be duplicated.
 shopt -s nullglob
-PARTS=("$STAGING/nightly-$NK-sweep-part"*.md "$STAGING/nightly-$NK-sweep-final.md")
+PARTS=("$STAGING/nightly-$SK-sweep-part"*.md "$STAGING/nightly-$SK-sweep-final.md")
 shopt -u nullglob
 if [ ${#PARTS[@]} -gt 0 ]; then
   reassemble "$SWEEP" "${PARTS[@]}"
@@ -1006,29 +1134,29 @@ python3 "$CODE/nearest_cards.py" "$SWEEP" >> "$LOG" 2>&1 \
 
 # 2e) SPLIT INTO THE CARRY QUEUE — ONE ATOMIC COMMIT (review P1-4). Tonight's candidates, the
 # sweep's and MARK stage's `## MARKS NOT CARDED` verdicts and tonight's WINDOW are written into
-# $CARRY/.split-$NK.tmp and committed by ONE rename to $CARRY/$NK. A kill before the rename leaves
+# $CARRY/.split-$SK.tmp and committed by ONE rename to $CARRY/$SK. A kill before the rename leaves
 # nothing (the window is not stamped and is swept again); a kill after it leaves everything,
-# and the next run reads the window back from $CARRY/$NK/WINDOW. A split failure falls back to
+# and the next run reads the window back from $CARRY/$SK/WINDOW. A split failure falls back to
 # ONE batch holding the whole sweep file, committed the same way — never to nothing.
 SPLIT_OK=1
 if [ -s "$SWEEP" ]; then
-  SPLIT_LIST=$STAGING/nightly-$NK-split.txt
+  SPLIT_LIST=$STAGING/nightly-$SK-split.txt
   _bf=""; [ "${NIGHTLY_FAULT:-}" = "split-before-commit" ] && _bf=split-before-commit
   if NIGHTLY_BATCH_FAULT="$_bf" python3 "$BATCH_TOOL" split-run "$SWEEP" --size "$CONSOLIDATE_BATCH" \
-       --carry "$CARRY" --run "$NK" --window "$RUN_START" > "$SPLIT_LIST" 2>>"$LOG"; then
-    echo "$(date -Is) split: $(python3 "$BATCH_TOOL" count "$SWEEP") candidate(s) -> $(grep -c '/cons-' "$SPLIT_LIST") batch(es) of <= $CONSOLIDATE_BATCH committed in $CARRY/$NK" >> "$LOG"
+       --carry "$CARRY" --run "$SK" --window "$WINDOW_END" > "$SPLIT_LIST" 2>>"$LOG"; then
+    echo "$(date -Is) split: $(python3 "$BATCH_TOOL" count "$SWEEP") candidate(s) -> $(grep -c '/cons-' "$SPLIT_LIST") batch(es) of <= $CONSOLIDATE_BATCH committed in $CARRY/$SK" >> "$LOG"
   else
     fault_point split-before-commit
-    if [ -d "$CARRY/$NK" ]; then
-      echo "$(date -Is) split reported a failure AFTER its commit — $CARRY/$NK is complete, continuing" >> "$LOG"
+    if [ -d "$CARRY/$SK" ]; then
+      echo "$(date -Is) split reported a failure AFTER its commit — $CARRY/$SK is complete, continuing" >> "$LOG"
     else
       SPLIT_OK=0
-      rm -rf "$CARRY/.split-$NK.tmp"
-      mkdir -p "$CARRY/.split-$NK.tmp"
-      cp "$SWEEP" "$CARRY/.split-$NK.tmp/cons-01.md"
-      echo "$RUN_START" > "$CARRY/.split-$NK.tmp/WINDOW"
-      mv -T "$CARRY/.split-$NK.tmp" "$CARRY/$NK"
-      echo "$(date -Is) split FAILED (non-fatal) — the whole sweep file is ONE carried batch in $CARRY/$NK" >> "$LOG"
+      rm -rf "$CARRY/.split-$SK.tmp"
+      mkdir -p "$CARRY/.split-$SK.tmp"
+      cp "$SWEEP" "$CARRY/.split-$SK.tmp/cons-01.md"
+      echo "$WINDOW_END" > "$CARRY/.split-$SK.tmp/WINDOW"
+      mv -T "$CARRY/.split-$SK.tmp" "$CARRY/$SK"
+      echo "$(date -Is) split FAILED (non-fatal) — the whole sweep file is ONE carried batch in $CARRY/$SK" >> "$LOG"
     fi
   fi
 fi
@@ -1037,8 +1165,15 @@ fi
 # window is in the committed run directory, and the queue lives in the ledger. Only when the
 # commit really happened (or there was nothing to commit) — a stamp over an uncommitted window
 # is exactly the loss this ordering exists to prevent. A failed SWEEP leaves the stamp alone.
-if [ "$DRYRUN" != "1" ] && { [ -d "$CARRY/$NK" ] || [ ! -s "$SWEEP" ]; }; then
-  echo "$RUN_START" > "$STAMP"
+# The window's END is this run's start -- or, for a resumed frozen list, the start of the run that
+# collected it (WINDOW_END), so the next window begins exactly where the frozen one ended. Only now is
+# the frozen list done with: its parts are committed with the window.
+if [ "$DRYRUN" != "1" ] && { [ -d "$CARRY/$SK" ] || [ ! -s "$SWEEP" ]; }; then
+  echo "$WINDOW_END" > "$STAMP"
+  if [ -d "$STAGING/.prepare-$SK" ]; then
+    rm -rf "$STAGING/.prepare-$SK"
+    echo "$(date -Is) prepare: the frozen list $SK is complete and committed to $CARRY/$SK — window stamped at $WINDOW_END" >> "$LOG"
+  fi
 fi
 
 fi   # SWEEP_OK

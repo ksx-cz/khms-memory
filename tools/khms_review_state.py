@@ -9,13 +9,25 @@ import khms_paths as P
 import mark_ledger as ML
 
 
-def triage_reviewed(unit, root=None, markers=None):
+def triage_marker_name(unit):
+    """THE name of a triage unit's review marker: `.reviewed-<file stem>`. One definition for the writer
+    (apply_triage.py) and this reader. Until #173 the writer used `.reviewed-<first date>-triage`, so a
+    suffixed unit (`DATE-lerr10-triage.md`) was never found reviewed and applying it overwrote the marker of
+    the nightly `DATE-triage.md`; for a plain `DATE-triage.md` both spellings are the same file."""
+    return '.reviewed-' + Path(unit).stem
+
+
+def triage_markers_dir(root=None):
     root = root or P.ROOT
-    markers = markers or (P.REVIEW_MARKERS if P.same_path(root, P.soft('ROOT')) else str(Path(root)/'state/shared/reviewed'))
-    name = Path(unit).stem
-    date = name.removesuffix('-triage')
+    return P.REVIEW_MARKERS if P.same_path(root, P.soft('ROOT')) else str(Path(root)/'state/shared/reviewed')
+
+
+def triage_reviewed(unit, root=None, markers=None):
+    markers = markers or triage_markers_dir(root)
+    name = triage_marker_name(unit)
+    # the second spelling (stem without `-triage`) is a hand-written legacy form, read but never written
     return any(ML.marker_holds(str(Path(markers)/n), str(unit))
-               for n in ('.reviewed-'+name, '.reviewed-'+date))
+               for n in (name, name.removesuffix('-triage')))
 
 
 def pending(root=None):

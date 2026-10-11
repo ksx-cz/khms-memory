@@ -100,7 +100,8 @@ if [ "$DRYRUN" = "1" ]; then
   echo "  date           : $DATE"
   echo "  mode           : full (all cards, every night); skip pairs judged in the last $SKIP_NIGHTS nights and unchanged since ($STAGING)"
   echo "  cards in know/ : $(python3 "$KHMS_CODE/khms_files.py" "$BRAIN/memory/know" | wc -l)"
-  echo "  embed index    : $(ls -la "$BRAIN"/memory/.embed/bge.npz 2>/dev/null | awk '{print $5" B, "$6" "$7" "$8}')"
+  _embed="$(khms_get KHMS_EMBED_DIR)/${KHMS_EMBED_SLUG:-bge}.npz"
+  echo "  embed index    : $_embed $(ls -la "$_embed" 2>/dev/null | awk '{print $5" B, "$6" "$7" "$8}' || true)$([ -f "$_embed" ] || echo 'ABSENT — the dense channel will be unavailable')"
   echo "  adjudicate top : $LIMIT pairs"
   echo "  judge          : $KHMS_JUDGE$([ "$KHMS_JUDGE" = local ] || echo " (claude -p --model $KHMS_JUDGE via $KHMS_CLAUDE_BIN)") — judge of record"
   if [ "$KHMS_JUDGE" != local ]; then

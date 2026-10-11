@@ -108,3 +108,26 @@ Restore while writers are paused, reconcile the counter and tombstone ledger,
 check the review hashes, and rebuild the views before resuming. Per-file history
 is not an atomic history of the whole base. Missing history remains unavailable;
 it cannot be reconstructed as evidence from a derived packet or today's card.
+
+### A night longer than its budget resumes, it does not start over
+
+The nightly sweep reads one window of sources (since the night stamp) in parts,
+one fresh model session per part (`SWEEP_GROUP_CHUNKS`). When a window has more
+parts than one night's `SWEEP_BUDGET_MIN` covers, the finished parts are kept:
+
+- Before part 1, the run freezes the window's input list in
+  `memory/inbox/.staging/.prepare-<night key>/FROZEN` — `since=`, `end=` (the
+  window), `group_chunks=`, `parts=` and `index_sha256=` of the ordered input list
+  `nightly-<night key>-prepare-chunks.txt`. The window's inputs (digest, git log,
+  chunks, part lists) stay in staging under that run's night key.
+- Each finished part gets a completion record `done-NNN` beside `FROZEN`, renamed
+  into place after its call and reassembly: the sha256 of its part list and of its
+  output `nightly-<night key>-sweep-gNN.md`. A part without a valid record (killed,
+  timed out, cut by the deadline) is redone from nothing; a recorded part never is.
+- The next run finds the frozen list, collects no new window, runs only the
+  parts without a record, and builds the sweep file from all part outputs in
+  order. Only when the whole list is complete and committed to the carry queue
+  does the stamp move — to the frozen `end`, so the next window starts exactly
+  there and no input is skipped. A list the stamp already covers is removed; a
+  damaged one (an input missing or changed) is set aside as `.damaged-<time>` and
+  its window is collected again from the unmoved stamp.

@@ -14,7 +14,7 @@ deterministic, zero tokens) and adjudication keys on predicate (local model, bat
 Blockers, unioned:
   1 rare-key      shared identifier with document frequency in [2, DF_MAX]
   2 quantity      same subject key + same unit family + disjoint values
-  3 dense         cosine top-k over the pre-built memory/.embed/<slug>.npz vectors
+  3 dense         cosine top-k over the pre-built KHMS_EMBED_DIR/<slug>.npz vectors
                   (reads stored float16 vectors — numpy only, no torch, no GPU)
 
 Shapes: quantity | identity | negation | correction-orphan | stale-value | semantic
@@ -664,7 +664,8 @@ def build_candidates(cards, focus_ids=None, dense_k=DENSE_K, verbose=True):
     try:
         import numpy as np
         slug = os.environ.get("KHMS_EMBED_SLUG", "bge")
-        z = np.load(f"{MEM}/.embed/{slug}.npz", allow_pickle=True)
+        # where the path resolver keeps the index (KHMS_EMBED_DIR; moved out of memory/.embed at #173)
+        z = np.load(os.path.join(P.EMBED_DIR, f"{slug}.npz"), allow_pickle=True)
         ids = [str(i) for i in z["ids"]]
         keep = [i for i, cid in enumerate(ids) if cid in by_id]
         V = z["vectors"][keep].astype("float32")
@@ -1071,7 +1072,7 @@ def _account(r, ok, wall):
 # are the ones in force; a breach is seen only after its attempt returned.
 JUDGE_OUT_TOKEN_CAP = 32000         # CLAUDE_CODE_MAX_OUTPUT_TOKENS for every judge call
 JUDGE_IN_TOKEN_ALLOWANCE = 16000    # tokens the CLI may add beyond prompt + system bytes
-# judge name -> the model id its `--model` alias bills as. sonnet = claude-sonnet-5, measured
+# judge name -> the model id its `--model` alias bills as. sonnet = claude-sonnet-5-5, measured
 # (TRIAGESONNET modelUsage). haiku's id is NOT measured: under a bound its price is unknown and
 # every attempt is refused (an unknown price is never $0).
 CLAUDE_MODEL_IDS = {"sonnet": "claude-sonnet-5-5"}
@@ -1090,6 +1091,12 @@ class JudgeUsageLimit(JudgeBudgetStop):
     """An account limit is terminal for this run, never a transient retry."""
 
 
+class JudgeModelUnpriced(ValueError):
+    """The judge model has no row in tok_account's price table, so no attempt can be bounded.
+    Deliberately NOT a JudgeBudgetStop: on 2026-10-11 this gap was reported as `outcomes
+    {'BUDGET': 250}` at $0 spent -- a missing price read as an exhausted budget. It names the model."""
+
+
 class JudgeBudget:
     """Per-night estimated spend bound of the Claude judge (see the block comment above)."""
 
@@ -1097,6 +1104,8 @@ class JudgeBudget:
         self.max_usd = float(max_usd)
         self.ledger = ledger
         self.model_id = model_id
+        if estimate is None:
+            self.price()                    # an unpriced judge fails HERE, by name, before any pair
         self.estimate = estimate or self.worst_case_usd
         self.known = self.unknown = self.inflight = 0.0
         self.attempts = self.refused = 0
@@ -1129,13 +1138,23 @@ class JudgeBudget:
     def model(self):
         return self.model_id or CLAUDE_MODEL_IDS.get(JUDGE)
 
-    def worst_case_usd(self, prompt):
-        """The most one attempt is ESTIMATED to cost. Unknown price -> inf (nothing fits)."""
+    def price(self):
+        """(input, output) USD/MTok of the judge model from tok_account.PRICES -- the one price table
+        every accounting tool reads. No model or no row -> JudgeModelUnpriced naming the model."""
         import tok_account as T
-        pr = T.price_for_model(self.model()) if self.model() else None
+        model = self.model()
+        pr = T.price_for_model(model) if model else None
         if pr is None:
-            return float("inf")
-        pin, pout = pr
+            raise JudgeModelUnpriced(
+                f"judge model {model or '(none: judge ' + repr(JUDGE) + ' has no CLAUDE_MODEL_IDS entry)'!s} "
+                f"has no price in tok_account.PRICES ({T.__file__}) — the judge bound cannot estimate an "
+                f"attempt, so no paid call starts; add the model's row from the official price list")
+        return pr
+
+    def worst_case_usd(self, prompt):
+        """The most one attempt is ESTIMATED to cost (JudgeModelUnpriced when the model has no price)."""
+        import tok_account as T
+        pin, pout = self.price()
         n_in = (len(prompt.encode("utf-8")) + len(CLAUDE_SYSTEM.encode("utf-8"))
                 + JUDGE_IN_TOKEN_ALLOWANCE)
         mult = max(T.MULT_CW1, T.MULT_CW5, T.MULT_CWX, 1.0)
@@ -1997,7 +2016,11 @@ def main():
     print(f"judge: {judge_description()}", file=sys.stderr)
     global JUDGE_BUDGET
     if JUDGE != "local" and args.max_usd is not None:
-        JUDGE_BUDGET = JudgeBudget(args.max_usd, ledger=args.spend_ledger)
+        try:
+            JUDGE_BUDGET = JudgeBudget(args.max_usd, ledger=args.spend_ledger)
+        except JudgeModelUnpriced as e:
+            print(f"judge bound: FAILED — {e}", file=sys.stderr)
+            return 3
         b = JUDGE_BUDGET.summary()
         meta["bounds"]["judge_budget"] = b
         print(f"judge bound: estimated bound (not a guaranteed hard cap) ${b['max_usd']:.2f}"
@@ -2047,4 +2070,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

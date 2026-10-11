@@ -56,6 +56,7 @@ import khms_triage_report as R      # noqa: E402  (role coherence — likewise)
 
 import khms_lock as L
 import khms_paths as P  # noqa: E402
+import khms_review_state as RS  # noqa: E402  (the triage marker's one name)
 
 # The base: the resolver's root; --brain names another one (tests use a throwaway base).
 # Card ids in comments (K-9xxxx) are illustrative stand-ins for the reference deployment's cards
@@ -388,8 +389,11 @@ def apply_locked(args, write, markers, rp):
     # `--brain` can be a symlink into the protected base, and `open(path, "w")` follows it. So every file this
     # run is about to write, move or create is checked here (an archive move also removes its source entry),
     # all of them before any of them: a refusal of a later card must not come after an earlier one changed.
+    # The marker is named by the unit's FILE STEM (khms_review_state.triage_marker_name, the reader's own
+    # definition): a suffixed unit (`DATE-lerr10-triage.md`) gets its own marker and never touches the
+    # nightly `DATE-triage.md`'s one, which the date-only name used to overwrite.
     m_date = re.search(r"(\d{4}-\d{2}-\d{2})", os.path.basename(args.triage_file))
-    marker = os.path.join(markers, f".reviewed-{m_date.group(1)}-triage") if m_date else None
+    marker = os.path.join(markers, RS.triage_marker_name(args.triage_file)) if m_date else None
     if write:
         outputs = [c["path"] for _, c, _ in changed_files]
         if args.archive:
