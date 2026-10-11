@@ -473,8 +473,10 @@ def suggest_cards(marks, cards, floor):
 # DATE-weekly.md; since review P1-3 the nightly publishes every consolidated batch as its
 # own immutable unit `<night key>-bNN.md` (night key = DATE or DATE-<n> for the n-th run
 # of that date), so approving one batch can never cover a batch published after it.
+# A MARK-stage chunk is committed as its own carry directory <night key>-mNN (PMARKFIRST,
+# nightly_distill.sh step 1e), so its batches are published as `<night key>-mNN-bKK.md`.
 UNIT_RE = re.compile(r"^(?P<stem>(?P<date>\d{4}-\d{2}-\d{2})"
-                     r"(?P<tail>-weekly|(?:-\d+)?-b\d{2,})?)\.md$")
+                     r"(?P<tail>-weekly|(?:-\d+)?(?:-m\d{2,})?-b\d{2,})?)\.md$")
 MTIME_SLACK_S = 5.0   # a legacy (hash-less) marker written in the same second as the unit
 
 

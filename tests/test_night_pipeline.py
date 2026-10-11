@@ -116,7 +116,7 @@ def log_of(root):
 
 
 def units(root):
-    return sorted(p for p in (root / "memory/inbox").iterdir() if re.match(r"^\d{4}-\d{2}-\d{2}(-\d+)?-b\d+\.md$", p.name))
+    return sorted(p for p in (root / "memory/inbox").iterdir() if re.match(r"^\d{4}-\d{2}-\d{2}(-\d+)?(-m\d+)?-b\d+\.md$", p.name))
 
 
 def cards_in(files):

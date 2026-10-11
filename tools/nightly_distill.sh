@@ -150,9 +150,10 @@ CONSOLIDATE_BATCH=${CONSOLIDATE_BATCH:-25}
 # exactly that way, with no line anywhere saying so. What replaced the cap:
 #   * the COVERAGE LEDGER (mark_ledger.py): every tracked journal MARK has an id and
 #     stays OPEN until a card covers it or the coordinator dismisses it with a reason;
-#     OPEN marks are the queue the MARK stage works from, oldest first, as far as the night's
-#     card budget (MARK_PENDING_MAX + CARD_BUDGET_MIN below) reaches;
-#   * the MARK stage: queued marks the sweep did not cover go to the model in chunks;
+#     OPEN marks are the queue the MARK stage works from, oldest first, as far as its own
+#     time budget (MARK_BUDGET_MIN below) reaches;
+#   * the MARK stage: queued marks go to the model in chunks, FIRST in the night (before the
+#     sweep), and every finished chunk is committed to the carry queue on its own;
 #   * the CARRY QUEUE (memory/ledger/carry/): consolidate runs in batches, every batch
 #     file stays in the carry queue until its output is merged into the inbox, so a batch
 #     the night did not reach (budget, failure, kill) is what the next night does FIRST.
@@ -166,42 +167,38 @@ CARRY=$ROOT/memory/ledger/carry
 # and 40m is 2x that. Chunks not started before the budget stay OPEN in the ledger.
 # MEASURED (P209N): the only night the stage ran (2026-10-03, 3 chunks of 60) took 10.1, 10.6 and
 # 14.1 min -> 30m (rule above). On the other four uncapped nights it ran NO chunk: the sweep alone
-# put 138-157 candidates over MARK_PENDING_MAX (see the backpressure note below).
+# put 138-157 candidates over the former MARK_PENDING_MAX (see THE MARK STAGE RUNS FIRST below).
 MARK_CHUNK=${MARK_CHUNK:-60}
 MARK_TIMEOUT=${MARK_TIMEOUT:-30m}
-# Wall-clock budgets, minutes after the run's start (03:30): no NEW mark chunk after
-# +90 (05:00), no NEW consolidate batch after +225 (07:15) — a started one is bounded by
-# its own timeout. Triage (31–59 min measured, P209N) runs after, so a full night ends by ~08:30.
+# Wall-clock budgets: no NEW mark chunk later than MARK_BUDGET_MIN after the START OF THE MARK
+# STAGE (it is the night's first model stage, so that is ~+0..+5 min after 03:30); no NEW sweep
+# part after +SWEEP_BUDGET_MIN and no NEW consolidate batch after +225 (07:15), both counted from
+# the run's start, as before — the night's total budget is unchanged, the MARK stage only gets its
+# share first. A started chunk/part/batch is bounded by its own timeout. Triage (31–59 min
+# measured, P209N) runs after, so a full night ends by ~08:30.
 # CARD_BUDGET_MIN was 180 until P209M (#209, reviewed budget increase: the night may write
-# more cards). Sized with MARK_PENDING_MAX below: the consolidation of MARK_PENDING_MAX candidates
-# (9 batches of 25) at the measured 12.5-19.6 min per batch (P209N: 75-139 min for 6-9 batches)
-# takes ~115-175 min; it starts after the sweep (12-26 min) and the MARK stage (chunks 10-14 min),
-# i.e. at ~+65..+90, and its last batch must still be allowed to START: +225. A night that does
-# not finish its batches carries them, and the carried candidates hold the next night's MARK
-# stage back (backpressure) — the budget regulates itself instead of piling up carry.
+# more cards). Sized for ~225 candidates (9 batches of 25) at the measured 12.5-19.6 min per batch
+# (P209N: 75-139 min for 6-9 batches), i.e. ~115-175 min, started after the MARK stage and the
+# sweep, and its last batch must still be allowed to START: +225. A night that does not finish its
+# batches carries them; the carry queue is the next night's consolidation, done oldest first.
 MARK_BUDGET_MIN=${MARK_BUDGET_MIN:-90}
 CARD_BUDGET_MIN=${CARD_BUDGET_MIN:-225}
 # Attempts per batch/chunk (the sweep keeps nightly_retry.sh's default 3): a batch that
 # fails twice is carried, and the next one is tried rather than spending the night on it.
 BATCH_RETRY_MAX=${BATCH_RETRY_MAX:-2}
-# BACKPRESSURE: the MARK stage only produces candidates while fewer than this many are
-# already waiting for consolidation (carry queue + tonight's sweep). Without it a large
-# backlog (1,893 OPEN marks since 2026-09-21 when this was built) would turn into an
-# ever-growing carry queue — candidates nobody consolidates — and the OPEN count would
-# shrink while the real backlog only moved. 125 = 5 batches = what ~100 min of
-# consolidation at the measured ~1.2 cards/min gets through. The marks it does not reach
-# stay OPEN, visibly, in the ledger.
-# RAISED 125 -> 225 (P209M, #209, owner 2026-10-06 K-93929 remedy b). MEASURED (P209N, nights
-# 10-02..10-06): the sweep ALONE yields 52-157 candidates (62, 68, 138, 52, 157), so at 125 the
-# stage was skipped on 4 of 5 nights while the OPEN queue grew 2740 -> 4387. A MARK chunk of 60
-# marks yields 13-28 candidates (10-03: 13, 28, 21) and accounts for all 60 ids (candidates or
-# NOT CARDED verdicts). At 225 = 9 batches, a night with the largest measured sweep (157) still
-# runs 4 chunks (157 -> ~178 -> ~199 -> ~220 -> stop) = ~240 marks; a 60-candidate night runs
-# chunks until the MARK budget (+90) stops it. COST, measured per unit on the same nights
-# (P209N per-stage table, tok_account): a MARK chunk ~$1.8 (10-03: $5.46 / 3), a consolidate batch
-# ~$2.4-3.3 ($14.28/6, $19.90/7, $28.99/9, $22.77/7) — i.e. ~$4-5 per 60 marks taken off the queue,
-# and ~+$14-17 a night at 4 chunks + 3 extra batches over the 125/180 setting ($30-39 measured).
-MARK_PENDING_MAX=${MARK_PENDING_MAX:-225}
+# THE MARK STAGE RUNS FIRST (PMARKFIRST, #209, Diblin's specification 2026-10-11 10:11). Until then
+# the MARK stage ran AFTER the sweep, inside the sweep's success branch, and stopped as soon as
+# MARK_PENDING_MAX (225) candidates already waited for consolidation (tonight's sweep + carry).
+# MEASURED: P209N, nights 10-02..10-06 — the sweep alone yielded 52-157 candidates and the stage
+# ran on 1 of 5 nights while the OPEN queue grew 2740 -> 4387; 2026-10-11 manual night — "648
+# candidate(s) already wait for consolidation (>= 225) — 42 chunk(s) left OPEN", no chunk at all,
+# 2537 OPEN marks untouched; and a failed sweep skipped the stage entirely. Owner (K-03350): no daily
+# limit, everything in the queue is processed. So now: the stage is the night's FIRST model stage,
+# independent of the sweep's outcome and of how many candidates wait; it has its own budget
+# (MARK_BUDGET_MIN from its own start) and no candidate-count gate; every finished chunk is
+# committed, on its own, to the carry queue as a run directory WITHOUT a WINDOW (it is not a
+# window of the sweep, so it never moves the sweep's stamp). The sweep later rebuilds its own file
+# from its parts — a MARK result merged only into that file could be lost, so it never goes there.
 
 mkdir -p "$STAGING"
 # The stage prompts: prompts/<name>.md with their {{...}} fields and private extension slots filled
@@ -242,7 +239,7 @@ RUN_START=$(date -Is)
 RUN_START_EPOCH=$(date +%s)
 # Only the holder writes the lock file (see THE LOCK above); the night key follows once claimed.
 [ "$DRYRUN" = "1" ] || printf 'nightly %s pid=%s\n' "$RUN_START" "$$" > "$LOCK"
-MARK_DEADLINE=$((RUN_START_EPOCH + MARK_BUDGET_MIN * 60))
+# MARK_DEADLINE is set when the MARK stage STARTS (step 1e), from that moment, not from here.
 SWEEP_DEADLINE=$((RUN_START_EPOCH + ${SWEEP_BUDGET_S:-$((SWEEP_BUDGET_MIN * 60))}))   # _S: test seam
 CARD_DEADLINE=$((RUN_START_EPOCH + CARD_BUDGET_MIN * 60))
 # RUN IDENTITY (review P1-4, 2026-10-01). Everything this run writes — staging inputs, carry
@@ -763,6 +760,9 @@ consolidate_inputs() {
   local jv="$STAGING/nightly-$d-journals-ledger.md" qr="$STAGING/nightly-$d-quotecheck.txt"
   [ -f "$jv" ] || jv="$STAGING/nightly-$d-journals.md"
   [ -f "$dg" ] || { dg=$DIGEST; ci=$CHUNK_INDEX; gl=$GITLOG; gi=$GITLOG_INDEX; jv=$JVERIFY; qr=$QREPORT; }
+  # a MARK-stage directory (<night key>-mNN, step 1e) has no inputs of its own but its own quote report;
+  # it is grounded against the journals of the night that consolidates it (they only grow)
+  [ -f "$STAGING/nightly-$d-quotecheck.txt" ] && qr="$STAGING/nightly-$d-quotecheck.txt"
   echo "INPUTS:"
   echo "- sweep candidates (THIS BATCH — consolidate exactly these): $b"
   echo "- already proposed tonight (earlier batches, READ-ONLY, dedup against it; may not exist yet): $PROPOSED_SO_FAR"
@@ -831,7 +831,8 @@ if [ "$DRYRUN" = "1" ]; then
   # `|| true`: an EMPTY queue is a normal night; under `set -o pipefail` grep's rc 1 used to end
   # the dry run here with rc 1, before the MARK-stage limits, quote sources and triage were printed.
   { grep -m3 '^- M-' "$QUEUE" || true; } | cut -c1-160 | sed 's|^|    |'
-  echo "  MARK stage: chunks of $MARK_CHUNK, timeout $MARK_TIMEOUT, $BATCH_RETRY_MAX attempt(s), no new chunk after $(date -d @"$MARK_DEADLINE" +%H:%M) or once >= $MARK_PENDING_MAX candidates wait for consolidation"
+  echo "  MARK stage: the FIRST model stage, before the sweep and independent of it; chunks of $MARK_CHUNK, timeout $MARK_TIMEOUT, $BATCH_RETRY_MAX attempt(s), no new chunk later than ${MARK_BUDGET_MIN} min after the stage starts; no candidate-count gate"
+  echo "  each finished chunk is committed on its own as $CARRY/<night key>-mNN/ (cons-NN.md + notcarded.md, no WINDOW: the sweep's stamp does not move)"
   echo "  grounding journal source (window + every journal from $LFLOOR): $JVERIFY ($(stat -c%s "$JVERIFY") B)"
   echo "  know-how test (K-93929): consolidate prompt $(grep -c 'not know-how' "$CODE/prompts/nightly-consolidate.md" || true) line(s), MARK prompt $(grep -c 'not know-how' "$CODE/prompts/nightly-marks.md" || true) line(s) name the drop reason; each output's drops are logged as 'know-how (<stage>): …'"
   echo
@@ -897,8 +898,93 @@ if added:
 print(f"reassembly: +{added} cards from {len(parts)} part file(s); sweep now holds {len(have)} candidates")
 PYMERGE
 }
-SWEEP_OK=1
 FAILED_STAGES=""
+# 1e) THE MARK STAGE — THE NIGHT'S FIRST MODEL STAGE (board #209; PMARKFIRST, see THE MARK STAGE
+# RUNS FIRST at the top). Queued OPEN journal marks go to the model in chunks of $MARK_CHUNK: every
+# id must end in a candidate (`MARKS:` line) or in a `## MARKS NOT CARDED` line with a reason.
+# It runs BEFORE the sweep and whatever the sweep will do (fail, time out, find nothing, yield 648
+# candidates); its budget is its own, MARK_BUDGET_MIN from the moment it starts, and no count of
+# candidates already waiting stops it.
+# EVERY FINISHED CHUNK IS ITS OWN TRANSACTION: its output (candidates + NOT CARDED verdicts) is
+# relabelled M<chunk*1000+n>, annotated (NEAREST) and quote-checked into staging, then committed by
+# ONE rename (nightly_batch.py split-run, no --window) as $CARRY/<night key>-mNN/ — before the sweep
+# starts, and never into the sweep file (a resumed sweep rebuilds that file from its parts). A kill
+# before the rename leaves the chunk's marks OPEN in the ledger (they are queued again, nothing of
+# the chunk is used); a kill after it leaves the whole chunk in carry, where the ledger counts its
+# ids as proposed (not queued again) and the consolidation publishes it as units <night key>-mNN-bKK.
+# The directory has no WINDOW, so neither the start of a run nor the closing of the directory moves
+# the sweep's stamp. A chunk that fails is not committed: its marks stay OPEN for tomorrow, and so
+# do the chunks the budget did not reach.
+MARKS_PROMPT_FILE=$CODE/prompts/nightly-marks.md
+MARK_PHASE_START=$(date +%s)
+MARK_DEADLINE=$((MARK_PHASE_START + MARK_BUDGET_MIN * 60))
+MCHUNKS=()
+if [ -f "$MARKS_PROMPT_FILE" ] && [ "$QUEUE_N" -gt 0 ] && [ -n "$AGENT_BIN" ]; then
+  mapfile -t MCHUNKS < <(ledger queue --chunk "$MARK_CHUNK" --outdir "$STAGING" \
+                           --prefix "nightly-$NK-markchunk" 2>>"$LOG") || MCHUNKS=()
+fi
+echo "$(date -Is) === marks === FIRST stage: ${#MCHUNKS[@]} chunk(s) of <= $MARK_CHUNK queued mark(s) owned by the record stage; no new chunk after $(date -d @"$MARK_DEADLINE" +%H:%M) (+${MARK_BUDGET_MIN} min from this stage's start)" >> "$LOG"
+# mark_commit <chunk output> <run key> <chunk number> -> 0 when the chunk is committed as $CARRY/<run key>
+mark_commit() {
+  local out="$1" key="$2" k="$3" rel="$STAGING/nightly-$2-carry.md"
+  rm -f "$rel"
+  python3 "$BATCH_TOOL" merge "$rel" "$out" --letter M --relabel-base $((k * 1000)) >> "$LOG" 2>&1 || return 1
+  python3 "$CODE/nearest_cards.py" "$rel" >> "$LOG" 2>&1 \
+    || echo "$(date -Is) === nearest === FAILED for marks-$k (non-fatal) — its batches are consolidated without NEAREST lines" >> "$LOG"
+  python3 "$CODE/verify_quotes.py" "$rel" --source digest="$DIGEST" --source journal="$JVERIFY" \
+    --source gitlog="$GITLOG" > "$STAGING/nightly-$key-quotecheck.txt" 2>&1 || true
+  fault_point "marks-before-commit-$k"
+  if ! python3 "$BATCH_TOOL" split-run "$rel" --size "$CONSOLIDATE_BATCH" --carry "$CARRY" --run "$key" \
+       > /dev/null 2>>"$LOG"; then
+    [ -d "$CARRY/$key" ] || return 1
+    echo "$(date -Is) marks-$k: split reported a failure AFTER its commit — $CARRY/$key is complete" >> "$LOG"
+  fi
+  echo "$(date -Is) marks-$k committed: $(python3 "$BATCH_TOOL" count "$rel") candidate(s) and $(grep -cE '^- M-[0-9a-f]{8} ::' "$rel" || true) NOT CARDED verdict(s) -> $CARRY/$key" >> "$LOG"
+  fault_point "marks-after-commit-$k"
+  return 0
+}
+MK=0
+for MC in "${MCHUNKS[@]}"; do
+  [ -f "$MC" ] || continue
+  MK=$((MK + 1))
+  if limit_stop "MARK chunks $MK..${#MCHUNKS[@]} (their marks stay OPEN)"; then break; fi
+  if [ "$(date +%s)" -ge "$MARK_DEADLINE" ]; then
+    echo "$(date -Is) === marks === budget of ${MARK_BUDGET_MIN} min reached — $(( ${#MCHUNKS[@]} - MK + 1 )) chunk(s) left OPEN in the ledger for the next night" >> "$LOG"
+    break
+  fi
+  MOUT=$STAGING/nightly-$NK-markout-$(printf %02d "$MK").md
+  MKEY=$NK-m$(printf %02d "$MK")
+  MPROMPT="$MARKS_BASE
+
+INPUTS:
+- MARK QUEUE chunk: $MC
+- journal directory (grep around a mark's journal/<file>:<line> for context): $ROOT/journal
+- knowledge base (grep before carding): $ROOT/memory/know
+OUTPUT FILE: $MOUT"
+  if RETRY_MAX_ATTEMPTS=$BATCH_RETRY_MAX retry_claude_call "marks-$MK" "$MARK_TIMEOUT" "$LOG" "$STAGE_MARK" -- \
+       "$AGENT" -p "$MPROMPT" "${STAGE_ISOLATION[@]}" --model "$MARK_MODEL" --allowedTools $TOOLS; then
+    if [ -s "$MOUT" ]; then
+      if ! mark_commit "$MOUT" "$MKEY" "$MK"; then
+        FAILED_STAGES="$FAILED_STAGES marks-$MK"
+        echo "$(date -Is) marks-$MK commit to the carry queue FAILED — nothing of it is used, its $(grep -c '^- M-' "$MC") mark(s) stay OPEN for the next night" >> "$LOG"
+      fi
+    else
+      # rc 0 and no output is a failed chunk, not a quiet one (PDRAIN: 2 of 63 calls on 2026-10-06
+      # printed a delegation and wrote nothing; until then only "coverage: 0/60" in the log said so)
+      FAILED_STAGES="$FAILED_STAGES marks-$MK"
+      echo "$(date -Is) marks-$MK exited 0 but wrote no output ($MOUT) — FAILED, its $(grep -c '^- M-' "$MC") mark(s) stay OPEN for the next night" >> "$LOG"
+    fi
+    ledger coverage "$MOUT" --queue "$MC" >> "$LOG" 2>&1 || true
+    knowhow_line "marks-$MK" "$MOUT"
+  else
+    FAILED_STAGES="$FAILED_STAGES marks-$MK"
+    echo "$(date -Is) marks-$MK FAILED — output not committed, its $(grep -c '^- M-' "$MC") mark(s) stay OPEN for the next night" >> "$LOG"
+  fi
+  python3 "$CODE/maxtok_check.py" --stage "marks-$MK" --since "$STAGE_MARK" \
+    --projects "$PROJ_DIR" >> "$LOG" 2>&1 || true
+done
+
+SWEEP_OK=1
 if [ -z "$AGENT_BIN" ]; then
   # No model can run tonight: the sweep FAILS (no stamp, the window is swept again), queued marks
   # stay OPEN and carried batches stay in the carry queue; only work that needs no model call
@@ -1029,7 +1115,7 @@ if [ "$SWEEP_OK" -ne 1 ]; then
   if [ -n "${PREP_DIR:-}" ] && [ -f "$PREP_DIR/FROZEN" ]; then
     echo "$(date -Is) sweep FAILED after retries — the window is not complete, so it is not consolidated tonight; ${_kept:-0} of ${#SWEEP_GROUP_FILES[@]} part(s) are KEPT in $PREP_DIR and the next run continues that frozen list (not stamped)" >> "$LOG"
   else
-    echo "$(date -Is) sweep FAILED after retries — no candidates produced, consolidate skipped for tonight (see the retry lines above for what was tried); not stamped, so the next run's window still covers tonight" >> "$LOG"
+    echo "$(date -Is) sweep FAILED after retries — no sweep candidates produced (carried batches, the MARK stage's included, are still consolidated below; see the retry lines above for what was tried); not stamped, so the next run's window still covers tonight" >> "$LOG"
   fi
 else
 if [ -s "$SWEEP_FAILED_FILE" ]; then
@@ -1081,65 +1167,6 @@ PYPREPARE
 python3 "$CODE/verify_quotes.py" "$SWEEP" --source digest="$DIGEST" --source gitlog="$GITLOG" \
   >> "$QREPORT" 2>&1 || true
 
-# 2c) THE MARK STAGE (board #209). Queued OPEN journal marks go to the
-# model in chunks of $MARK_CHUNK: every id must end in a candidate (`MARKS:` line) or in a
-# `## MARKS NOT CARDED` line with a reason. A chunk that fails is NOT merged (a cut-off
-# candidate must not drag its ids into a drop) — its marks simply stay OPEN for tomorrow, and so
-# do the chunks the budget did not reach. Their outputs are merged into the sweep file, so the
-# consolidate batches see one candidate list.
-MARKS_PROMPT_FILE=$CODE/prompts/nightly-marks.md
-MCHUNKS=()
-if [ -f "$MARKS_PROMPT_FILE" ] && [ "$QUEUE_N" -gt 0 ] && [ -n "$AGENT_BIN" ]; then
-  mapfile -t MCHUNKS < <(ledger queue --chunk "$MARK_CHUNK" --outdir "$STAGING" \
-                           --prefix "nightly-$NK-markchunk" 2>>"$LOG") || MCHUNKS=()
-fi
-echo "$(date -Is) === marks === ${#MCHUNKS[@]} chunk(s) of <= $MARK_CHUNK queued mark(s) owned by the record stage" >> "$LOG"
-MK=0
-for MC in "${MCHUNKS[@]}"; do
-  [ -f "$MC" ] || continue
-  MK=$((MK + 1))
-  if limit_stop "MARK chunks $MK..${#MCHUNKS[@]} (their marks stay OPEN)"; then break; fi
-  if [ "$(date +%s)" -ge "$MARK_DEADLINE" ]; then
-    echo "$(date -Is) === marks === budget of ${MARK_BUDGET_MIN} min reached — $(( ${#MCHUNKS[@]} - MK + 1 )) chunk(s) left OPEN in the ledger for the next night" >> "$LOG"
-    break
-  fi
-  PENDING=$(python3 "$BATCH_TOOL" count "$SWEEP" 2>/dev/null || echo 0)
-  for CF in $(carry_batches); do
-    PENDING=$((PENDING + $(python3 "$BATCH_TOOL" count "$CF" 2>/dev/null || echo 0)))
-  done
-  if [ "$PENDING" -ge "$MARK_PENDING_MAX" ]; then
-    echo "$(date -Is) === marks === $PENDING candidate(s) already wait for consolidation (>= $MARK_PENDING_MAX) — $(( ${#MCHUNKS[@]} - MK + 1 )) chunk(s) left OPEN in the ledger; consolidation first" >> "$LOG"
-    break
-  fi
-  MOUT=$STAGING/nightly-$NK-markout-$(printf %02d "$MK").md
-  MPROMPT="$MARKS_BASE
-
-INPUTS:
-- MARK QUEUE chunk: $MC
-- journal directory (grep around a mark's journal/<file>:<line> for context): $ROOT/journal
-- knowledge base (grep before carding): $ROOT/memory/know
-OUTPUT FILE: $MOUT"
-  if RETRY_MAX_ATTEMPTS=$BATCH_RETRY_MAX retry_claude_call "marks-$MK" "$MARK_TIMEOUT" "$LOG" "$STAGE_MARK" -- \
-       "$AGENT" -p "$MPROMPT" "${STAGE_ISOLATION[@]}" --model "$MARK_MODEL" --allowedTools $TOOLS; then
-    if [ -s "$MOUT" ]; then
-      python3 "$BATCH_TOOL" merge "$SWEEP" "$MOUT" --letter M --relabel-base $((MK * 1000)) >> "$LOG" 2>&1 \
-        || echo "$(date -Is) marks-$MK merge FAILED (non-fatal) — its marks stay OPEN" >> "$LOG"
-    else
-      # rc 0 and no output is a failed chunk, not a quiet one (PDRAIN: 2 of 63 calls on 2026-10-06
-      # printed a delegation and wrote nothing; until then only "coverage: 0/60" in the log said so)
-      FAILED_STAGES="$FAILED_STAGES marks-$MK"
-      echo "$(date -Is) marks-$MK exited 0 but wrote no output ($MOUT) — FAILED, its $(grep -c '^- M-' "$MC") mark(s) stay OPEN for the next night" >> "$LOG"
-    fi
-    ledger coverage "$MOUT" --queue "$MC" >> "$LOG" 2>&1 || true
-    knowhow_line "marks-$MK" "$MOUT"
-  else
-    FAILED_STAGES="$FAILED_STAGES marks-$MK"
-    echo "$(date -Is) marks-$MK FAILED — output not merged, its $(grep -c '^- M-' "$MC") mark(s) stay OPEN for the next night" >> "$LOG"
-  fi
-  python3 "$CODE/maxtok_check.py" --stage "marks-$MK" --since "$STAGE_MARK" \
-    --projects "$PROJ_DIR" >> "$LOG" 2>&1 || true
-done
-
 run_quotecheck "$SWEEP"
 echo "$(date -Is) quotecheck: $(tail -1 "$QREPORT")" >> "$LOG"
 
@@ -1159,7 +1186,8 @@ python3 "$CODE/nearest_cards.py" "$SWEEP" >> "$LOG" 2>&1 \
   || echo "$(date -Is) === nearest === FAILED (non-fatal) — consolidate runs without NEAREST lines" >> "$LOG"
 
 # 2e) SPLIT INTO THE CARRY QUEUE — ONE ATOMIC COMMIT (review P1-4). Tonight's candidates, the
-# sweep's and MARK stage's `## MARKS NOT CARDED` verdicts and tonight's WINDOW are written into
+# sweep's `## MARKS NOT CARDED` verdicts and tonight's WINDOW are written into (the MARK stage's
+# results are already in carry, each chunk in its own directory, step 1e)
 # $CARRY/.split-$SK.tmp and committed by ONE rename to $CARRY/$SK. A kill before the rename leaves
 # nothing (the window is not stamped and is swept again); a kill after it leaves everything,
 # and the next run reads the window back from $CARRY/$SK/WINDOW. A split failure falls back to
@@ -1371,7 +1399,8 @@ $(consolidate_inputs "$B" "$BD" "$CB" "$BOUT")"
 done
 [ "$CB_LIMIT" -eq 0 ] || limit_stop "$CB_LIMIT consolidate batch(es) (they stay in $CARRY)" || true
 # A run directory whose batches are all published is closed: its window is folded into the
-# stamp (never backwards) and the directory goes.
+# stamp (never backwards) and the directory goes. A MARK-stage directory (<night key>-mNN) has no
+# WINDOW, so closing it never moves the stamp.
 for _d in "$CARRY"/[0-9]*/; do
   [ -d "$_d" ] || continue
   _d=${_d%/}
@@ -1411,7 +1440,7 @@ run_triage_stage
 # failed consolidate batch stays in the carry queue: both are tomorrow's work, neither is lost.
 if [ -n "$FAILED_STAGES" ]; then
   if [ "$SWEEP_OK" -ne 1 ]; then
-    WHERE="not stamped, so the next run's window still covers this one"
+    WHERE="not stamped, so the next run's window still covers this one; committed MARK chunks are in $CARRY or the inbox, failed ones stay OPEN"
   else
     WHERE="window stamped; failed MARK chunks stay OPEN in the ledger and failed batches stay in $CARRY — the next night continues from there"
   fi

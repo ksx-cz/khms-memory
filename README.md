@@ -109,6 +109,21 @@ check the review hashes, and rebuild the views before resuming. Per-file history
 is not an atomic history of the whole base. Missing history remains unavailable;
 it cannot be reconstructed as evidence from a derived packet or today's card.
 
+### The MARK stage runs first and keeps what it finished
+
+The OPEN journal MARKs of the coverage ledger (`mark_ledger.py queue`) are the
+night's FIRST model stage, before the sweep and whatever the sweep does (fail,
+time out, find nothing, find hundreds of candidates). It has its own budget,
+`MARK_BUDGET_MIN` counted from the stage's own start, and no gate on how many
+candidates already wait for consolidation; the night's other deadlines are
+unchanged. Every finished chunk — candidates and `## MARKS NOT CARDED` verdicts —
+is committed on its own, by one rename, as the carry directory
+`memory/ledger/carry/<night key>-mNN/` (no `WINDOW` file, so it never moves the
+sweep's stamp) and is published by the consolidation as units
+`<night key>-mNN-bKK.md`. A chunk killed before its commit leaves its marks OPEN
+(queued again, nothing of it used); a committed chunk counts as proposed and is
+never queued again.
+
 ### A night longer than its budget resumes, it does not start over
 
 The nightly sweep reads one window of sources (since the night stamp) in parts,

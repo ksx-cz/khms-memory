@@ -30,11 +30,14 @@ between them left the batch to be consolidated again and merged again (a label
 clash was renamed, never recognised).  Now every step is idempotent and keyed
 by a stable BATCH ID, so a run killed anywhere repeats nothing that finished:
 
-    split-run SWEEP --carry C --run NK --window TS
+    split-run SWEEP --carry C --run NK [--window TS]
           writes the batches (+ NOT CARDED + WINDOW) into C/.split-NK.tmp/ and
           COMMITS them with one rename to C/NK/ — a kill before the rename
           leaves no batch (and no stamp), a kill after it leaves all of them
           plus the window the next run resumes from.  Refuses an existing C/NK.
+          Without --window no WINDOW file is written: a MARK-stage chunk
+          (C/<night key>-mNN, PMARKFIRST) is not a window of the sweep and must
+          never move the sweep's stamp.
     publish SRC --unit U --batch-id ID --record R [--relabel-base N]
           creates the inbox unit U from SRC with an exclusive link (never an
           overwrite), then records ID in R.  U already there with the same
@@ -235,8 +238,9 @@ def cmd_split_run(a):
     if notc:
         with open(os.path.join(tmp, "notcarded.md"), "x", encoding="utf-8") as fh:
             fh.write(render("", [], [(NOT_CARDED, "".join(b for _h, b in notc))]))
-    with open(os.path.join(tmp, "WINDOW"), "x", encoding="utf-8") as fh:
-        fh.write(a.window.strip() + "\n")
+    if a.window is not None:               # a MARK-stage chunk has no window (see the docstring)
+        with open(os.path.join(tmp, "WINDOW"), "x", encoding="utf-8") as fh:
+            fh.write(a.window.strip() + "\n")
     if os.environ.get("NIGHTLY_BATCH_FAULT") == "split-before-commit":
         print("split-run: FAULT INJECTED before commit", file=sys.stderr)
         os._exit(137)
@@ -488,7 +492,7 @@ def main(argv=None):
     s.add_argument("--size", type=int, default=25)
     s.add_argument("--carry", required=True)
     s.add_argument("--run", required=True)
-    s.add_argument("--window", required=True)
+    s.add_argument("--window", default=None)
     s.set_defaults(fn=cmd_split_run)
     s = sub.add_parser("publish")
     s.add_argument("src")

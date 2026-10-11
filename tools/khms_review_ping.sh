@@ -171,7 +171,7 @@ for d in $DATES; do
   if [ "$UNITS_OK" = 1 ]; then
     case "$d" in
       *-weekly) units_re="^${d}\.md\$" ;;
-      *) units_re="^${d}((-[0-9]+)?-b[0-9]{2,})?\.md\$" ;;
+      *) units_re="^${d}((-[0-9]+)?(-m[0-9]{2,})?-b[0-9]{2,})?\.md\$" ;;
     esac
     have_units="$(ls "$INBOX" 2>/dev/null | grep -E "$units_re" || true)"
     if [ -n "$have_units" ]; then
