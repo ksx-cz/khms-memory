@@ -68,7 +68,6 @@ DEFAULTS = [
     ("KHMS_CLAIM_LOG", "${KHMS_STATE}/claim_gate.log"),
     ("KHMS_PROPOSAL_LOG", "${KHMS_STATE}/proposal_gate.log"),
     ("KHMS_STOP_LOG", "${KHMS_STATE}/stop_gate.log"),
-    ("KHMS_RECALL_INTENT", "${KHMS_STATE}/recall_intent.jsonl"),
     ("KHMS_HOOK_STATE", "${KHMS_STATE}/hook-state"),
     ("KHMS_HOOKS_OFF_FILE", "${KHMS_STATE}/hooks-off"),
     ("KHMS_LEN_CACHE", "${KHMS_STATE}/cardlen.json"),

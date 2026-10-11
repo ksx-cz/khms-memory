@@ -7,9 +7,9 @@ Wire it (see claude-code/README.md) to:
   SessionStart                 the unreviewed-inbox / night-in-progress line, the mark-ledger line, the
                                gates' fail-open records, and the reply directive -- ONCE per session
   UserPromptSubmit             open a turn, score the prompt, inject matching cards, one directive line
-  PreToolUse  Bash             record recall intents; run precheck.sh for a risky-command class; score
+  PreToolUse  Bash             run precheck.sh for a risky-command class; score
   PreToolUse  Edit|Write       score the file path and the edited text (only text matching HOOK_DOMAIN)
-  PreToolUse  Agent|Task       the dispatch gate: a proposal inside a brief needs a bound recall
+  PreToolUse  Agent|Task       the dispatch gate: a proposal inside a brief is shown its nearest cards once
   PreToolUse  <report tool>    the retrieval-claim gate and the proposal gate on a report to the principal
   Stop                         the reply-owed gate: the principal's last channel message gets an answer
   PostToolUse / ...Failure     score the command and its error lines (switched off by the experiment file
@@ -31,10 +31,12 @@ Design rules:
     private KHMS_PATTERNS file. A public deployment works with neither.
 
 Locations come from khms_paths. The legacy per-file overrides KHMS_STATE_DIR, KHMS_LOG, KHMS_BAZE_LOG,
-KHMS_PROPOSAL_LOG, KHMS_STOP_LOG, KHMS_RECALL_INTENT and KHMS_NIGHTLY_LOCK are honoured from the
-environment, so existing tests and wrappers keep working.
+KHMS_PROPOSAL_LOG, KHMS_STOP_LOG and KHMS_NIGHTLY_LOCK are honoured from the environment, so existing
+tests and wrappers keep working.
 Kill switch: touch the file named by KHMS_HOOKS_OFF_FILE (default ${KHMS_STATE}/hooks-off) or export
-KHMS_HOOKS_OFF=1.
+KHMS_HOOKS_OFF=1. A switched-off hook still writes one `HOOKS-OFF` line per event to the inject log, and a
+gate switched off in the experiment file one `OFF` line to its own log each time it is consulted: a switch
+that is on must never look like an idle gate.
 """
 import collections
 import datetime
@@ -43,7 +45,6 @@ import json
 import os
 import khms_files
 import re
-import shlex
 import subprocess
 import sys
 import time
@@ -432,6 +433,9 @@ def load_experiment():
     return cfg if isinstance(cfg, dict) else {}
 
 
+GATE_OFF_WHY = "switched off by %s in the experiment file"
+
+
 def inject_on(exp, event):
     return bool((exp.get("inject") or {}).get(event, True))
 
@@ -554,6 +558,7 @@ def claim_log(session, verdict, why, qpart):
 def run_claim_gate(payload, event, exp):
     """True == the report was DENIED (and the deny was already printed)."""
     if not exp.get("baze_gate", exp.get("claim_gate", True)):
+        claim_log(payload.get("session_id", ""), "OFF", GATE_OFF_WHY % "baze_gate/claim_gate", "")
         return False
     session = payload.get("session_id", "")
     path, st = load_state(session)
@@ -575,359 +580,48 @@ run_baze_gate = run_claim_gate      # legacy name
 
 
 # --- the proposal gate -----------------------------------------------------------------------------------
-# A report or a brief that carries a PROPOSAL (a recommendation, a "shall I ...?", an A) B) choice) is
-# denied unless a recall of the same turn shares the proposal's own key terms: a recall on the symptom
-# alone does not show that the base was asked about the proposed remedy. The matchers below have English
-# defaults; a deployment adds its own language through the private KHMS_PATTERNS file.
+# A report or a brief that carries a PROPOSAL (a recommendation, a "shall I ...?", a proposal label) runs
+# the recall on the proposal itself and is denied ONCE with the nearest cards the author has not been shown
+# or has not cited (proposal_gate below); the same proposal sent again passes. Whether the author recalled
+# is not checked. The matchers below have English defaults; a deployment adds its own language through the
+# private KHMS_PATTERNS file.
 PROPOSAL_LOG = (os.environ.get("KHMS_PROPOSAL_LOG")
                 or (os.path.join(os.path.dirname(os.environ["KHMS_BAZE_LOG"]), ".proposal_gate.log")
                     if os.environ.get("KHMS_BAZE_LOG") else None)
                 or P.soft("KHMS_PROPOSAL_LOG"))
 PROPOSAL_EN_MARKER_RE = re.compile(
-    r"\b(?:i|we)\s+(?:would\s+|'d\s+|do\s+|strongly\s+)?(?:propose|recommend|suggest)\b"
+    r"\b(?:i|we)(?:\s+would|\s*'d)?\s+(?:do\s+|strongly\s+)?(?:propose|recommend|suggest)\b"
+    r"|\b(?:i|we)(?:\s+would|\s*'d)\s+go\s+(?:with|for)\b"
     r"|\b(?:my|our)\s+(?:proposal|recommendation|suggestion|advice)\b"
     r"|\b(?:shall|should)\s+(?:i|we)\b[^?]*\?")
+# A label opens the line, follows punctuation or a dash, or follows a connective or a revising verb
+# ("So the recommendation:", "Revised proposal:", "I therefore refine the recommendation:").
 PROPOSAL_EN_LABEL_RE = re.compile(
-    r"(?:^|[(\[]\s*|[.!;:]\s+|\s[-–—]\s+)(recommendation|recommended|recommend|proposal|"
-    r"suggestion|proposed fix|proposed change)\s*:", re.I)
-PROPOSAL_EN_CHOICE_RE = re.compile(r"\bchoose\b|\bwhich (?:option|one|variant)\b|\bpick (?:one|a|an)\b")
+    r"(?:^|[(\[]\s*|[.!;:]\s+|\s[-–—]\s+"
+    r"|\b(?:so|therefore|thus|hence|final|(?:refine|update|revise|correct)[ds]?)\s+(?:the\s+|my\s+|our\s+)?)"
+    r"(recommendation|recommended(?: option| approach| variant| fix)?|recommend|proposal|suggestion"
+    r"|proposed(?: fix| change| solution| approach)?)\s*:", re.I)
 # Report-mode marker: the deployment's own (HOOK_PROPOSAL_MARKER) or the English one. Brief mode always
 # accepts both, because a brief may be written in either language.
 PROPOSAL_MARKER_RE = PAT.regex("HOOK_PROPOSAL_MARKER", PROPOSAL_EN_MARKER_RE.pattern)
-PROPOSAL_OPTION_RE = re.compile(r"^\s*(?:[-*•]\s*)?(?:\d+[.)]\s*)?(?:\*\*)?\(?([A-E])\)")
 PROPOSAL_LIST_RE = re.compile(r"^\s*(?:[-*•]|\d+(?:[–-]\d+)?[.)])\s")
 # A line that refers back to a previous proposal ("item 2", "A or B").
 PROPOSAL_REF_RE = PAT.regex(
     "HOOK_PROPOSAL_REF", r"\b(?:[Ii]tem|[Pp]oint)s?\s+\d|\b[A-E]\s*(?:,|\band\b|\bor\b|/)\s*[A-E]\b")
-# Words that make an option block a CHOICE put to the principal.
-PROPOSAL_CHOICE_RE = PAT.regex("HOOK_PROPOSAL_CHOICE", PROPOSAL_EN_CHOICE_RE.pattern)
 # The mandatory report lines are not proposals (normalised line start, with the colon).
 PROPOSAL_SKIP_RE = PAT.regex("HOOK_PROPOSAL_SKIP", r"^(?:base|verified|if i were wrong)\s*:")
-# ...and are not context either (normalised line start).
-PROPOSAL_META_RE = PAT.regex("HOOK_PROPOSAL_META", r"^(base|verified|if i were wrong)\b")
 _QUOTED_RE = re.compile(r"`[^`]*`|\"[^\"\n]*\"|„[^“\n]*“|“[^”\n]*”")
 _SLASH_NEAR = 3                # a marker this close to a `/` is an item of a word list
 
 PROPOSAL_MAX_SHOWN = 3        # proposals named in one refusal
-PROPOSAL_QUERY_TERMS = 8      # terms in the suggested query
-PROPOSAL_MIN_TERMS = 3        # fewer on the marker line -> take the line above
-PROPOSAL_STOP = frozenset("""
-the and for with this that from into then than are was
-its not our you your will would should shall propose proposed proposal recommend recommended
-recommendation suggest suggestion option variant choose
-""".split()) | frozenset(PAT.words("HOOK_PROPOSAL_STOPWORDS", ()))
-# Term prefixes too generic to tell one proposal from another in this deployment.
-PROPOSAL_GENERIC = tuple(PAT.words("HOOK_PROPOSAL_GENERIC", ()))
-_PROPOSAL_NOISE_RE = re.compile(r"^(?:k-\d+|[\d.,:/x%\-]+|https?:.*|.*://.*)$")
 
 
 def _unquoted(text):
     return _QUOTED_RE.sub(" ", text or "")
 
 
-
-
-def brief_marker(raw, n):
-    """A proposal marker on one brief line -- either language, not quoted, not in a `/` word list, not a
-    section title (a markdown heading or an ALL-CAPS label)."""
-    if raw.lstrip().startswith("#"):
-        return False
-    t = _unquoted(n)
-    for rx in (PROPOSAL_MARKER_RE, PROPOSAL_EN_MARKER_RE):
-        if any(_not_listed(m, t) for m in rx.finditer(t)):
-            return True
-    r = _unquoted(raw)
-    for m in PROPOSAL_EN_LABEL_RE.finditer(r):
-        if m.group(1).isupper():
-            continue
-        return True
-    return False
-
-
-def _prop_same(a, b):
-    """Same word up to an inflection: equal, or a common prefix of at least 4 letters that leaves at most
-    2 letters of the shorter word over (calibrate/calibration)."""
-    if a == b:
-        return True
-    n = 0
-    for x, y in zip(a, b):
-        if x != y:
-            break
-        n += 1
-    return n >= 4 and n >= min(len(a), len(b)) - 2
-
-
 def _prop_line_norm(raw):
     return ks.norm(raw).strip().lstrip("-*_>•·+ \t")
-
-
-
-
-def proposal_terms(span):
-    """Key terms of a proposal in order of appearance, one per stem."""
-    out = []
-    for t in ks.tokens(span):
-        t = t.strip(".,-/")
-        if len(t) < 3 or t in PROPOSAL_STOP or _PROPOSAL_NOISE_RE.match(t) \
-                or (PROPOSAL_GENERIC and t.startswith(PROPOSAL_GENERIC)):
-            continue
-        if any(_prop_same(t, o) for o in out):
-            continue
-        out.append(t)
-    return out
-
-
-def proposal_query(body, terms):
-    """The suggested recall: the most specific terms, in reading order. Specific = a capitalised name
-    inside a sentence, an identifier (digits, `_`, `.`, `/`), then length."""
-    caps = {ks.norm(w) for w in re.findall(r"(?<![.!?]\s)(?<!^)\b([A-Z][\w\-]+)", body or "")}
-    rank = sorted(range(len(terms)), key=lambda i: (
-        -(terms[i] in caps or bool(re.search(r"[\d_./]", terms[i]))), -len(terms[i]), i))
-    keep = sorted(rank[:PROPOSAL_QUERY_TERMS])
-    return " ".join(terms[i] for i in keep)
-
-
-def _prop_words(terms, glossary):
-    words = set(terms)
-    for t in terms:                        # the base may be written in another language than the report
-        for key, en in glossary.items():
-            if t.startswith(key):
-                words.update(ks.tokens(en))
-    return words
-
-
-def _prop_covered(words, recall_tokens):
-    return any(_prop_same(w, r) for w in words for r in recall_tokens)
-
-
-# Recall binding. Only recalls of THIS session's turn count: the session's own transcript (a recall.sh
-# Bash call whose tool_result is not an error), and a subagent's recall only through its own transcript
-# AND only when the gated text cites a card that call returned. The PreToolUse intent record says which
-# subagent issued which recall.
-RECALL_CMD_RE = re.compile(
-    r"(?:^|[\s;&|(])(?:\S*/)?recall\.sh\s+(.+?)(?=\s+\d*[<>]|\s*[|;\n]|\s*&&|\s*\)|$)")
-
-
-def recall_intent_path():
-    if os.environ.get("KHMS_RECALL_INTENT"):
-        return os.environ["KHMS_RECALL_INTENT"]
-    if os.environ.get("KHMS_RECALL_LOG"):
-        return os.environ["KHMS_RECALL_LOG"] + ".intent.jsonl"
-    return P.soft("KHMS_RECALL_INTENT")
-
-
-def recall_queries_of(cmd):
-    """Queries of every `recall.sh ...` in a shell command (flags and redirects out)."""
-    out = []
-    for m in RECALL_CMD_RE.finditer(cmd or ""):
-        arg = m.group(1)
-        try:
-            words = shlex.split(arg)
-        except ValueError:
-            words = arg.split()
-        words = [w for w in words if not w.startswith("--")]
-        if words:
-            out.append(" ".join(words))
-    return out
-
-
-def record_recall_intent(payload):
-    """PreToolUse(Bash): one intent line per recall.sh in the command. Never raises."""
-    try:
-        cmd = str((payload.get("tool_input") or {}).get("command", ""))
-        if "recall.sh" not in cmd:
-            return 0
-        qs = recall_queries_of(cmd)
-        if not qs:
-            return 0
-        path = recall_intent_path()
-        if not path or not P.may_write(path):
-            return 0
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        with open(path, "a", encoding="utf-8") as f:
-            for q in qs:
-                f.write(json.dumps({
-                    "ts": round(time.time(), 3), "sid": payload.get("session_id", ""),
-                    "agent_id": payload.get("agent_id") or "",
-                    "tool_use_id": payload.get("tool_use_id") or "",
-                    "query": q}, ensure_ascii=False) + "\n")
-        return len(qs)
-    except Exception:                                              # noqa: BLE001
-        return 0
-
-
-def _jsonl_tail(path, nbytes=CLAIM_TAIL):
-    try:
-        with open(path, "rb") as f:
-            f.seek(0, 2)
-            size = f.tell()
-            f.seek(max(0, size - nbytes))
-            data = f.read().decode("utf-8", "replace")
-    except (OSError, TypeError):
-        return []
-    lines = data.splitlines()
-    if size > nbytes and lines:
-        lines = lines[1:]
-    out = []
-    for ln in lines:
-        try:
-            out.append(json.loads(ln))
-        except ValueError:
-            continue
-    return out
-
-
-def _result_text(content):
-    if isinstance(content, list):
-        return "\n".join(str(c.get("text", "")) if isinstance(c, dict) else str(c) for c in content)
-    return str(content or "")
-
-
-def transcript_recalls(path, since_t, main=True, only_ids=None):
-    """[(tool_use_id, query, cards)] of the recall.sh Bash calls in transcript `path` issued at/after
-    `since_t` whose tool_result (matched by tool_use_id) is NOT an error. `main` skips sidechain lines;
-    `only_ids` restricts to those calls."""
-    uses, results = {}, {}
-    try:
-        fh = open(path, encoding="utf-8", errors="replace")
-    except OSError:
-        return []
-    with fh:
-        for ln in fh:
-            is_use = '"tool_use"' in ln and "recall.sh" in ln
-            is_res = '"tool_result"' in ln and uses and any(i in ln for i in uses)
-            if not (is_use or is_res):
-                continue
-            try:
-                d = json.loads(ln)
-            except ValueError:
-                continue
-            if main and d.get("isSidechain"):
-                continue
-            msg = d.get("message")
-            content = msg.get("content") if isinstance(msg, dict) else None
-            if not isinstance(content, list):
-                continue
-            for blk in content:
-                if not isinstance(blk, dict):
-                    continue
-                if blk.get("type") == "tool_use" and d.get("type") == "assistant":
-                    tid = blk.get("id") or ""
-                    cmd = str((blk.get("input") or {}).get("command", ""))
-                    ts = _ts_epoch(d.get("timestamp"))
-                    if (not tid or blk.get("name") != "Bash" or "recall.sh" not in cmd
-                            or ts is None or ts + CLAIM_SLACK < since_t
-                            or (only_ids is not None and tid not in only_ids)):
-                        continue
-                    uses[tid] = recall_queries_of(cmd)
-                elif blk.get("type") == "tool_result" and d.get("type") == "user":
-                    tid = blk.get("tool_use_id")
-                    if tid in uses:
-                        results[tid] = (bool(blk.get("is_error")), _result_text(blk.get("content")))
-    out = []
-    for tid, qs in uses.items():
-        if tid not in results or results[tid][0]:
-            continue                       # still running, or failed: no recall
-        cards = set(re.findall(r"\bK-\d{5}\b", results[tid][1]))
-        out += [(tid, q, cards) for q in qs]
-    return out
-
-
-AGENT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
-
-
-def bound_recalls(session, since_t, text="", transcript="", agent_id=""):
-    """[(token set, how)] of the recalls bound to THIS session's turn. `agent_id`: the gated call comes
-    from that subagent, so ITS transcript is the "own" one."""
-    if not session or since_t is None or not transcript:
-        return []
-    transcript = os.path.expanduser(str(transcript))
-    cited = set(re.findall(r"K-\d{5}", text or ""))
-
-    def terms(q):
-        return {t for t in ks.tokens(q) if t not in PROPOSAL_STOP
-                and not (PROPOSAL_GENERIC and t.startswith(PROPOSAL_GENERIC))}
-    out = []
-    base = transcript[:-len(".jsonl")] if transcript.endswith(".jsonl") else transcript
-    own, own_main = transcript, True
-    if agent_id:
-        if not AGENT_ID_RE.match(str(agent_id)):
-            return []
-        own, own_main = os.path.join(base, "subagents", "agent-%s.jsonl" % agent_id), False
-    for tid, q, _cards in transcript_recalls(own, since_t, main=own_main):
-        if ks.tokens(q):
-            out.append((terms(q), M.msg("HOOK_HOW_OWN")))
-    by_agent = {}
-    for it in _jsonl_tail(recall_intent_path()):
-        aid, tid = str(it.get("agent_id") or ""), str(it.get("tool_use_id") or "")
-        if (it.get("sid") == session and aid and tid and AGENT_ID_RE.match(aid)
-                and it.get("ts", 0) + CLAIM_SLACK >= since_t):
-            by_agent.setdefault(aid, set()).add(tid)
-    for aid, tids in sorted(by_agent.items()):
-        if aid == agent_id:
-            continue                       # already counted as the caller's own
-        sub = os.path.join(base, "subagents", "agent-%s.jsonl" % aid)
-        for tid, q, cards in transcript_recalls(sub, since_t, main=False, only_ids=tids):
-            if ks.tokens(q) and cited & cards:
-                out.append((terms(q), M.msg("HOOK_HOW_SUBAGENT", agent=aid[:12])))
-    return out
-
-
-def _prop_context_terms(text, body):
-    """Terms of the text OUTSIDE this proposal (the mandatory report lines out): a word the whole text is
-    about cannot be what tells this proposal apart."""
-    rest = []
-    for ln in (text or "").splitlines():
-        core = ln.strip().lstrip("-*•·+> \t").strip()
-        if not core or core in (body or "") or PROPOSAL_META_RE.match(_prop_line_norm(ln)):
-            continue
-        rest.append(ln)
-    return proposal_terms("\n".join(rest))
-
-
-def proposal_covered(body, terms, ctx_terms, recalls, glossary):
-    """A recall covers a proposal when it shares at least two of its terms (one, if the proposal has only
-    one) AND one shared term DISTINGUISHES it -- a term the rest of the text does not use. Heuristic: it
-    shows a recall on the proposal's own subject was evidenced, not that the proposal is right."""
-    distinct = [t for t in terms if not any(_prop_same(t, c) for c in ctx_terms)]
-    if not distinct:
-        distinct = proposal_query(body, terms).split()[:3]
-    need = min(2, len(terms))
-    for rt in recalls:
-        shared = [t for t in terms if _prop_covered(_prop_words([t], glossary), rt)]
-        if len(shared) >= need and any(t in distinct for t in shared):
-            return True
-    return False
-
-
-def proposal_verdict(text, st, session="", transcript="", since_t=None, agent_id="", brief=False):
-    """(ALLOW|DENY|EXEMPT, reason, [(label, suggested query)] of the uncovered proposals). `since_t`
-    overrides the report turn (the dispatch gate passes its own); `agent_id` names the calling subagent."""
-    turn_start = st.get("turn_start") if since_t is None else since_t
-    if turn_start is None:
-        return "EXEMPT", M.msg("HOOK_WHY_NO_TURN"), []
-    spans = proposal_spans(text, brief=brief)
-    if not spans:
-        return "EXEMPT", M.msg("HOOK_WHY_NO_PROPOSAL"), []
-    bound = bound_recalls(session, turn_start, text, transcript, agent_id)
-    recalls = [r for r, _how in bound]
-    try:
-        glossary = ks.load_glossary()
-    except Exception:                                            # noqa: BLE001
-        glossary = {}
-    missing = []
-    for label, body in spans:
-        terms = proposal_terms(body)
-        if not terms:
-            continue
-        if proposal_covered(body, terms, _prop_context_terms(text, body), recalls, glossary):
-            continue
-        missing.append((label, proposal_query(body, terms)))
-    if missing:
-        return ("DENY", M.msg("HOOK_WHY_UNCOVERED", n=len(missing), total=len(spans),
-                              bound=len(recalls)), missing)
-    return ("ALLOW", M.msg("HOOK_WHY_COVERED", n=len(spans),
-                           how=", ".join(sorted({h for _r, h in bound})) or "-"), [])
 
 
 def proposal_log(session, verdict, why, label):
@@ -935,18 +629,10 @@ def proposal_log(session, verdict, why, label):
         _stamp(), session or "-", verdict, why, re.sub(r"\s+", " ", label or "")[:120]))
 
 
-def _proposal_items(missing):
-    """One line per uncovered proposal, each with the exact recall to run."""
-    return "\n".join(M.msg("HOOK_PROPOSAL_ITEM", label=re.sub(r"\s+", " ", label)[:90], query=q)
-                     for label, q in missing[:PROPOSAL_MAX_SHOWN])
-
-
-
-
 # --- the dispatch gate: the same rule when a subagent is launched -------------------------------------
-# A PreToolUse on the Agent tool whose prompt, or the brief file the prompt names, carries a proposal is
-# denied without a bound recall on that proposal in the same turn (every UserPromptSubmit opens a turn,
-# task notifications too). An unreadable brief fails open, and the fail-open is logged as one.
+# A PreToolUse on the Agent tool whose prompt, or the brief file the prompt names, carries a proposal goes
+# through proposal_gate exactly like a report (every UserPromptSubmit opens a turn, task notifications
+# too). An unreadable brief fails open, and the fail-open is logged as one.
 AGENT_TOOLS = ("Agent", "Task")
 ISSUE_LINE_RE = re.compile(r"^\s*Issue:\s*#(\d+)\b", re.M)
 BRIEF_PATH_RE = re.compile(r"(/[^\s'\"`<>|;()]+\.md)\b")
@@ -1001,12 +687,6 @@ def dispatch_brief_paths(prompt, cwd=None, unresolved=None):
         if _is_brief_name(p, src) and p not in out:
             out.append(p)
     return out
-
-
-
-
-
-
 
 
 # --- fail-open records: a broken gate is not an idle one ---------------------------------------------
@@ -1256,11 +936,8 @@ def handle_report(payload, event, exp):
         log(event, "report", action="stop-stamp error %s" % exc)
 
 
-
 _GATE_CARDS = []
-_SLASH_NEAR = 3
 PROPOSAL_TOPN = 5
-PROPOSAL_MAX_SHOWN = 3
 PROPOSAL_Q_CHARS = 400
 PROPOSAL_LOG_WORDS = 12
 PROPOSAL_SRC = "gate:proposal"
@@ -1274,18 +951,6 @@ PROPOSAL_DENY_HEAD = {'reply':'This proposal has relevant recall results:',
 PROPOSAL_DENY_TAIL = 'Read the relevant cards, revise the proposal or resend it after reading. The same proposal is shown once per author context.'
 TERM_DENY = 'Preferred terminology: rewrite these expressions before sending:\n%s'
 
-PROPOSAL_EN_MARKER_RE = re.compile(
-    r"\b(?:i|we)\s+(?:would\s+|'d\s+|do\s+|strongly\s+)?(?:propose|recommend|suggest)\b"
-    r"|\b(?:my|our)\s+(?:proposal|recommendation|suggestion|advice)\b"
-    r"|\b(?:shall|should)\s+(?:i|we)\b[^?]*\?")
-
-PROPOSAL_EN_LABEL_RE = re.compile(
-    r"(?:^|[(\[]\s*|[.!;:]\s+|\s[-–—]\s+)(recommendation|recommended|recommend|proposal|"
-    r"suggestion|proposed fix|proposed change)\s*:", re.I)
-
-PROPOSAL_LIST_RE = re.compile(r"^\s*(?:[-*•]|\d+(?:[–-]\d+)?[.)])\s")
-
-_QUOTED_RE = re.compile(r"`[^`]*`|\"[^\"\n]*\"|„[^“\n]*“|“[^”\n]*”")
 
 _TERM_EXEMPT = re.compile(r"```.*?(```|\Z)|`[^`\n]*`|„[^“\n]{0,400}“|“[^”\n]{0,400}”"
                           r"|\"[^\"\n]{0,400}\"", re.S)
@@ -1515,6 +1180,7 @@ def term_hits(text):
 def run_term_gate(payload, event, exp):
     'Shared proposal/terminology gate: run_term_gate'
     if not exp.get("term_gate", True):
+        log(event, "discord-reply", action="OFF (%s)" % (GATE_OFF_WHY % "term_gate"))
         return False
     hits = term_hits(_reply_text(payload))
     if not hits:
@@ -1528,6 +1194,7 @@ def run_term_gate(payload, event, exp):
 def run_proposal_gate(payload, event, exp):
     'Shared proposal/terminology gate: run_proposal_gate'
     if not exp.get("proposal_gate", True):
+        proposal_log(payload.get("session_id", ""), "OFF", GATE_OFF_WHY % "proposal_gate", "reply")
         return False
     session = payload.get("session_id", "")
     path, st = load_state(session)
@@ -1554,12 +1221,13 @@ def dispatch_texts(prompt, cwd=None):
                 texts.append(("brief " + p, fh.read()))
         except OSError as exc:
             errors.append((p, exc.__class__.__name__))
-    errors += [(t, "relativni cesta bez cwd") for t in unresolved]
+    errors += [(t, M.msg("HOOK_WHY_RELATIVE")) for t in unresolved]
     return texts, errors
 
 def run_dispatch_proposal_gate(payload, exp):
     'Shared proposal/terminology gate: run_dispatch_proposal_gate'
     if not exp.get("proposal_gate", True):
+        proposal_log(payload.get("session_id", ""), "OFF", GATE_OFF_WHY % "proposal_gate", "dispatch")
         return False
     session = payload.get("session_id", "")
     path, st = load_state(session)
@@ -1573,7 +1241,7 @@ def run_dispatch_proposal_gate(payload, exp):
     verdict, spans = proposal_gate(texts, str(payload.get("agent_id") or "main"), st,
                                    turn=("dispatch", st.get("prompt_t", st.get("turn_start"))))
     if verdict == "EXEMPT":
-        proposal_log(session, "EXEMPT", "%s: bez navrhu" % what, "")
+        proposal_log(session, "EXEMPT", "%s: %s" % (what, M.msg("HOOK_WHY_NO_PROPOSAL")), "")
         return False
     save_state(path, st)
     proposal_log_spans(session, what, spans)
@@ -1585,9 +1253,29 @@ def run_dispatch_proposal_gate(payload, exp):
         % sum(1 for s in spans if s["tag"] == "OPEN"))
     return True
 
+def hooks_off():
+    """Why every KHMS hook is switched off, or None."""
+    if os.environ.get("KHMS_HOOKS_OFF") == "1":
+        return "KHMS_HOOKS_OFF=1"
+    if HOOKS_OFF_FILE and os.path.exists(HOOKS_OFF_FILE):
+        return "kill-switch file %s" % HOOKS_OFF_FILE
+    return None
+
+
+def log_hooks_off(why):
+    """One inject-log line (the ordinary `log` layout) for an event the kill switch silenced. Never raises."""
+    try:
+        event = str((json.load(sys.stdin) or {}).get("hook_event_name") or "-")
+    except Exception:                                              # noqa: BLE001
+        event = "-"
+    log(event, "", action="HOOKS-OFF: every KHMS hook skipped (%s)" % why)
+
+
 def main():
     global EXP_TAG
-    if os.environ.get("KHMS_HOOKS_OFF") == "1" or (HOOKS_OFF_FILE and os.path.exists(HOOKS_OFF_FILE)):
+    off = hooks_off()
+    if off:
+        log_hooks_off(off)
         return
     payload = json.load(sys.stdin)
     event = payload.get("hook_event_name", "")
@@ -1617,9 +1305,6 @@ def main():
             proposal_log(payload.get("session_id", ""), "ERROR->ALLOW",
                          "dispatch bypass: %s" % str(exc)[:80], "")
         return
-
-    if event == "PreToolUse" and payload.get("tool_name") == "Bash":
-        record_recall_intent(payload)
 
     if event == "PreToolUse" and is_report_tool(payload):
         handle_report(payload, event, exp)

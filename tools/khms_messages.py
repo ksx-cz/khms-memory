@@ -117,37 +117,12 @@ DEFAULTS = {
     "HOOK_WHY_HONEST": "honest form ({form})",
     "HOOK_WHY_NO_IDS": "line without card ids",
     "HOOK_WHY_NO_TURN": "no report turn in this session",
-    "HOOK_WHY_NO_DISPATCH_TURN": "no turn in this session",
     "HOOK_WHY_NO_RECALL": "no src=cli recall in this turn",
     "HOOK_WHY_NO_QUERY": "no query, but a recall ran in this turn",
     "HOOK_WHY_MATCH": "{pct}% match with a recall of this turn",
     "HOOK_WHY_LOW_MATCH": "best match with a recall of this turn only {pct}%",
     "HOOK_WHY_NO_PROPOSAL": "no proposal",
-    "HOOK_WHY_UNCOVERED": ("{n} of {total} proposals without a bound recall on their subject (bound recalls "
-                           "in this turn: {bound})"),
-    "HOOK_WHY_COVERED": "{n} proposals: recall evidenced (bound to this session: {how}), relevance heuristic",
-    "HOOK_WHY_DISPATCH_UNCOVERED": "{n} proposals without a bound recall on their subject",
     "HOOK_WHY_RELATIVE": "relative path without cwd",
-    "HOOK_WHY_BRIEF_UNREADABLE": "{what}: brief unreadable ({err}, fail-open)",
-    "HOOK_HOW_OWN": "own",
-    "HOOK_HOW_SUBAGENT": "subagent {agent}, result cited",
-    "HOOK_PROPOSAL_DENY": ("The report carries a proposal the base was not asked about in this report turn "
-                           "({why}). A recall on the symptom alone is not enough -- the base may know the answer "
-                           "to the proposal itself. For each proposal run a recall with its own words, read the "
-                           "result and send again:\n{items}\n(counted: only recall.sh calls of THIS session and "
-                           "turn that finished without an error, per the session transcript; a subagent's recall "
-                           "only through its own transcript and only when the report cites a card that call "
-                           "returned; the recall must share at least two words of the proposal, one of them a "
-                           "word the rest of the report does not use)"),
-    "HOOK_DISPATCH_DENY": ("The brief carries a proposal the base was not asked about in this turn ({why}; "
-                           "where: {where}). The agent will carry the proposal out as a settled decision, and the "
-                           "base may know the answer to the proposal itself. For each proposal run a recall with "
-                           "its own words, read the result and send the brief again:\n{items}\n(counted: only "
-                           "recall.sh calls of THIS session since this turn began that finished without an error, "
-                           "per the session transcript; a subagent's recall only through its own transcript and "
-                           "only when the brief cites a card that call returned; the recall must share at least "
-                           "two words of the proposal, one of them a word the rest of the brief does not use)"),
-    "HOOK_PROPOSAL_ITEM": "- proposal \"{label}...\" -> `tools/recall.sh \"{query}\"`",
     "HOOK_GATE_PROPOSALS": "proposals",
     "HOOK_GATE_STOP": "Stop",
     "HOOK_FAILOPEN": ("GATES FAILED OPEN: {n} ERROR->ALLOW record(s) ({gates}) -- a gate that failed looks idle. "

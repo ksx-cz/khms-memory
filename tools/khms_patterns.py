@@ -15,8 +15,8 @@ are NOT expanded). Absent file = English only. Keys:
   HOOK_<NAME>=<value>             a matcher of khms_hook.py that REPLACES its English default
                                   (regex(), value()) or extends it (words()); khms_hook.py names each key:
                                   HOOK_CLAIM_KEYWORD, HOOK_CLAIM_HONEST, HOOK_DOMAIN, HOOK_PROPOSAL_MARKER,
-                                  HOOK_PROPOSAL_REF, HOOK_PROPOSAL_CHOICE, HOOK_PROPOSAL_SKIP,
-                                  HOOK_PROPOSAL_META, HOOK_PROPOSAL_STOPWORDS, HOOK_PROPOSAL_GENERIC
+                                  HOOK_PROPOSAL_LABEL, HOOK_PROPOSAL_NONE, HOOK_PROPOSAL_PAREN,
+                                  HOOK_PROPOSAL_PAREN_ADJ, HOOK_PROPOSAL_REF, HOOK_PROPOSAL_SKIP
   OWNERQ_<NAME>=<value>           verify_owner_quotes.py: the principal's name forms and wording, self-test
                                   sentences (its docstring names each key)
   CONVERT_TAG_HINT_<n>=<tag>::<regex>  convert_inbox2.py: an extra surface form of a registry tag, in file order
