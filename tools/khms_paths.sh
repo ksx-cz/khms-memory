@@ -58,8 +58,9 @@ _KHMS_CFG_RESOLVED=""
 
 _khms_err() { echo "khms_paths: $*" >&2; return 3; }
 
-_khms_parse() {   # _khms_parse FILE -> fills _KHMS_RAW; rc 3 on a malformed line
-  local file="$1" line s v n=0
+_khms_parse() {   # _khms_parse FILE -> fills _KHMS_RAW; rc 3 on malformed/duplicate keys
+  local file="$1" line s v key n=0
+  local -A first_lines=()
   _KHMS_RAW=()
   while IFS= read -r line || [ -n "$line" ]; do
     n=$((n + 1))
@@ -69,11 +70,17 @@ _khms_parse() {   # _khms_parse FILE -> fills _KHMS_RAW; rc 3 on a malformed lin
     [[ "$s" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]] \
       || { _khms_err "malformed line $n in $file (expected KEY=VALUE)"; return 3; }
     v="${BASH_REMATCH[2]}"
+    key="${BASH_REMATCH[1]}"
+    if [ -n "${first_lines[$key]:-}" ]; then
+      _khms_err "duplicate key $key at line $n in $file (first defined at line ${first_lines[$key]})"
+      return 3
+    fi
+    first_lines[$key]="$n"
     v="${v#"${v%%[![:space:]]*}"}"; v="${v%"${v##*[![:space:]]}"}"
     if [ "${#v}" -ge 2 ] && [ "${v:0:1}" = "${v: -1}" ] && { [ "${v:0:1}" = '"' ] || [ "${v:0:1}" = "'" ]; }; then
       v="${v:1:${#v}-2}"
     fi
-    _KHMS_RAW["${BASH_REMATCH[1]}"]="$v"
+    _KHMS_RAW["$key"]="$v"
   done < "$file"
 }
 

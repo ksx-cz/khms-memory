@@ -167,7 +167,7 @@ _LOADED = None
 def _load():
     global _LOADED
     if _LOADED is None:
-        _LOADED = dict(DEFAULTS)
+        loaded = dict(DEFAULTS)
         try:
             path = P.get("KHMS_MESSAGES")
         except P.KhmsNoBaseError:        # a library import with no base selected: English defaults
@@ -176,7 +176,9 @@ def _load():
             with open(path, encoding="utf-8") as fh:
                 for k, v in P.parse_config(fh.read(), path):
                     if k in DEFAULTS:
-                        _LOADED[k] = v
+                        loaded[k] = v
+        # Cache only successful loads; invalid configuration never means defaults.
+        _LOADED = loaded
     return _LOADED
 
 

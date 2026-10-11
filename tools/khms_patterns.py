@@ -37,14 +37,17 @@ _ITEMS = None
 def _load():
     global _ITEMS
     if _ITEMS is None:
-        _ITEMS = []
+        items = []
         try:
             path = P.get("KHMS_PATTERNS")
         except P.KhmsNoBaseError:        # no base selected (lint of explicit files): defaults
             path = os.environ.get("KHMS_PATTERNS") or ""
         if path and os.path.isfile(path):
             with open(path, encoding="utf-8") as fh:
-                _ITEMS = P.parse_config(fh.read(), path)
+                items = P.parse_config(fh.read(), path)
+        # Publish only a successful load: a parse/resolution error must stay an
+        # error on subsequent calls rather than silently selecting defaults.
+        _ITEMS = items
     return _ITEMS
 
 

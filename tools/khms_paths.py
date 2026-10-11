@@ -30,7 +30,8 @@ documented default below. An empty value counts as unset.
 File grammar (khms_paths.sh reads the same file with the same rules; tests/test_paths.py runs both readers
 over the same cases): one KEY=VALUE per line; blank lines and lines starting with `#` are ignored; one
 optional pair of surrounding quotes is removed; `${NAME}` is replaced by the RESOLVED value of NAME (env,
-file, default). Any other line is malformed. A reference cycle, a reference to a name nothing defines, a
+file, default). A key may occur only once per file, including identical or empty values. Any other line is
+malformed. A reference cycle, a reference to a name nothing defines, a
 missing explicitly selected file and a KHMS_READ_ONLY other than 0/1 are errors. The file is never sourced
 or evaluated.
 
@@ -148,8 +149,9 @@ def registered_root_file(env=None):
 
 
 def parse_config(text, origin="<config>"):
-    """[(key, raw value)] in file order; KhmsPathError on a malformed line."""
+    """[(key, raw value)] in file order; reject malformed lines and duplicate keys."""
     out = []
+    first_lines = {}
     for n, line in enumerate(text.splitlines(), 1):
         s = line.strip()
         if not s or s.startswith("#"):
@@ -157,10 +159,16 @@ def parse_config(text, origin="<config>"):
         m = _LINE_RE.match(s)
         if not m:
             raise KhmsPathError(f"khms_paths: malformed line {n} in {origin} (expected KEY=VALUE)")
+        key = m.group(1)
+        if key in first_lines:
+            raise KhmsPathError(
+                f"khms_paths: duplicate key {key} at line {n} in {origin} "
+                f"(first defined at line {first_lines[key]})")
+        first_lines[key] = n
         val = m.group(2).strip()
         if len(val) >= 2 and val[0] == val[-1] and val[0] in "\"'":
             val = val[1:-1]
-        out.append((m.group(1), val))
+        out.append((key, val))
     return out
 
 
