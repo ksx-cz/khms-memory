@@ -22,6 +22,9 @@ it guards moves them into logs and transcripts. The scan refuses to certify anyt
 light up at least MIN_CONTROL_CLASSES classes in --control, an explicit private corpus: a "0 hits" from a
 broken scanner or an empty terms file looks exactly like a clean tree (positive control).
 
+The email class exempts complete synthetic addresses in the reserved .invalid domain; other
+private-term classes still apply to those strings.
+
 HISTORY (--history RANGE, e.g. origin/master..HEAD): every blob that the range would newly make reachable is
 scanned, not only the final tree -- an intermediate commit that carried private text publishes it too.
 
@@ -87,6 +90,17 @@ def load_terms(path):
     return terms
 
 
+def reserved_email(line, match):
+    """Exempt a complete synthetic address in .invalid, never a prefix of a real one."""
+    address = match.group(0)
+    if not re.fullmatch(r"[A-Za-z0-9._%+-]+@(?:[A-Za-z0-9-]+\.)+invalid", address, re.I):
+        return False
+    # A caller-supplied regex might have matched only part of the address.
+    if match.start() and re.match(r"[\w.@%+-]", line[match.start() - 1]):
+        return False
+    return not (match.end() < len(line) and re.match(r"[\w.@%+-]", line[match.end()]))
+
+
 def term_hits(rel, text, terms):
     out = []
     in_examples = rel.startswith("examples/")
@@ -94,6 +108,8 @@ def term_hits(rel, text, terms):
         for cls, rx in terms:
             for m in rx.finditer(line):
                 if in_examples and m.group(0) in ALLOWED_EXAMPLE_IDS:
+                    continue
+                if cls == "email" and reserved_email(line, m):
                     continue
                 out.append((rel, n, cls))
                 break

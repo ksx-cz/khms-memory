@@ -73,10 +73,24 @@ class HookCase(unittest.TestCase):
 class Directive(HookCase):
     def test_session_start_carries_the_whole_directive(self):
         ctx = self.context({"hook_event_name": "SessionStart", "session_id": "s1"})
+        self.assertNotIn("mandatory reply lines", ctx)
+        self.assertNotIn("-->", ctx)
         self.assertIn("base:", ctx)
         self.assertIn("verified:", ctx)
         self.assertIn("if I were wrong:", ctx)
         self.assertGreater(len(ctx), 800, "the full text should be here, once")
+
+    def test_multiline_and_inline_html_comments_are_not_injected(self):
+        path = os.path.join(self.root, "directive.md")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("<!-- hidden header\nhidden continuation -->\nbase: visible\n"
+                    "verified: visible <!-- hidden inline -->\nif I were wrong: visible")
+        ctx = self.context({"hook_event_name": "SessionStart", "session_id": "comments"},
+                           KHMS_DIRECTIVE=path)
+        self.assertNotIn("hidden", ctx)
+        self.assertNotIn("<!--", ctx)
+        self.assertIn("base: visible", ctx)
+        self.assertIn("verified: visible", ctx)
 
     def test_a_prompt_carries_only_the_pointer_line(self):
         ctx = self.context(self.prompt("why do the checksums keep failing on the link"))

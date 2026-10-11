@@ -131,7 +131,7 @@ def directive_text():
             body = f.read()
     except (OSError, TypeError):
         return directive_line()
-    body = "\n".join(ln for ln in body.splitlines() if not ln.lstrip().startswith("<!--"))
+    body = re.sub(r"<!--.*?-->", "", body, flags=re.DOTALL)
     return body.strip() or directive_line()
 
 

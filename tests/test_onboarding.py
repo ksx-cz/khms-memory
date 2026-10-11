@@ -14,6 +14,9 @@ def test_docs_keep_code_out_of_the_base():
         text = (REPO / name).read_text()
         assert '$KHMS_ROOT/tools' not in text, name
     assert 'KHMS_CODE' in (REPO / 'README.md').read_text()
+    for name in ('README.md', 'AGENTS.md'):
+        assert 'mark_ledger.py" sync' in (REPO / name).read_text()
+    assert 'stop the embedding daemon' in (REPO / 'README.md').read_text()
     assert 'code-lock-file' in (REPO / 'README.md').read_text()
     assert 'your KHMS_ROOT' not in (REPO / 'claude-code/settings.hooks.json').read_text()
 
@@ -42,13 +45,22 @@ def test_clean_clone_init_recall_hook_and_locked_update(tmp_path):
     tools = clone / 'tools'
     run('bash', str(tools / 'khms_init.sh'), '--register', env['KHMS_ROOT'])
     run('python3', str(tools / 'build_views.py'))
+    # Execute the documented ledger command against this clean, empty base.
+    quickstart = (REPO / 'README.md').read_text().split('```bash', 1)[1].split('```', 1)[0]
+    ledger_command = next(line for line in quickstart.splitlines() if 'mark_ledger.py' in line)
+    env['KHMS_CODE'] = str(clone)
+    run('bash', '-c', ledger_command)
+    assert (Path(env['KHMS_ROOT']) / 'memory/ledger/marks.jsonl').exists()
     recall = run('bash', str(tools / 'recall.sh'), '--lexical', 'onboarding checksum', ok=False)
     assert recall.returncode == 1 and 'nothing on record' in recall.stdout
     assert 'lexical' in recall.stdout.lower()
     hook = run('python3', str(tools / 'khms_hook.py'), input=json.dumps(
         {'hook_event_name': 'SessionStart', 'session_id': 'onboarding'}))
-    if hook.stdout.strip():
-        assert 'hookSpecificOutput' in json.loads(hook.stdout)
+    context = json.loads(hook.stdout)['hookSpecificOutput']['additionalContext']
+    assert 'base:' in context and 'verified:' in context and 'if I were wrong:' in context
+    assert 'mandatory reply lines' not in context and '-->' not in context
+    assert 'MARK coverage unavailable' not in context
+    assert 'no state' not in context and 'FileNotFoundError' not in context
     assert (Path(env['KHMS_ROOT']) / 'state/inject.log').exists()
     assert not (Path(env['KHMS_ROOT']) / 'tools').exists()
     assert not list(Path(env['KHMS_ROOT']).rglob('*.py'))

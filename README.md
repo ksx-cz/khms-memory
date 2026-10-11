@@ -37,11 +37,15 @@ export KHMS_CODE="$HOME/khms"
 export KHMS_ROOT="$HOME/.agent-memory"
 "$KHMS_CODE/tools/khms_init.sh" --register "$KHMS_ROOT"
 python3 "$KHMS_CODE/tools/build_views.py"
+python3 "$KHMS_CODE/tools/mark_ledger.py" sync
 "$KHMS_CODE/tools/recall.sh" --lexical "checksum mismatch"
 printf '%s\n' '{"hook_event_name":"SessionStart","session_id":"install-check"}' \
   | python3 "$KHMS_CODE/tools/khms_hook.py"
 tail "$(python3 "$KHMS_CODE/tools/khms_paths.py" KHMS_INJECT_LOG)"
 ```
+
+The ledger sync establishes MARK coverage from the journal before the first hook
+check. Run it again after journal changes to refresh coverage; it approves no cards.
 
 No cards are approved by initialization. An empty base returns "nothing on record"
 with recall exit 1; it is a successful empty search. Lexical recall needs no model or
@@ -54,7 +58,10 @@ for reviewed bootstrap cards and [Claude Code wiring](claude-code/README.md).
 Update the clone, leaving the data base in place. Pause scheduled jobs and active
 users of this clone first. A code-use lock prevents a running nightly, weekly,
 triage or export stage from overlapping the update; pause hooks and interactive
-commands too. Check that `git -C "$KHMS_CODE" status --porcelain` is empty, then:
+commands too. Explicitly stop the embedding daemon for this clone before the
+update: it holds the code-use lock for its entire lifetime, so waiting for an idle
+daemon will never release the lock. Use the deployment's normal daemon stop command.
+Check that `git -C "$KHMS_CODE" status --porcelain` is empty, then:
 
 ```bash
 git -C "$KHMS_CODE" fetch origin
@@ -64,12 +71,15 @@ lock="$(python3 "$KHMS_CODE/tools/khms_paths.py" --code-lock-file)"
 flock -n -x "$lock" git -C "$KHMS_CODE" merge --ff-only "$approved_sha"
 ```
 
-A lock refusal means the clone is in use: let that run finish and retry. The release gate is [.github/workflows/test.yml](.github/workflows/test.yml)
+A lock refusal means the clone is still in use. Identify the holder; let a finite
+job finish or stop the embedding daemon through its normal lifecycle command. Do
+not retry indefinitely. The release gate is [.github/workflows/test.yml](.github/workflows/test.yml)
 for that exact SHA. Do not select a moving branch tip after checking CI. A git
 refusal means the revision or history needs review; do not force reset.
 Keep the exclusive lock held for the whole code change, not only a check before it.
 After success, repeat the lexical recall and hook checks above, inspect the release
-notes for any explicit migration, and resume paused jobs. The base's configuration,
+notes for any explicit migration, then restart the embedding daemon through its
+normal lifecycle command and resume paused jobs. The base's configuration,
 cards, journal and state are retained; no code is copied into the base and no publish
 manifest is needed. A reader deployment can update its code without making data writable.
 

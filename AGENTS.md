@@ -26,8 +26,12 @@ export KHMS_CODE="$HOME/khms"
 export KHMS_ROOT="$HOME/.agent-memory"
 "$KHMS_CODE/tools/khms_init.sh" --register "$KHMS_ROOT"
 python3 "$KHMS_CODE/tools/build_views.py"
+python3 "$KHMS_CODE/tools/mark_ledger.py" sync
 "$KHMS_CODE/tools/recall.sh" --lexical "checksum mismatch"
 ```
+
+The ledger sync establishes MARK coverage from the journal before the first hook
+check. Run it again after journal changes to refresh coverage; it approves no cards.
 
 An empty base is a valid first install. Recall prints its lexical channel and
 "nothing on record" (exit 1 for no matches, not an installation failure). No model,

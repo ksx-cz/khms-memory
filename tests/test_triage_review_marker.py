@@ -131,7 +131,7 @@ def test_the_marker_repair_is_a_dry_run_first_idempotent_and_refuses_what_it_can
     assert wrong.returncode == 1 and "REFUSED" in wrong.stdout, wrong.stdout
 
 
-# Review FIX (Diblin, 2026-10-11), defect 2: `apply_triage.py --dry-run` writes the same `<stem>.applied.md` (K-05302),
+# Review FIX (Diblin, 2026-10-11), defect 2: `apply_triage.py --dry-run` writes the same `<stem>.applied.md`,
 # so its existence and mtime are no proof that the review was applied. The repair now requires the report's header to
 # say APPLIED for THIS unit, and checks and writes under the `cards` lock the apply writer holds.
 import fcntl  # noqa: E402

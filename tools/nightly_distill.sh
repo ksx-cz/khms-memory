@@ -192,7 +192,7 @@ BATCH_RETRY_MAX=${BATCH_RETRY_MAX:-2}
 # MEASURED: P209N, nights 10-02..10-06 — the sweep alone yielded 52-157 candidates and the stage
 # ran on 1 of 5 nights while the OPEN queue grew 2740 -> 4387; 2026-10-11 manual night — "648
 # candidate(s) already wait for consolidation (>= 225) — 42 chunk(s) left OPEN", no chunk at all,
-# 2537 OPEN marks untouched; and a failed sweep skipped the stage entirely. Owner (K-03350): no daily
+# 2537 OPEN marks untouched; and a failed sweep skipped the stage entirely. Policy: no daily
 # limit, everything in the queue is processed. So now: the stage is the night's FIRST model stage,
 # independent of the sweep's outcome and of how many candidates wait; it has its own budget
 # (MARK_BUDGET_MIN from its own start) and no candidate-count gate; every finished chunk is

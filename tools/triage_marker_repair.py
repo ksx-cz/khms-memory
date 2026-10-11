@@ -15,7 +15,7 @@ written as `sha256=<the unit's sha256 now>` -- the form the reader checks -- ONL
   * `<stem>.applied.md` exists beside the unit, is not older than the unit (the review was applied after the
     unit's last edit; a unit edited after its apply still owes a review), and is a GENUINE APPLIED report of THIS
     unit: its first line is `# apply_triage — <unit file name> (APPLIED <timestamp>)`. `apply_triage.py --dry-run`
-    writes the same file with `(DRY RUN …)` (K-05302), so existence and mtime alone prove nothing; a DRY RUN,
+    writes the same file with `(DRY RUN …)`, so existence and mtime alone prove nothing; a DRY RUN,
     malformed or other unit's report is refused (review FIX, 2026-10-11). A unit really applied whose report a
     later dry run overwrote is refused too -- the safe direction: apply it again;
   * the marker is absent, or is a legacy marker with no sha256 line. A marker that records the sha256 of OTHER

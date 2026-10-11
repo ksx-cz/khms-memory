@@ -4,6 +4,8 @@ The controls are generated at test time in a temporary directory -- never tracke
 the repository scan themselves; strings that would look like a credential are assembled at run time.
 """
 import os
+import importlib.util
+import re
 import shutil
 import subprocess
 import sys
@@ -50,6 +52,28 @@ class Boundary(unittest.TestCase):
     def test_diacritics_as_declared_data_are_allowed(self):
         p = self.write("data.py", "# boundary: allow-diacritics\nWORD = 'báze'\n")
         self.assertEqual(run("--scan-files", p).returncode, 0)
+
+
+    def test_reserved_invalid_email_only_is_exempt(self):
+        spec = importlib.util.spec_from_file_location("boundary_under_test", SCAN)
+        scanner = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(scanner)
+        # Synthetic addresses only; a private term table is never needed by CI.
+        email = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+")
+        for address in ("fixture@example.invalid", "test@sub.example.INVALID"):
+            self.assertEqual(scanner.term_hits("test.py", address, [("email", email)]), [])
+        for address in ("person" + "@" + "company.test", "fixture" + "@" + "example.invalid.company.test",
+                        "fixture" + "@" + "example.invalid-test"):
+            self.assertEqual(scanner.term_hits("test.py", address, [("email", email)]),
+                             [("test.py", 1, "email")])
+        # A truncated or overly broad private regex cannot hide a real address.
+        prefix = re.compile(r"fixture@example\.invalid")
+        self.assertEqual(scanner.term_hits("test.py", "fixture" + "@" + "example.invalid.company.test",
+                                           [("email", prefix)]), [("test.py", 1, "email")])
+        self.assertEqual(scanner.term_hits("test.py", "fixture@example.invalid",
+                                           [("person", email)]), [("test.py", 1, "person")])
+        self.assertEqual(scanner.term_hits("test.py", "fixture@example.invalid " + "person" + "@" + "company.test",
+                                           [("email", email)]), [("test.py", 1, "email")])
 
     def test_terms_mode_reports_class_never_value_and_needs_its_control(self):
         terms = self.write("terms.txt", "agent\tliteral\tZorblax\nhost\tregex\tsecret-host-\\d+\n"
