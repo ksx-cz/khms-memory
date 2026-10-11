@@ -1,5 +1,5 @@
 {
-  "_comment": "Merge into ~/.claude/settings.json (user-wide) or .claude/settings.json (project). Replace PATH_TO_KHMS with your KHMS_ROOT - hook commands do not expand shell variables. Remove the _comment keys. PostToolUse and PostToolUseFailure are deliberately absent: see claude-code/README.md and docs/measuring-injection.md.",
+  "_comment": "Merge into ~/.claude/settings.json (user-wide) or .claude/settings.json (project). Replace PATH_TO_KHMS with the absolute path to your code clone - hook commands do not expand shell variables. Remove the _comment keys. PostToolUse and PostToolUseFailure are deliberately absent: see claude-code/README.md and docs/measuring-injection.md.",
   "hooks": {
     "SessionStart": [
       {

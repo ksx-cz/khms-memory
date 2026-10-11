@@ -19,8 +19,15 @@ message and every tool call, so it must start fast and must never fail because a
 
 ## Wire the hooks
 
+Set `KHMS_ROOT` in the harness environment, or initialize with `--register` under
+that harness's HOME. Shell exports in a terminal do not configure an already
+running harness. Resolve state/log paths with `khms_paths.py`; configuration may
+place them outside the base. The example hook commands always execute clone code.
+
+
 Merge [`settings.hooks.json`](settings.hooks.json) into `~/.claude/settings.json` (user-wide) or
-`.claude/settings.json` (per project), replacing `PATH_TO_KHMS` with your `$KHMS_ROOT`. Hooks do
+`.claude/settings.json` (per project), replacing `PATH_TO_KHMS` with the absolute path to your code clone
+(`KHMS_CODE` in the onboarding examples), never the data base. Hooks do
 not expand `$VARS` in the command string, so the path is written out; that one absolute path is
 the only one in the whole system.
 
@@ -54,7 +61,7 @@ else: a substantial report with no `base:` line, and a `base:` line that cites c
 `src=cli` recall since the turn began matches the query it claims to have run. A line that cites
 no card, and every honest form ("did not search", "nothing on record"), always passes — the
 thing being checked is a CITATION, not the wording. Every verdict, including the allows, goes
-into `tools/.claim_gate.log`.
+into `KHMS_CLAIM_LOG` (default `state/claim_gate.log` in a private base).
 
 The hook returns `{"hookSpecificOutput": {"hookEventName": …, "additionalContext": …}}` — the
 text lands in the model's context for that turn. Printing nothing means "no injection", which is
@@ -106,12 +113,12 @@ score is a sum of inverse-document-frequency weights, so on a base of twenty car
 nothing reaches 18 and the floor never fires. Start around 8–10, watch `.inject.log` for a week,
 and raise them when injections start feeling like noise rather than help.
 
-**Everything the hook decides goes into `tools/.inject.log`**, including the silences, with the
+**Everything the hook decides goes into `KHMS_INJECT_LOG` (default `state/inject.log` in a private base)**, including the silences, with the
 reason a card above the bar was not injected (`dedup`, `cap`, `threshold`). This is not
 optional decoration: a hook that quietly stops firing is indistinguishable from a quiet day, and
 "the good card was there and stayed silent" has to be diagnosable after the fact.
 
-Kill switch, when injections are in the way: `touch $KHMS_ROOT/tools/.hooks-off`, or export
+Kill switch, when injections are in the way: `touch "$(python3 "$KHMS_CODE/tools/khms_paths.py" KHMS_HOOKS_OFF_FILE)"`, or export
 `KHMS_HOOKS_OFF=1`. Delete the file to re-enable. The hook also fails open on every exception:
 a broken memory system must never break the session it is trying to help.
 
@@ -127,11 +134,12 @@ is too broad, no lines at all means it is too narrow.
 ## Cron
 
 ```cron
-# nightly sweep — after the day's transcripts exist, before the operator's morning
-30 3 * * *  KHMS_ROOT=/path/to/base /path/to/base/tools/nightly_distill.sh  >> /path/to/base/tools/cron.log 2>&1
-# weekly synthesis — needs the week's inboxes to exist
-0  4 * * 0  KHMS_ROOT=/path/to/base /path/to/base/tools/weekly_synthesis.sh >> /path/to/base/tools/cron.log 2>&1
+# Daily: weekly follows a successful night and decides whether seven calendar days have elapsed.
+30 3 * * * KHMS_ROOT=/path/to/base /bin/bash -c '/path/to/clone/tools/nightly_distill.sh && /path/to/clone/tools/weekly_synthesis.sh' >> /path/to/base/state/cron.log 2>&1
 ```
+
+Do not add a second weekly timer: chaining avoids overlap with a long night and
+retries a due weekly after the next successful night.
 
 Cron gets a minimal environment: set `KHMS_ROOT` in the crontab line (as above), and set `HOME`
 if your agent CLI stores credentials under it. Both drivers are single-instance (`flock`) and
@@ -141,18 +149,19 @@ lost night into all of them.
 
 **Alert on staleness, not on failure.** A run that dies leaves no proposal file, and "no inbox
 today" looks exactly like "a quiet day with nothing to distill". Check the age of
-`tools/.last-nightly` and `tools/.last-weekly` (both written only on success) and say something
+`KHMS_NIGHT_STAMP` and `KHMS_WEEK_STAMP`
+(default `state/shared/last-nightly` and `state/shared/last-weekly`) (both written only on success) and say something
 when they exceed a day and a week respectively.
 
 ## Verifying the wiring
 
 ```bash
-echo '{"hook_event_name":"SessionStart","session_id":"t"}' | python3 $KHMS_ROOT/tools/khms_hook.py
+echo '{"hook_event_name":"SessionStart","session_id":"t"}' | python3 "$KHMS_CODE/tools/khms_hook.py"
 echo '{"hook_event_name":"UserPromptSubmit","prompt":"why does the checksum keep failing","session_id":"t"}' \
-  | python3 $KHMS_ROOT/tools/khms_hook.py
+  | python3 "$KHMS_CODE/tools/khms_hook.py"
 echo '{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"rm -rf ./build"},"session_id":"t"}' \
-  | python3 $KHMS_ROOT/tools/khms_hook.py
-tail $KHMS_ROOT/tools/.inject.log
+  | python3 "$KHMS_CODE/tools/khms_hook.py"
+tail "$(python3 "$KHMS_CODE/tools/khms_paths.py" KHMS_INJECT_LOG)"
 ```
 
 The third one should print the precheck block if any card carries the `filesystem` tag. Nothing
@@ -162,7 +171,7 @@ exists.
 Dry-run the pipeline without spending a single model token:
 
 ```bash
-NIGHTLY_DRYRUN=1 $KHMS_ROOT/tools/nightly_distill.sh
+NIGHTLY_DRYRUN=1 "$KHMS_CODE/tools/nightly_distill.sh"
 ```
 
 It assembles every deterministic input and prints the two stages' INPUTS blocks verbatim. Use it

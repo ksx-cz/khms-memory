@@ -16,19 +16,24 @@ Before you start, know the two rules that outrank convenience:
 
 ## Step 1 — Decide where memory lives, and set `KHMS_ROOT`
 
-Pick a directory *outside* the code you work on — memory outlives any one project. Everything
-below is relative to it. Every script in `tools/` reads the environment variable `KHMS_ROOT`
-and falls back to its own parent directory, so a copied `tools/` directory works with no edits.
+Keep a code clone and a separate data directory. `KHMS_CODE` below is a shell
+convenience naming the clone; tools resolve data through `KHMS_ROOT` or registration,
+never by copying tools into the base. Install Python 3 and PyYAML for view generation.
 
 ```bash
-export KHMS_ROOT="$HOME/.agent-memory"      # put this in your shell profile too
+git clone https://github.com/ksx-cz/khms-memory.git "$HOME/khms"
+export KHMS_CODE="$HOME/khms"
+export KHMS_ROOT="$HOME/.agent-memory"
+"$KHMS_CODE/tools/khms_init.sh" --register "$KHMS_ROOT"
+python3 "$KHMS_CODE/tools/build_views.py"
+"$KHMS_CODE/tools/recall.sh" --lexical "checksum mismatch"
 ```
 
-Create the layout; the tools stay in the clone and find the base through `khms_paths`:
-
-```bash
-git clone <this-repo> ~/khms && ~/khms/tools/khms_init.sh "$KHMS_ROOT"
-```
+An empty base is a valid first install. Recall prints its lexical channel and
+"nothing on record" (exit 1 for no matches, not an installation failure). No model,
+embedding service or network call is needed for this check. Persist `KHMS_CODE` in
+your shell profile; registration lets tools find the base without `KHMS_ROOT`.
+See [README.md](README.md#safe-code-updates) before updating the clone.
 
 `khms_init.sh` is idempotent and copies no code: it resolves the configuration every tool will
 use (environment, `KHMS_CONFIG_FILE`, `$KHMS_ROOT/config/khms.env`), refuses a reader
@@ -54,7 +59,9 @@ $KHMS_ROOT/
   memory/inbox/.staging/    what each pipeline stage was actually handed (forensics)
   memory/archive/know/      superseded and condensed cards — "fog", still greppable
   journal/YYYY-MM-DD.md     what happened today, written as it happens
-  tools/                    the scripts below; tools/.next_id is the ID counter
+  config/khms.env           optional settings; no executable code
+  state/                    agent logs and caches (default for a private base)
+  state/shared/next_id      card ID counter (default shared-state location)
 ```
 
 ## Step 2 — Learn the card format (this is the part you must not improvise)
@@ -118,12 +125,15 @@ Working examples of every shape: [examples/](examples/).
 
 ## Step 3 — Bootstrap the two cards the system needs about itself
 
-The knowledge base must contain its own instructions, because that is the copy retrieval can
-serve you later. Copy `spec/khms-spec.md` into a `policy` card (`tags: [khms, core]`,
-`level: derived`) and `spec/bootstrap-digest.md` into a second one. Then:
+The empty-base smoke check above does not approve cards. Prepare candidate cards
+in `memory/inbox/` describing the spec and bootstrap digest, with valid provenance:
+a derived policy requires non-empty `derived_from` pointing to approved observations.
+Do not paste the spec into `memory/know/` or invent evidence to satisfy the schema.
+Have your operator review the candidates, then use `approve_inbox.py` as described
+in Step 6. Until then, keep the spec and digest from this clone in context.
 
 ```bash
-"$KHMS_ROOT/tools/build_views.py"     # validates every card, regenerates views + MEMORY.md
+python3 "$KHMS_CODE/tools/build_views.py"  # validates cards, generates views + MEMORY.md
 ```
 
 `MEMORY.md` is generated — never edit it by hand, and never edit anything in `memory/views/`.
@@ -151,7 +161,7 @@ where to dig. A MARK costs you one line; a lost decision costs a re-derivation.
 ## Step 5 — Retrieval: a floor you install and a ceiling you owe
 
 **The floor** is mechanical. Hooks call `khms_hook.py` on session start, on every operator
-message, before file edits and shell commands, and after failed tool calls; it scores the text
+message, and before file edits and shell commands; it scores the text
 against the card base and injects at most a couple of cards, under a budget. It runs whether or
 not you remember it exists. Install it per [claude-code/README.md](claude-code/README.md).
 
@@ -213,20 +223,20 @@ expensive attention is spent only where it is needed.
    section with real attention; approve or fix the rest quickly. Then:
 
    ```bash
-   "$KHMS_ROOT/tools/approve_inbox.py" "$KHMS_ROOT/memory/inbox/$(date +%F).md"
-   "$KHMS_ROOT/tools/build_views.py"
+   "$KHMS_CODE/tools/approve_inbox.py" "$KHMS_ROOT/memory/inbox/$(date +%F).md"
+   "$KHMS_CODE/tools/build_views.py"
    ```
 
    `approve_inbox.py` STOPS at `## DEFERRED` and `## DROPPED` — the candidates the relation
    gate withheld are reported and not imported, and rescuing one means moving its block back
-   under `## Cards` by hand. It then allocates the sequential IDs from `tools/.next_id`,
+   under `## Cards` by hand. It then allocates the sequential IDs from `KHMS_SHARED_STATE/next_id`,
    rewrites temp cross-references, and writes the cards. It exits non-zero if any card failed to parse —
    treat a partial import as a failure, never as a finished one. It also **refuses the whole
    run, before allocating any ID, when a card says it corrects something without naming what**
    (`tools/khms_lint.py`): add the `contradicts` / `supersedes` / `refuted_by` edge it asks for
    and re-run. A correction only prose can see is one your retrieval will never reach. Finish
    with a two-sentence report to your operator in their language.
-5. **Weekly synthesis** (`tools/weekly_synthesis.sh`, cron Sunday ~04:00) + weekly review.
+5. **Weekly synthesis** (`tools/weekly_synthesis.sh`, after a successful night, due every seven calendar days) + weekly review.
    Proposes `principle` cards where three or more observations share a shape, puts contradicting
    patterns side by side with the cheapest experiment that would discriminate them, and ranks
    condensation candidates. Condensing is not deleting: the absorbing pattern must carry the
@@ -241,19 +251,19 @@ happened or did not, and that leaves a trace showing which.
 ## Step 7 — Verify the install
 
 ```bash
-"$KHMS_ROOT/tools/build_views.py"                 # -> "OK: N cards …"; non-zero = schema break
-"$KHMS_ROOT/tools/verify_relations.py" --self-test  # -> "SELFTEST OK — 12/12 cases"
-"$KHMS_ROOT/tools/recall.sh" checksum mismatch    # -> ranked cards, or "nothing on record"
-"$KHMS_ROOT/tools/precheck.sh" sensors            # -> policies/gotchas, or "nothing on record"
+"$KHMS_CODE/tools/build_views.py"                 # -> "OK: N cards …"; non-zero = schema break
+"$KHMS_CODE/tools/verify_relations.py" --self-test  # -> self-test passes
+"$KHMS_CODE/tools/recall.sh" --lexical checksum mismatch    # -> ranked cards, or "nothing on record"
+"$KHMS_CODE/tools/precheck.sh" sensors            # -> policies/gotchas, or "nothing on record"
 echo '{"hook_event_name":"UserPromptSubmit","prompt":"why do the checksums keep failing","session_id":"t1"}' \
-  | python3 "$KHMS_ROOT/tools/khms_hook.py"       # -> JSON with additionalContext, or nothing
-tail -3 "$KHMS_ROOT/tools/.inject.log"            # -> one line per hook firing, with the reason
+  | python3 "$KHMS_CODE/tools/khms_hook.py"       # -> JSON with additionalContext, or nothing
+tail -3 "$(python3 "$KHMS_CODE/tools/khms_paths.py" KHMS_INJECT_LOG)"            # -> one line per hook firing, with the reason
 ```
 
 The audit log is not decoration. A hook that silently stops firing looks exactly like a quiet
 day, so every firing records what it searched, what the top hit scored, and why anything above
 the bar was *not* injected (`dedup`, `cap`, `threshold`). Kill switch, when the injections are
-in your way: `touch "$KHMS_ROOT/tools/.hooks-off"` (or `KHMS_HOOKS_OFF=1`).
+in your way: `touch "$(python3 "$KHMS_CODE/tools/khms_paths.py" KHMS_HOOKS_OFF_FILE)"` (or `KHMS_HOOKS_OFF=1`).
 
 ## Step 8 — Calibrate, and keep the numbers out of the rules
 

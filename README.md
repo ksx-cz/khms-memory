@@ -25,6 +25,54 @@ deployment's values, not laws.
 - Wiring it into Claude Code (hooks, cron, dependencies)? → [claude-code/](claude-code/README.md).
 - Want to see cards before writing any? → [examples/](examples/) (fictional weather-station domain).
 
+## Quick start
+
+Python 3, PyYAML, git and Linux shell utilities are sufficient for this local
+check. Provision PyYAML first (for example, install your distribution's
+`python3-yaml` package). Keep the clone separate from the data directory:
+
+```bash
+git clone https://github.com/ksx-cz/khms-memory.git "$HOME/khms"
+export KHMS_CODE="$HOME/khms"
+export KHMS_ROOT="$HOME/.agent-memory"
+"$KHMS_CODE/tools/khms_init.sh" --register "$KHMS_ROOT"
+python3 "$KHMS_CODE/tools/build_views.py"
+"$KHMS_CODE/tools/recall.sh" --lexical "checksum mismatch"
+printf '%s\n' '{"hook_event_name":"SessionStart","session_id":"install-check"}' \
+  | python3 "$KHMS_CODE/tools/khms_hook.py"
+tail "$(python3 "$KHMS_CODE/tools/khms_paths.py" KHMS_INJECT_LOG)"
+```
+
+No cards are approved by initialization. An empty base returns "nothing on record"
+with recall exit 1; it is a successful empty search. Lexical recall needs no model or
+embedding service. Registration is scoped to HOME; hooks running as another user
+need their own registration or explicit `KHMS_ROOT`. Continue with [AGENTS.md](AGENTS.md)
+for reviewed bootstrap cards and [Claude Code wiring](claude-code/README.md).
+
+## Safe code updates
+
+Update the clone, leaving the data base in place. Pause scheduled jobs and active
+users of this clone first. A code-use lock prevents a running nightly, weekly,
+triage or export stage from overlapping the update; pause hooks and interactive
+commands too. Check that `git -C "$KHMS_CODE" status --porcelain` is empty, then:
+
+```bash
+git -C "$KHMS_CODE" fetch origin
+# Set this to the full commit SHA approved for release, with green test.yml CI for that SHA.
+approved_sha="<approved-full-commit-sha>"
+lock="$(python3 "$KHMS_CODE/tools/khms_paths.py" --code-lock-file)"
+flock -n -x "$lock" git -C "$KHMS_CODE" merge --ff-only "$approved_sha"
+```
+
+A lock refusal means the clone is in use: let that run finish and retry. The release gate is [.github/workflows/test.yml](.github/workflows/test.yml)
+for that exact SHA. Do not select a moving branch tip after checking CI. A git
+refusal means the revision or history needs review; do not force reset.
+Keep the exclusive lock held for the whole code change, not only a check before it.
+After success, repeat the lexical recall and hook checks above, inspect the release
+notes for any explicit migration, and resume paused jobs. The base's configuration,
+cards, journal and state are retained; no code is copied into the base and no publish
+manifest is needed. A reader deployment can update its code without making data writable.
+
 ## For humans: what problem this solves
 
 An agent that works with someone for months keeps re-deriving the same conclusions, repeating
