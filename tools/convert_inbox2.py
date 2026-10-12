@@ -5,6 +5,12 @@ Usage:
     convert_inbox2.py memory/inbox/DATE.md [OUT.md] [--date YYYY-MM-DD]
                       [--report FILE] [--quiet]
 
+Exit: 0 = every candidate-shaped heading of the input is a card of the output; 1 = no cards,
+a schema problem, or a heading the strict form did not take (its text was absorbed into the card
+before it -- NOT approve-ready); 4 = the output is valid, but N candidates stand under a trailer
+section (`## Dropped`, `## DROPPED (no valid RELATION)`, `## DEFERRED`, ...) and were not
+converted -- each has a `FLAG not converted:` line (report and stderr) and needs a decision (#232).
+
 Default OUT is the input with `.approve.md` instead of `.md`; default `--report`
 is OUT with `.report.txt`.  Reads nothing but the input, the tag registry and
 the spec's own rules; writes nothing but OUT and the report.  It never assigns
@@ -853,22 +859,66 @@ def convert(text, date, registry):
     return cards, rows
 
 
-def count_withheld(text):
-    """-> (candidates under ## DEFERRED, candidates under ## DROPPED*).
+# EVERY CANDIDATE IS ACCOUNTED FOR (#232; K-02720, its seventh instance). A LOOSE superset of the card
+# heading: any `##`/`###` heading whose first word is label-shaped -- `C1`, `C6A`, `M52031+M53017`, `F1` --
+# whatever follows it. Card ids (`### K-00011 …`, triage files) are not candidates and do not match.
+# On 2026-10-11 and 2026-10-12 a unit held candidates this converter did not turn into cards -- six with labels
+# the strict form does not know (`C6A`), one under the consolidate's own mixed-case `## Dropped` section that
+# the night's relation gate had filled -- and the report said `dropped: 0`, rc 0; the reviewers found them by
+# counting headings by hand. Now every candidate-shaped heading is either a converted card or a FLAG line.
+CANDIDATE_RE = re.compile(r"^(#{2,3}) +([A-Z][A-Za-z]?\d+[A-Za-z0-9]*(?:\+[A-Z][A-Za-z]?\d+[A-Za-z0-9]*)*)\b",
+                          re.M)
+SECTION_HEAD_RE = re.compile(r"^## +(.+?)\s*$", re.M)
 
-    Sections are delimited by the next top-level `## ` heading, so a DEFERRED
-    section followed by DROPPED counts each once.
-    """
-    out = []
-    for head in ("## DEFERRED", "## DROPPED"):
-        n = 0
-        for m in re.finditer(rf"^{re.escape(head)}.*$", text, re.M):
-            nxt = re.search(r"^## \S", text[m.end():], re.M)
-            end = m.end() + (nxt.start() if nxt else len(text) - m.end())
-            n += len(re.findall(r"^#{2,3} +[A-Z]\d+[a-z]?[:\s]",
-                                text[m.end():end], re.M))
-        out.append(n)
-    return tuple(out)
+
+def census(text):
+    """-> (n candidate headings, [(label, where, why)] for each one NOT converted).
+
+    `where` is the section heading it stands in; `why` is `absorbed into <label>` for a heading inside the
+    cards region that the strict form did not take (its text became part of the card before it -- the output
+    is wrong) or `withheld` for one under a trailer section (`## Dropped`, `## DROPPED (no valid RELATION)`,
+    `## DEFERRED`, ...: the output is right, a decision about the candidate is owed)."""
+    region = split_trailers(text)
+    converted = {m.start() for m in CARD_RE.finditer(region)}
+    heads = list(CANDIDATE_RE.finditer(text))
+    sections = [h for h in SECTION_HEAD_RE.finditer(text) if not CANDIDATE_RE.match(text, h.start())]
+    missed = []
+    for m in heads:
+        if m.start() in converted:
+            continue
+        secs = [h for h in sections if h.start() < m.start()]
+        where = "## " + secs[-1].group(1) if secs else "(no section)"
+        if m.start() < len(region):
+            prev = [c for c in CARD_RE.finditer(region) if c.start() < m.start()]
+            why = f"absorbed into {prev[-1].group(1)}" if prev else "absorbed into no card (lost)"
+        else:
+            why = "withheld"
+        missed.append((m.group(2), where, why))
+    return len(heads), missed
+
+
+def count_withheld(text):
+    """-> (candidates under a DEFERRED section, candidates under a DROPPED section), in ANY spelling.
+
+    `## Dropped` (the consolidate's own section, where the night's gate also puts its drops) counted as 0
+    until #232: only the upper-case `## DROPPED` was searched, so a gate-dropped candidate under the mixed-case
+    heading was reported as `dropped: 0` (2026-10-12, unit m07-b01)."""
+    _n, missed = census(text)
+    deferred = sum(1 for _l, where, why in missed if why == "withheld" and where.lower().startswith("## deferred"))
+    dropped = sum(1 for _l, where, why in missed if why == "withheld" and where.lower().startswith("## dropped"))
+    return deferred, dropped
+
+
+def census_lines(text, n_cards):
+    """-> (report lines, n absorbed, n withheld)."""
+    n_heads, missed = census(text)
+    lines = [f"candidate headings: {n_heads}, converted: {n_cards}, not converted: {len(missed)}"]
+    for label, where, why in missed:
+        lines.append(f"FLAG not converted: {label} under '{where}' -- {why}"
+                     + (" (the card before it now holds its text: NOT approve-ready)" if why.startswith("absorbed")
+                        else " (move it under ## Cards with a valid RELATION line, or leave it with a reason)"))
+    n_abs = sum(1 for m in missed if m[2].startswith("absorbed"))
+    return lines, n_abs, len(missed) - n_abs
 
 
 def expected_edges(rest):
@@ -1176,9 +1226,13 @@ def main(argv=None):
         date = str(dt.date.fromisoformat(m.group(1)) - dt.timedelta(days=1))
 
     registry = load_tags()
-    cards, rows = convert(open(a.src, encoding="utf-8").read(), date, registry)
+    src_text = open(a.src, encoding="utf-8").read()
+    cards, rows = convert(src_text, date, registry)
     if not cards:
         print(f"no cards found in {a.src}", file=sys.stderr)
+        c_lines, _a, _w = census_lines(src_text, 0)
+        for ln in c_lines[1:]:
+            print(ln, file=sys.stderr)
         return 1
     open(dst, "w", encoding="utf-8").write(render(cards))
 
@@ -1186,13 +1240,14 @@ def main(argv=None):
     # converter stops at those headings and would otherwise report a clean run
     # over a file whose gate rejected half of it — the shape of a check whose
     # passing condition holds whether or not anything happened.
-    src_text = open(a.src, encoding="utf-8").read()
     n_deferred, n_dropped = count_withheld(src_text)
+    c_lines, n_absorbed, n_withheld = census_lines(src_text, len(cards))
 
     lines = [f"convert_inbox2: {a.src} -> {dst}",
              f"{len(cards)} cards, knowledge date {date}",
              f"withheld by the night's own gate — deferred: {n_deferred}, "
              f"dropped: {n_dropped} (see ## DEFERRED / ## DROPPED in {a.src})",
+             *c_lines,
              "",
              "flags: t=type guessed (no body template)  e=evidence guessed (no "
              "VERIFIED line)", "       g=tags weak  s=scope ambiguous (agent vs "
@@ -1240,14 +1295,23 @@ def main(argv=None):
         lines.append(f"  all {n_rel} RELATION entr(y/ies) in {a.src} converted "
                      f"whole, every source line conserved")
     problems += split
+    problems += [ln for ln in c_lines[1:] if "absorbed" in ln]
     open(report_path, "w", encoding="utf-8").write("\n".join(lines) + "\n")
 
     if not a.quiet:
         print("\n".join(lines))
     print(f"\nwrote {len(cards)} cards -> {dst}\nreport -> {report_path}")
+    for ln in c_lines[1:]:
+        print(ln, file=sys.stderr)
     if problems:
         print(f"!! {len(problems)} schema problem(s) — NOT approve-ready", file=sys.stderr)
         return 1
+    if n_withheld:
+        # rc 4, not 0: rc 0 means "every candidate of the file is in the output"; the output is right, but
+        # a decision about the withheld candidate(s) is owed before the unit counts as reviewed (#232).
+        print(f"!! {n_withheld} candidate(s) withheld under a trailer section, not converted — "
+              f"see the FLAG lines; the approve file is valid for the rest", file=sys.stderr)
+        return 4
     print("next: read the report, fix what it flags, then "
           f"tools/approve_inbox.py {dst}")
     return 0

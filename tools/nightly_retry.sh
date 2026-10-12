@@ -74,7 +74,15 @@ retry_claude_call() {
     rc=0
     out=$(mktemp "${TMPDIR:-/tmp}/retry-out.XXXXXX")
     timeout --signal=TERM --kill-after=60s "$tmo" "$@" > "$out" 2>&1 || rc=$?
-    cat "$out" >> "$log"
+    # RETRY_RESULT_TOOL (#232): when set (nightly_distill.sh sets agent_result.py), every attempt's output is
+    # logged through it -- the call's answer, then ONE `<stage> served-by: <model>` line read from the CLI's
+    # JSON result (UNKNOWN when there is none), appended to RETRY_SERVED_FILE too. Unset = logged verbatim.
+    if [ -n "${RETRY_RESULT_TOOL:-}" ] && [ -f "$RETRY_RESULT_TOOL" ]; then
+      python3 "$RETRY_RESULT_TOOL" --stage "$stage" --attempt "$attempt/$max_attempts" --rc "$rc" \
+        ${RETRY_SERVED_FILE:+--served-file "$RETRY_SERVED_FILE"} "$out" >> "$log" 2>&1 || cat "$out" >> "$log"
+    else
+      cat "$out" >> "$log"
+    fi
     if [ "$rc" -ne 0 ] && grep -qiE "$RETRY_LIMIT_RE" "$out"; then
       echo "$(date -Is) $stage USAGE LIMIT on attempt $attempt/$max_attempts (rc=$rc): $(grep -m1 -iE "$RETRY_LIMIT_RE" "$out" | head -c 200) — not retried$([ -n "$flag" ] && echo "; no further model call starts in this run ($flag)")" >> "$log"
       if [ -n "$flag" ]; then echo "$(date -Is) $stage: $(grep -m1 -iE "$RETRY_LIMIT_RE" "$out" | head -c 200)" > "$flag"; fi

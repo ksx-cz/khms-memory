@@ -23,6 +23,8 @@ FAKE = r'''#!/usr/bin/env python3
 # Fake agent CLI: sweep / MARK stage / consolidate, by the shape of the prompt (`-p <prompt>`).
 import json, os, re, sys
 args = sys.argv[1:]
+if args[:1] == ["--version"]:        # a real run logs the agent's version once (#232); not a stage call
+    print("0.0.0 (fake agent)"); sys.exit(0)
 prompt = args[args.index("-p") + 1] if "-p" in args else ""
 def field(rx):
     m = re.findall(rx, prompt, re.M)
@@ -327,6 +329,8 @@ WFAKE = r'''#!/usr/bin/env python3
 # (the records read_coverage.py checks) except paths containing FAKE_SKIP_READ, then writes its output.
 import json, os, re, sys
 args = sys.argv[1:]
+if args[:1] == ["--version"]:
+    print("0.0.0 (fake weekly agent)"); sys.exit(0)
 prompt = args[args.index("-p") + 1]
 sid = args[args.index("--session-id") + 1]
 out = re.findall(r"^OUTPUT FILE: (.+)$", prompt, re.M)[-1].strip()

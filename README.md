@@ -185,7 +185,9 @@ never queued again.
 ### A night longer than its budget resumes, it does not start over
 
 The nightly sweep reads one window of sources (since the night stamp) in parts,
-one fresh model session per part (`SWEEP_GROUP_CHUNKS`). When a window has more
+one fresh model session per part (`SWEEP_GROUP_CHUNKS`). Each stage counts its time
+budget from its OWN start (`MARK_BUDGET_MIN`, `SWEEP_BUDGET_MIN`, `CARD_BUDGET_MIN`), so a
+long MARK stage cannot eat the sweep's time. When a window has more
 parts than one night's `SWEEP_BUDGET_MIN` covers, the finished parts are kept:
 
 - Before part 1, the run freezes the window's input list in

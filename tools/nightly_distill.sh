@@ -26,7 +26,9 @@
 #   KHMS_CHAT_FETCH      argv run first to refresh a chat archive (its own config names the archive)
 #   KHMS_CHAT_VERIFY     argv run with `--journal <journal dir>`: principal quotes checked against chat
 #   journal/             always
-# STAGES: KHMS_AGENT (headless CLI, called as `<agent> -p <prompt> --model M --allowedTools ...`),
+# STAGES: KHMS_AGENT (headless CLI, an ABSOLUTE path -- a bare name only with KHMS_AGENT_FROM_PATH=1 --
+#   called as `<agent> -p <prompt> --output-format json --model M --allowedTools ...`; each call logs the
+#   model that served it, read from that JSON by agent_result.py),
 #   KHMS_SWEEP_MODEL, KHMS_MARK_MODEL, KHMS_CONS_MODEL; KHMS_NIGHT_TRIAGE = argv of the optional
 #   standing-base triage stage. Prompts: prompts/<stage>.md rendered by khms_prompt.py (private
 #   extensions from KHMS_PROMPT_EXT). An agent CLI that is not executable FAILS the night's model
@@ -41,7 +43,15 @@ python3 "$CODE/khms_health.py" || exit 3
 khms_require_writable "run the nightly sweep" || exit $?
 ROOT=$(khms_get KHMS_ROOT)
 AGENT=$(khms_get KHMS_AGENT)
-AGENT_BIN=$(command -v -- "$AGENT" 2>/dev/null || true)
+# THE AGENT CLI (#232): an absolute KHMS_AGENT, or a bare name ONLY with KHMS_AGENT_FROM_PATH=1
+# (khms_agent_resolve in khms_paths.sh). A refused or missing agent leaves AGENT_BIN empty, and every model
+# stage of the night FAILS visibly below (nothing stamped) -- the PATH lookup that served an older model for
+# two nights in October 2026 is not a fallback.
+khms_agent_resolve || true
+AGENT_BIN=$KHMS_AGENT_BIN
+# The triage stage judges with the same CLI the night just verified (nightly_triage.sh resolves it the same
+# way when it runs on its own).
+if [ -n "$AGENT_BIN" ] && [ -z "${KHMS_CLAUDE_BIN:-}${NIGHTLY_CLAUDE_BIN:-}" ]; then export KHMS_CLAUDE_BIN=$AGENT_BIN; fi
 SWEEP_MODEL=$(khms_get KHMS_SWEEP_MODEL)
 MARK_MODEL=$(khms_get KHMS_MARK_MODEL)
 CONS_MODEL=$(khms_get KHMS_CONS_MODEL)
@@ -104,18 +114,23 @@ SWEEP_GROUP_CHUNKS=${SWEEP_GROUP_CHUNKS:-1}
 # A call that exceeds its limit is killed by timeout(1) and logged by nightly_retry.sh as
 # "FAILED after N/N attempts (rc=124 = TIMEOUT)"; the night then ends "nightly INCOMPLETE".
 SWEEP_TIMEOUT=${SWEEP_TIMEOUT:-75m}
-# THE SWEEP'S OVERALL DEADLINE (K209H, REV209 F8), minutes after the run's start. Until then a
-# multi-part sweep had no total bound: K parts x 3 attempts x SWEEP_TIMEOUT, on a service with no
-# timeout. No sweep part and no retry attempt STARTS after it, and a started attempt is clipped to
-# it (RETRY_DEADLINE_EPOCH in nightly_retry.sh). 150: the single-call sweep measured 9–38 min, so
-# a healthy night is far inside it, and it leaves the consolidate budget (CARD_BUDGET_MIN, +180)
-# half an hour of its own. A sweep stopped by it FAILS like any other (no stamp, window kept; since
+# THE SWEEP'S OVERALL DEADLINE (K209H, REV209 F8), minutes after THE SWEEP STAGE'S OWN START (#232; until
+# 2026-10-12 after the RUN's start). Until K209H a multi-part sweep had no total bound: K parts x 3 attempts x
+# SWEEP_TIMEOUT, on a service with no timeout. No sweep part and no retry attempt STARTS after it, and a
+# started attempt is clipped to it (RETRY_DEADLINE_EPOCH in nightly_retry.sh).
+# WHY FROM ITS OWN START: since PMARKFIRST the MARK stage runs first and uses its whole 90 min plus the
+# overrun of its last chunk (2026-10-12: 03:32:33 -> 05:13:18), so a deadline counted from 03:30 left the
+# sweep ~47 of its 150 minutes and it stopped at part 6 of 31 (ISWEEP12). Each stage now owns its budget.
+# 180 = THE RULE ABOVE on the worst measured DAY, not on one call: the largest digest (1109 KB, 2026-10-05)
+# is ~44 one-chunk parts, and the p95 part on a healthy CLI is 121 s (2026-10-11-2: 51 parts, median 81 s,
+# p95 121 s, claude-sonnet-5-5) -> 44 x 121 s = 89 min -> 2 x 89 = 178 -> 180. (The old 150 was sized for
+# the single-call sweep, 9–38 min.) A sweep stopped by it FAILS like any other (no stamp, window kept; since
 # #173 its finished parts are KEPT and the next run continues the frozen list -- see THE FROZEN PREPARE
 # LIST below), and
 # every failed sweep is recorded in KHMS_SWEEP_FAILED, which a morning review ping reads aloud
 # until a sweep succeeds — a part that always fails on a growing window surfaces instead of
 # looping silently.
-SWEEP_BUDGET_MIN=${SWEEP_BUDGET_MIN:-150}
+SWEEP_BUDGET_MIN=${SWEEP_BUDGET_MIN:-180}
 SWEEP_FAILED_FILE=$(khms_get KHMS_SWEEP_FAILED)
 # PER BATCH since 2026-10-01 (board #209, see "NO CARD CAP" below). Until then it was one
 # 100m call for the whole night (2026-08-24: 103 candidates, 70 cards written before a 60m
@@ -127,9 +142,13 @@ SWEEP_FAILED_FILE=$(khms_get KHMS_SWEEP_FAILED)
 # RE-MEASURED on the first five uncapped nights (P209N): 29 batches took 4.8-38.9 min, and the
 # slowest was a 12-candidate batch (2026-10-05, consout-2026-10-04-06) — duration does not follow
 # batch size, so the rate-based 45m left 1.16x headroom. 80m = 2 x 38.9 rounded up (rule above).
-# Worst case with BATCH_RETRY_MAX=2: a batch started just before CARD_DEADLINE (+225 since P209M) ends
-# by +225+160 = +385 min, triage (TRIAGE_TIMEOUT 120m) by ~+505 = ~11:55 — inside the weekly's wait,
-# which starts at 04:00 (+30) and lasts WEEKLY_NIGHT_WAIT_MIN 480 min, i.e. until +510 (12:00).
+# Worst case with BATCH_RETRY_MAX=2: a batch started just before CARD_DEADLINE ends 2 x 80m + 30 s later.
+# THE NIGHT'S LENGTH SINCE #232 (every stage counts its budget from its own start): MARK <= 90 + one chunk
+# (<= 2 x 30m) ~ +151, sweep exactly +180 (clipped) -> +331, consolidation 280 + its last batch 160 -> +772,
+# triage <= 120m -> ~+892 min (~18:20) -- only when EVERY stage runs at twice its worst measured length. A
+# measured heavy night is ~+2 +105 +89 +139 +59 = ~+394 (~10:05), a typical one ~08:00. The weekly started by
+# its Sunday 04:00 timer waits WEEKLY_NIGHT_WAIT_MIN 480 min (until 12:00) and fails after it; the weekly
+# started by the deployment AFTER a successful night does not wait at all.
 CONSOLIDATE_TIMEOUT=${CONSOLIDATE_TIMEOUT:-80m}
 CONSOLIDATE_BATCH=${CONSOLIDATE_BATCH:-25}
 
@@ -170,19 +189,19 @@ CARRY=$ROOT/memory/ledger/carry
 # put 138-157 candidates over the former MARK_PENDING_MAX (see THE MARK STAGE RUNS FIRST below).
 MARK_CHUNK=${MARK_CHUNK:-60}
 MARK_TIMEOUT=${MARK_TIMEOUT:-30m}
-# Wall-clock budgets: no NEW mark chunk later than MARK_BUDGET_MIN after the START OF THE MARK
-# STAGE (it is the night's first model stage, so that is ~+0..+5 min after 03:30); no NEW sweep
-# part after +SWEEP_BUDGET_MIN and no NEW consolidate batch after +225 (07:15), both counted from
-# the run's start, as before — the night's total budget is unchanged, the MARK stage only gets its
-# share first. A started chunk/part/batch is bounded by its own timeout. Triage (31–59 min
-# measured, P209N) runs after, so a full night ends by ~08:30.
-# CARD_BUDGET_MIN was 180 until P209M (#209, reviewed budget increase: the night may write
-# more cards). Sized for ~225 candidates (9 batches of 25) at the measured 12.5-19.6 min per batch
-# (P209N: 75-139 min for 6-9 batches), i.e. ~115-175 min, started after the MARK stage and the
-# sweep, and its last batch must still be allowed to START: +225. A night that does not finish its
-# batches carries them; the carry queue is the next night's consolidation, done oldest first.
+# Wall-clock budgets, EACH COUNTED FROM THE START OF ITS OWN STAGE (#232): no NEW mark chunk later than
+# MARK_BUDGET_MIN after the MARK stage starts, no NEW sweep part later than SWEEP_BUDGET_MIN after the sweep
+# starts, no NEW consolidate batch later than CARD_BUDGET_MIN after the consolidation starts. Until
+# 2026-10-12 the sweep (+150) and the consolidation (+225) counted from the run's start, so a long MARK stage
+# ate their time (ISWEEP12: the sweep got ~47 min). A started chunk/part/batch is bounded by its own timeout.
+# Triage (31–59 min measured, P209N) runs after. The night's worst case is above (CONSOLIDATE_TIMEOUT).
+# CARD_BUDGET_MIN: THE RULE ABOVE on the longest measured consolidation STAGE: 139 min (P209N, 6-9 batches
+# a night, 2026-10-02..06, 75-139 min; for scale 2026-10-11-2: 26 batches in 120 min, 2026-10-12: 7 in 48)
+# -> 2 x 139 = 278 -> 280. (It was 180, then 225 from the run's start since P209M, i.e. what was left after
+# the stages before it.) A night that does not finish its batches carries them; the carry queue is the next
+# night's consolidation, done oldest first.
 MARK_BUDGET_MIN=${MARK_BUDGET_MIN:-90}
-CARD_BUDGET_MIN=${CARD_BUDGET_MIN:-225}
+CARD_BUDGET_MIN=${CARD_BUDGET_MIN:-280}
 # Attempts per batch/chunk (the sweep keeps nightly_retry.sh's default 3): a batch that
 # fails twice is carried, and the next one is tried rather than spending the night on it.
 BATCH_RETRY_MAX=${BATCH_RETRY_MAX:-2}
@@ -239,9 +258,9 @@ RUN_START=$(date -Is)
 RUN_START_EPOCH=$(date +%s)
 # Only the holder writes the lock file (see THE LOCK above); the night key follows once claimed.
 [ "$DRYRUN" = "1" ] || printf 'nightly %s pid=%s\n' "$RUN_START" "$$" > "$LOCK"
-# MARK_DEADLINE is set when the MARK stage STARTS (step 1e), from that moment, not from here.
-SWEEP_DEADLINE=$((RUN_START_EPOCH + ${SWEEP_BUDGET_S:-$((SWEEP_BUDGET_MIN * 60))}))   # _S: test seam
-CARD_DEADLINE=$((RUN_START_EPOCH + CARD_BUDGET_MIN * 60))
+# MARK_DEADLINE, SWEEP_DEADLINE and CARD_DEADLINE are set when their stage STARTS, from that moment (#232).
+SWEEP_BUDGET_SEC=${SWEEP_BUDGET_S:-$((SWEEP_BUDGET_MIN * 60))}   # _S: test seams
+CARD_BUDGET_SEC=${CARD_BUDGET_S:-$((CARD_BUDGET_MIN * 60))}
 # RUN IDENTITY (review P1-4, 2026-10-01). Everything this run writes — staging inputs, carry
 # batches, published inbox units — is named by its NIGHT KEY, not by DATE: the first run of a
 # date gets NK=DATE (the historic names), a second run of the same date gets DATE-2, then
@@ -263,6 +282,18 @@ else
   printf 'nightly %s pid=%s nk=%s\n' "$RUN_START" "$$" "$NK" > "$LOCK"
 fi
 echo "$RUN_START nightly start (night key $NK)" >> "$LOG"
+# THE AGENT, ONCE PER REAL RUN (#232): which file runs the stages and what it says its version is. A model
+# alias (`sonnet`) maps to a different model in another CLI version, so the version is half of the answer;
+# the other half is the `served-by:` line every model call writes (agent_result.py, from the CLI's JSON).
+if [ -n "$AGENT_BIN" ]; then
+  _ver=$(timeout 30 "$AGENT_BIN" --version 2>&1 | head -1 || true)
+  echo "$(date -Is) agent: $AGENT_BIN ($KHMS_AGENT_WHY) version: ${_ver:-UNKNOWN (no answer to --version)}" >> "$LOG"
+else
+  echo "$(date -Is) $KHMS_AGENT_WHY" >> "$LOG"
+fi
+export RETRY_RESULT_TOOL=$CODE/agent_result.py
+export RETRY_SERVED_FILE=$STAGING/.served-$NK
+rm -f "$RETRY_SERVED_FILE"
 # THE USAGE-LIMIT FLAG (PDRAIN, #209; P209N A-4): retry_claude_call writes it on the first
 # "You've hit your … limit" answer and then refuses every later model call of this run (rc 75), and
 # the stage loops below stop at it with ONE line instead of attempting every chunk and batch.
@@ -800,8 +831,8 @@ if [ "$DRYRUN" = "1" ]; then
     "$(wc -l < "$GITLOG_INDEX" 2>/dev/null || echo 0)"
   printf 'sweep parts: %s (one sweep call per part of <= %s chunks; 0 = one call, prompt as below)\n' \
     "${#SWEEP_GROUP_FILES[@]}" "$SWEEP_GROUP_CHUNKS"
-  printf 'sweep: timeout %s per call; deadline: no sweep part or retry attempt starts after %s (+%s s); failed sweeps so far: %s\n' \
-    "$SWEEP_TIMEOUT" "$(date -d @"$SWEEP_DEADLINE" +%H:%M)" "$((SWEEP_DEADLINE - RUN_START_EPOCH))" \
+  printf 'sweep: timeout %s per call; deadline: no sweep part or retry attempt starts later than %s s after the sweep stage starts; failed sweeps so far: %s\n' \
+    "$SWEEP_TIMEOUT" "$SWEEP_BUDGET_SEC" \
     "$(grep -c . "$SWEEP_FAILED_FILE" 2>/dev/null || echo 0)"
   echo
   if [ -n "$RESUME" ]; then
@@ -821,7 +852,7 @@ if [ "$DRYRUN" = "1" ]; then
   carry_batches | sed 's|^|    * |'
   echo "  tonight's sweep is split into batches committed atomically as $CARRY/<night key>/cons-NN.md"
   echo "  each consolidated batch is published as its own immutable inbox unit memory/inbox/<night key>-bNN.md (record: $RECORD)"
-  echo "  per batch: timeout $CONSOLIDATE_TIMEOUT, $BATCH_RETRY_MAX attempt(s); no new batch after $(date -d @"$CARD_DEADLINE" +%H:%M)"
+  echo "  per batch: timeout $CONSOLIDATE_TIMEOUT, $BATCH_RETRY_MAX attempt(s); no new batch later than $((CARD_BUDGET_SEC / 60)) min after the consolidation starts"
   echo "  INPUTS block of a batch (verbatim shape):"
   consolidate_inputs "$CARRY/$NK/cons-01.md" "$NK" 1 "$STAGING/nightly-consout-$NK-01.md" | sed 's|^|    |'
   echo
@@ -848,7 +879,7 @@ if [ "$DRYRUN" = "1" ]; then
   echo "                             python3 $CODE/verify_relations.py <batch output>   (no --max: NO CARD CAP)"
   python3 "$CODE/verify_relations.py" --self-test || true
   echo
-  echo "--- agent: ${AGENT_BIN:-NOT EXECUTABLE ($AGENT) — the model stages would FAIL}; models sweep=$SWEEP_MODEL marks=$MARK_MODEL consolidate=$CONS_MODEL"
+  echo "--- agent: ${AGENT_BIN:+$AGENT_BIN ($KHMS_AGENT_WHY)}${AGENT_BIN:-$KHMS_AGENT_WHY — the model stages would FAIL}; models sweep=$SWEEP_MODEL marks=$MARK_MODEL consolidate=$CONS_MODEL (aliases; each call logs the model that served it)"
   echo "--- TRIAGE stage (step 4b) — delegated dry run ---"
   if [ ${#TRIAGE_CMD[@]} -gt 0 ]; then
     NIGHTLY_DRYRUN=1 "${TRIAGE_CMD[@]}" || true
@@ -962,7 +993,7 @@ INPUTS:
 - knowledge base (grep before carding): $ROOT/memory/know
 OUTPUT FILE: $MOUT"
   if RETRY_MAX_ATTEMPTS=$BATCH_RETRY_MAX retry_claude_call "marks-$MK" "$MARK_TIMEOUT" "$LOG" "$STAGE_MARK" -- \
-       "$AGENT" -p "$MPROMPT" "${STAGE_ISOLATION[@]}" --model "$MARK_MODEL" --allowedTools $TOOLS; then
+       "$AGENT_BIN" -p "$MPROMPT" "${STAGE_ISOLATION[@]}" --output-format json --model "$MARK_MODEL" --allowedTools $TOOLS; then
     if [ -s "$MOUT" ]; then
       if ! mark_commit "$MOUT" "$MKEY" "$MK"; then
         FAILED_STAGES="$FAILED_STAGES marks-$MK"
@@ -985,13 +1016,16 @@ OUTPUT FILE: $MOUT"
 done
 
 SWEEP_OK=1
+# THE SWEEP'S OWN DEADLINE (#232): counted from here, after the MARK stage, not from the run's start.
+SWEEP_DEADLINE=$(( $(date +%s) + SWEEP_BUDGET_SEC ))
+echo "$(date -Is) === sweep === no new part after $(date -d @"$SWEEP_DEADLINE" +%H:%M:%S) (+$((SWEEP_BUDGET_SEC / 60)) min from this stage's start)" >> "$LOG"
 if [ -z "$AGENT_BIN" ]; then
   # No model can run tonight: the sweep FAILS (no stamp, the window is swept again), queued marks
   # stay OPEN and carried batches stay in the carry queue; only work that needs no model call
   # (publishing an already durable batch output) still happens below.
   SWEEP_OK=0
   FAILED_STAGES="$FAILED_STAGES agent-unavailable"
-  echo "$(date -Is) AGENT UNAVAILABLE: '$AGENT' (KHMS_AGENT) is not an executable command — every model stage of this night FAILS; nothing is stamped" >> "$LOG"
+  echo "$(date -Is) $KHMS_AGENT_WHY — every model stage of this night FAILS; nothing is stamped" >> "$LOG"
 elif [ -n "$SOURCE_FAILED" ]; then
   # A configured source could not be read (step 1 above): the window is incomplete, so it is not
   # swept and not committed; the stamp stays where it was and the next night collects it again.
@@ -1046,16 +1080,16 @@ elif [ ${#SWEEP_GROUP_FILES[@]} -gt 0 ]; then
     if limit_stop "sweep parts $_k..$_K"; then SWEEP_OK=0; break; fi
     if [ "$(date +%s)" -ge "$SWEEP_DEADLINE" ]; then
       SWEEP_OK=0
-      echo "$(date -Is) sweep part $_k/$_K NOT STARTED — the sweep deadline $(date -d @"$SWEEP_DEADLINE" +%H:%M) (+${SWEEP_BUDGET_MIN} min) has passed; the sweep is incomplete" >> "$LOG"
+      echo "$(date -Is) sweep part $_k/$_K NOT STARTED — the sweep deadline $(date -d @"$SWEEP_DEADLINE" +%H:%M:%S) (+$((SWEEP_BUDGET_SEC / 60)) min from the sweep's start) has passed; the sweep is incomplete" >> "$LOG"
       break
     fi
     # no valid record: whatever an earlier, killed attempt left is not this part's output
     rm -f "$_rec" "$_gout" "${_gout%.md}-part"*.md "${_gout%.md}-final.md"
     echo "$(date -Is) sweep part $_k/$_K: $(grep -c . "$_gf") chunk(s) -> $_gout" >> "$LOG"
     if ! RETRY_DEADLINE_EPOCH=$SWEEP_DEADLINE retry_claude_call "sweep-$_k" "$SWEEP_TIMEOUT" "$LOG" "$STAGE_MARK" -- \
-         "$AGENT" -p "$SWEEP_BASE
+         "$AGENT_BIN" -p "$SWEEP_BASE
 
-$(sweep_group_inputs "$_k" "$_K" "$_gf" "$_gout")" "${STAGE_ISOLATION[@]}" --model "$SWEEP_MODEL" --allowedTools $TOOLS; then
+$(sweep_group_inputs "$_k" "$_K" "$_gf" "$_gout")" "${STAGE_ISOLATION[@]}" --output-format json --model "$SWEEP_MODEL" --allowedTools $TOOLS; then
       SWEEP_OK=0
       echo "$(date -Is) sweep part $_k/$_K FAILED — the sweep is incomplete; parts after it are not started" >> "$LOG"
     fi
@@ -1096,7 +1130,7 @@ $(sweep_group_inputs "$_k" "$_K" "$_gf" "$_gout")" "${STAGE_ISOLATION[@]}" --mod
   fi
 else
 RETRY_DEADLINE_EPOCH=$SWEEP_DEADLINE retry_claude_call sweep "$SWEEP_TIMEOUT" "$LOG" "$STAGE_MARK" -- \
-  "$AGENT" -p "$SWEEP_PROMPT" "${STAGE_ISOLATION[@]}" --model "$SWEEP_MODEL" --allowedTools $TOOLS || SWEEP_OK=0
+  "$AGENT_BIN" -p "$SWEEP_PROMPT" "${STAGE_ISOLATION[@]}" --output-format json --model "$SWEEP_MODEL" --allowedTools $TOOLS || SWEEP_OK=0
 # max_tokens guard over the LAST attempt (STAGE_MARK is re-stamped by each attempt).
 # Report, not gate: `|| true` keeps a check that is meant to be non-fatal from killing the run
 # under `set -e` (already paid for once, with weeks of lost nights).
@@ -1309,6 +1343,9 @@ finish_batch() {    # the carry cleanup — repeatable, the batch is already pub
 }
 CB=0; CB_DONE=0; CB_LEFT=0; CB_LIMIT=0
 PUBLISHED_UNITS=()
+# THE CONSOLIDATION'S OWN DEADLINE (#232): counted from here, after the MARK stage and the sweep.
+CARD_DEADLINE=$(( $(date +%s) + CARD_BUDGET_SEC ))
+echo "$(date -Is) === consolidate === $(carry_batches | wc -l) batch(es) in the carry queue; no new batch after $(date -d @"$CARD_DEADLINE" +%H:%M:%S) (+$((CARD_BUDGET_SEC / 60)) min from this stage's start)" >> "$LOG"
 : > "$PROPOSED_SO_FAR"
 mapfile -t CBATCHES < <(carry_batches)
 for B in "${CBATCHES[@]}"; do
@@ -1361,7 +1398,7 @@ for B in "${CBATCHES[@]}"; do
   if [ -s "$RETRY_LIMIT_FLAG" ]; then CB_LIMIT=$((CB_LIMIT + 1)); continue; fi
   if [ "$(date +%s)" -ge "$CARD_DEADLINE" ]; then
     CB_LEFT=$(carry_batches | wc -l)
-    echo "$(date -Is) consolidate budget of ${CARD_BUDGET_MIN} min reached — $CB_LEFT batch(es) stay in $CARRY for the next night" >> "$LOG"
+    echo "$(date -Is) consolidate budget of $((CARD_BUDGET_SEC / 60)) min (from its own start) reached — $CB_LEFT batch(es) stay in $CARRY for the next night" >> "$LOG"
     break
   fi
   if [ -z "$AGENT_BIN" ]; then
@@ -1374,7 +1411,7 @@ for B in "${CBATCHES[@]}"; do
 
 $(consolidate_inputs "$B" "$BD" "$CB" "$BOUT")"
   if RETRY_MAX_ATTEMPTS=$BATCH_RETRY_MAX retry_claude_call "consolidate-$BD-$BNN" "$CONSOLIDATE_TIMEOUT" "$LOG" "$STAGE_MARK" -- \
-       "$AGENT" -p "$CPROMPT" "${STAGE_ISOLATION[@]}" --model "$CONS_MODEL" --allowedTools $TOOLS; then
+       "$AGENT_BIN" -p "$CPROMPT" "${STAGE_ISOLATION[@]}" --output-format json --model "$CONS_MODEL" --allowedTools $TOOLS; then
     if [ -s "$BOUT" ]; then
       postprocess_batch "$BOUT" "$BD" "$BID"
       cp "$BOUT" "$DUR.tmp" && mv "$DUR.tmp" "$DUR"
@@ -1433,6 +1470,9 @@ ledger sync >> "$LOG" 2>&1 || echo "$(date -Is) mark ledger sync (post) FAILED (
 # clone's code-use lock, nested in this run's), and run_triage_stage keeps it non-fatal under
 # `set -euo pipefail`. Unconfigured, the log says so. A quiet night runs it too (above).
 run_triage_stage
+# THE NIGHT'S MODELS (#232): one line, per stage family, of the models that actually served (from each
+# call's served-by line); the morning review ping repeats it with the triage judge's.
+echo "$(date -Is) models served this night: $(python3 "$CODE/agent_result.py" --summary "$RETRY_SERVED_FILE")" >> "$LOG"
 
 # THE STAMP (board #209): written right after the sweep's candidates were persisted in the carry
 # queue (step 2e), never when the SWEEP failed — then the window stays open so the NEXT run's

@@ -121,8 +121,12 @@ weekly_fail() {   # weekly_fail <why> — the run fails visibly and leaves no ou
 FINAL_OUT=$ROOT/memory/inbox/$DATE-weekly.md
 # The model and review gates write privately; publish only the completed proposal.
 OUT=$STAGING/weekly-$DATE-merge.md
-AGENT_BIN=$(command -v -- "$AGENT" 2>/dev/null || true)
-[ -n "$AGENT_BIN" ] || weekly_fail "AGENT UNAVAILABLE: '$AGENT' (KHMS_AGENT) is not an executable command"
+# THE AGENT CLI (#232): an absolute KHMS_AGENT, or a bare name only with KHMS_AGENT_FROM_PATH=1
+# (khms_agent_resolve, khms_paths.sh) -- never a silent PATH lookup; its path and version are logged once.
+khms_agent_resolve || true
+AGENT_BIN=$KHMS_AGENT_BIN
+[ -n "$AGENT_BIN" ] || weekly_fail "$KHMS_AGENT_WHY"
+echo "$(date -Is) agent: $AGENT_BIN ($KHMS_AGENT_WHY) version: $(timeout 30 "$AGENT_BIN" --version 2>&1 | head -1 || true)" >> "$LOG"
 
 NLOCK=$(khms_get KHMS_NIGHTLY_LOCK)
 mkdir -p "$(dirname "$NLOCK")"

@@ -83,7 +83,17 @@ export KHMS_LLM_URL=${KHMS_LLM_URL:-$(khms_get KHMS_LLM_URL)}
 export KHMS_LLM_MODEL=${KHMS_LLM_MODEL:-$(khms_get KHMS_LLM_MODEL)}
 FALLBACK_JUDGE=""
 if [ -n "$KHMS_LLM_URL" ] && [ "$KHMS_JUDGE" != local ]; then FALLBACK_JUDGE=local; fi
-export KHMS_CLAUDE_BIN=${KHMS_CLAUDE_BIN:-${NIGHTLY_CLAUDE_BIN:-$(khms_get KHMS_AGENT)}}
+# THE JUDGE'S CLI (#232): what the caller names (the nightly passes the CLI it verified), else KHMS_AGENT
+# resolved by the same rule as every driver -- an absolute path, or a bare name only with
+# KHMS_AGENT_FROM_PATH=1. Refused, KHMS_CLAUDE_BIN stays empty and khms_contradict.py refuses every Claude
+# judge call with the same one-line reason (the local fallback, when configured, still runs).
+if [ -n "${KHMS_CLAUDE_BIN:-}${NIGHTLY_CLAUDE_BIN:-}" ]; then
+  export KHMS_CLAUDE_BIN=${KHMS_CLAUDE_BIN:-$NIGHTLY_CLAUDE_BIN}
+else
+  khms_agent_resolve || true
+  export KHMS_CLAUDE_BIN=$KHMS_AGENT_BIN
+  if [ -z "$KHMS_CLAUDE_BIN" ] && [ "$KHMS_JUDGE" != local ]; then echo "$(date -Is) triage judge: $KHMS_AGENT_WHY" >&2; fi
+fi
 # The shadow judge of the reference deployment (a second judge evaluated on the same pairs) is an
 # evaluation pilot, not part of KHMS: it ran only while the judge of record was the local model.
 # The whole base every night, minus the pairs judged in the last SKIP_NIGHTS nights (see LIMIT above).

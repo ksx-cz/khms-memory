@@ -61,6 +61,7 @@ DEFAULTS = {
     "PING_EXTRA_ONLY": "[AUTO-PING] Project check: {extra}. Then report to {principal}.",
     "PING_EXTRA_FAILED": "PROJECT CHECK DID NOT ANSWER (rc={rc}, {cmd}): {out}",
     "PING_EXTRA_CLEAN": "clean (nothing to report)",
+    "PING_MODELS": "LAST NIGHT'S MODELS (from each call's own JSON result): {models}",
     "PING_INBOX_CLEAN": "(inbox clean)",
     "LEDGER_NO_STATE": "MARK LEDGER: no state -- run mark_ledger.py sync",
     "LEDGER_STATUS": ("MARK LEDGER (since {floor}): OPEN {open} (queued {queued}, proposed in an unreviewed "

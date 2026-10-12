@@ -12,7 +12,7 @@ the agent whether or not it remembers to search".
 | `PyYAML` | `build_views.py`, `approve_inbox.py`, `precheck.sh`, `weekly_synthesis.sh` | `pip install pyyaml` |
 | `flock`, `timeout`, `find`, `date` (GNU coreutils/util-linux) | the pipeline drivers | present on any normal Linux; on macOS install `coreutils` and `flock` or run the pipeline in a container |
 | `git` | optional | only to feed the day's commits into the sweep |
-| a headless agent CLI (`claude -p …`) | the nightly and weekly drivers | set `KHMS_AGENT` if it is not `claude` |
+| a headless agent CLI (`claude -p …`) | the nightly and weekly drivers, the triage judge | set `KHMS_AGENT` to its ABSOLUTE path; a bare name is refused (one log line) unless `KHMS_AGENT_FROM_PATH=1` allows the PATH lookup. Each real run logs the CLI's path and `--version`, and each model call logs the model that served it (`served-by:`) |
 
 `khms_hook.py` and `khms_search.py` are **stdlib only** on purpose: the hook runs on every
 message and every tool call, so it must start fast and must never fail because an import broke.

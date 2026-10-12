@@ -342,6 +342,15 @@ if [ -n "$EXTRA" ]; then
   fi
 fi
 
+# THE MODELS THAT SERVED THE LAST NIGHT (#232). Two nights in October 2026 a stale agent CLI answered the
+# `sonnet` alias with an older, ~5x slower model, and nothing anyone read in the morning said so. The night
+# log now carries the agent's version and one `served-by:` line per model call (agent_result.py, from the
+# CLI's JSON result); the ping repeats the last night's summary on the same one line, with the triage
+# judge's models. Informational: it rides on a message that is sent anyway and never makes one by itself.
+MODELS="$(python3 "$CODE/agent_result.py" --night-log "$(khms_get KHMS_NIGHT_LOG)" 2>/dev/null || true)"
+if [ -n "$MSG" ] && [ -n "$MODELS" ]; then
+  MSG="$MSG  ||  $(M PING_MODELS models="$MODELS")"
+fi
 # --dry-run: print what would be sent and exit. Use this when testing from inside
 # a session -- a live delivery types into the agent's OWN input box while it is busy,
 # which is exactly the situation where delivery is flakiest.
@@ -354,6 +363,7 @@ fi
 if [ "${1:-}" = "--dry-run" ] || [ "${KHMS_PING_DRYRUN:-}" = "1" ]; then
   echo "DRY-RUN pending: $PENDING"
   echo "DRY-RUN extra: ${EXTRA:-$(M PING_EXTRA_CLEAN)}"
+  echo "DRY-RUN models: ${MODELS:-none recorded}"
   # ...AND WHAT WOULD BE SENT. A dry run that printed only the pending list while
   # promising "what would be sent" could not show the one thing it exists to show:
   # a broken message would have dry-run clean every time.

@@ -116,9 +116,38 @@ def judge_from_env(env=None) -> str:
 
 
 JUDGE = judge_from_env()
-# The agent CLI: KHMS_CLAUDE_BIN (a test stub), else the configured agent (KHMS_AGENT) on PATH.
-CLAUDE_BIN = (os.environ.get("KHMS_CLAUDE_BIN") or shutil.which(_setting("KHMS_AGENT", "claude"))
-              or _setting("KHMS_AGENT", "claude"))
+
+
+def resolve_agent(settings=None):
+    """-> (absolute path of the agent CLI, "") or ("", one-line reason).
+
+    The rule every driver uses (#232, khms_agent_resolve in khms_paths.sh): KHMS_AGENT is an ABSOLUTE path;
+    a bare name is looked up on PATH only with KHMS_AGENT_FROM_PATH=1. Until 2026-10-12 a bare `claude` was
+    resolved through PATH here and in the drivers, and under systemd that found a stale CLI whose `sonnet`
+    alias served an older model (the judge's own usage line said `claude-sonnet-5` that night).
+    `settings` (a dict) replaces the settings lookup in tests."""
+    def val(key, default):
+        return settings.get(key, default) if settings is not None else _setting(key, default)
+    a = val("KHMS_AGENT", "claude") or "claude"
+    if os.path.isabs(a):
+        if os.path.isfile(a) and os.access(a, os.X_OK):
+            return a, ""
+        return "", f"AGENT UNAVAILABLE: KHMS_AGENT={a!r} is not an executable file"
+    if val("KHMS_AGENT_FROM_PATH", "0") != "1":
+        return "", (f"AGENT REFUSED: KHMS_AGENT={a!r} is not an absolute path; PATH would pick "
+                    f"{shutil.which(a) or 'nothing'}, which can silently be another CLI and model -- set "
+                    f"KHMS_AGENT=<absolute path>, or KHMS_AGENT_FROM_PATH=1 to allow the PATH lookup")
+    found = shutil.which(a)
+    if found:
+        return found, ""
+    return "", f"AGENT UNAVAILABLE: KHMS_AGENT={a!r} (KHMS_AGENT_FROM_PATH=1) is not an executable command on PATH"
+
+
+# The agent CLI: KHMS_CLAUDE_BIN (the nightly's verified CLI, or a test stub), else KHMS_AGENT by the rule above.
+if os.environ.get("KHMS_CLAUDE_BIN"):
+    CLAUDE_BIN, CLAUDE_BIN_WHY = os.environ["KHMS_CLAUDE_BIN"], ""
+else:
+    CLAUDE_BIN, CLAUDE_BIN_WHY = resolve_agent()
 CLAUDE_RUNNER = subprocess.run          # replaced by a stub in tests
 CTX_CAP = 262144
 TRUNC_RATIO = 0.92        # prompt_eval_count/num_ctx at or above this => treat as truncated
@@ -1232,6 +1261,8 @@ def _post_claude(prompt, timeout=None, model=None):
     lands as NO-VERDICT, which is the honest outcome."""
     timeout = LLM_TIMEOUT if timeout is None else timeout
     model = model or CLAUDE_MODELS[JUDGE]
+    if not CLAUDE_BIN:
+        raise ClaudeJudgeError(CLAUDE_BIN_WHY or "no agent CLI configured (KHMS_AGENT)")
     budget = JUDGE_BUDGET
     w = budget.reserve(prompt) if budget is not None else None   # may raise JudgeBudgetStop
     env = dict(os.environ)
