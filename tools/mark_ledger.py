@@ -24,6 +24,11 @@ exactly one state:
 The state is DERIVED on every `sync` from these sources, so a killed run can never leave it
 inconsistent:
     journal/*.md          the marks themselves (from the floor date on)
+    memory/ledger/generated/*.md   GENERATED lines (#237 step 2): MARK-shaped lines the night's
+                          transcript/git generator wrote (generated_marks.py), each with its source label
+                          and a verbatim span.  They are NOT journal MARKs: their own `G-` id space, their
+                          own file, `origin: generated` in marks.jsonl; otherwise the same states and the
+                          same queue (one time axis: their local time sorts them among the journal MARKs)
     memory/know/*.md      cards — CARDED only through the card's `marks:` FRONTMATTER list (a
                           structured link written by the approve path).  A mention of the id anywhere
                           else, a `journal <date> <HH:MM>` source reference or a verbatim quote only
@@ -138,14 +143,15 @@ CANON = {alias: canon for canon, aliases in KIND_ALIASES.items() for alias in al
 # lines and stop producing them): a status line is a plain journal line without MARK.  A DENYLIST, not an
 # allowlist: the closed allowlist before #209 A2 lost know-how written under kinds nobody had listed
 # (K-05341), so every kind not named here stays tracked.  The default is the status kinds the ledger
-# counted on 2026-10-13; a deployment replaces it with LEDGER_STATUS_KINDS in its patterns file (words
+# counted on 2026-10-13, in English only (the public code ships English defaults); a deployment whose journals
+# use other words for status lists ALL of its status kinds in LEDGER_STATUS_KINDS in its patterns file (words
 # separated by spaces, commas or semicolons; `none` = track every kind).  Matching ignores case, the
 # diacritics (an accented spelling equals the plain one) and a `→status` tail.  A skipped status line is COUNTED
 # (`status_skipped` in summary.json, the sync output and the status line), never dropped silently (K-00586).
 DEFAULT_STATUS_KINDS = (
     "agent-done", "agent-done-check", "agent-fail", "agent-partial", "board-reply", "board-archive",
-    "board", "hotovo", "stav", "done", "check", "dispatch", "deploy", "review", "merge", "plan",
-    "handoff", "report", "overeno", "potvrzeno", "pending", "resolved", "verified", "khms")
+    "board", "done", "check", "dispatch", "deploy", "review", "merge", "plan",
+    "handoff", "report", "pending", "resolved", "verified", "khms")
 
 
 def fold_kind(raw):
@@ -171,7 +177,7 @@ def status_kind(raw):
     k = fold_kind(raw).split("→", 1)[0]
     return k if k in STATUS_KINDS else None
 
-# A kind is a word (Czech letters, digits, `-`, `_`, one optional `→status` tail); a
+# A kind is a word (letters of any script, digits, `-`, `_`, one optional `→status` tail); a
 # placeholder in prose (`MARK[...]`, `MARK[<kind>]`, `MARK[..]`) is not a mark.
 KIND_SHAPE_RE = re.compile(r"^[^\W\d_][\w-]*(?:→[\w-]+)?$")
 KIND_PLACEHOLDERS = frozenset(("kind", "x", "xxx"))
@@ -216,9 +222,18 @@ LEAD_TIME_RE = re.compile(r"^(?P<hm>\d{1,2}:\d{2})(?::\d{2})?\b\s*")
 # quoted (`MARK[done]`) is a reference, not a mark.
 TOKEN_RE = re.compile(r"(?:\*\*)?MARK\[(?P<kind>[^\]\s]+)\](?:\*\*)?:?\s*")
 LATER_LEAD_RE = re.compile(r"(?:[.;!?)]|\s[—–-])\s*(?:\*\*)?$")
-ID_RE = re.compile(r"\bM-[0-9a-f]{8}\b")
+# A tracked id: `M-` for a journal MARK, `G-` for a GENERATED line (#237 step 2: a line the night's
+# transcript/git generator wrote into memory/ledger/generated/, never into the journal).  Two id spaces, so
+# a generated line can never be mistaken for, or collide with, a journal MARK somebody wrote.
+ID_RE = re.compile(r"\b[MG]-[0-9a-f]{8}\b")
 CARD_ID_RE = re.compile(r"\bK-\d{5}\b")
 JOURNAL_NAME_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})\.md$")
+# A generated-lines file: memory/ledger/generated/<night key>.md (night key = DATE or DATE-<n>).
+GEN_NAME_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})(?:-\d+)?\.md$")
+# One generated line (generated_marks.py writes them, nothing else does):
+#   - <UTC ISO time> MARK[<kind>] <finding> (src=digest sess <id> @<HH:MM> | src=gitlog <sha>) :: "<span>"
+GEN_LINE_RE = re.compile(r"^- (?P<iso>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?Z) "
+                         r"MARK\[(?P<kind>[^\]\s]+)\]\s*(?P<text>\S.*)$")
 REVIEWED_SUFFIXES = ("", "-cards")
 NOT_CARDED_HEAD = "## MARKS NOT CARDED"
 
@@ -243,6 +258,7 @@ class Paths:
         self.reviewed = reviewed or _review_dir(root)
         self.ledger = os.path.join(root, "memory", "ledger")
         self.carry = os.path.join(self.ledger, "carry")
+        self.generated = os.path.join(self.ledger, "generated")
         self.events = os.path.join(self.ledger, "events.jsonl")
         self.marks = os.path.join(self.ledger, "marks.jsonl")
         self.summary = os.path.join(self.ledger, "summary.json")
@@ -261,6 +277,11 @@ def mark_id(kind, text):
     body = LEAD_TIME_RE.sub("", norm(text), count=1)
     h = hashlib.sha1(f"{kind}|{body}".encode("utf-8")).hexdigest()
     return "M-" + h[:8]
+
+
+def gen_id(kind, text):
+    """The id of a GENERATED line: same hash as a journal MARK, its own `G-` id space."""
+    return "G-" + mark_id(kind, text)[2:]
 
 
 def _skip(skipped, raw, text):
@@ -355,6 +376,52 @@ def scan_journal(path, skipped=None):
     return out
 
 
+def scan_generated(path, skipped=None):
+    """-> mark dicts of one generated-lines file (#237 step 2).  `date`/`time` are the LOCAL time of the
+    source record (the journal's clock), so the queue sorts generated lines and journal MARKs on one
+    time axis; the UTC stamp stays in `utc`.  A status kind (the generator must not write one) is
+    skipped and counted like a journal status line."""
+    name = os.path.basename(path)
+    out, seen = [], set()
+    try:
+        fh = open(path, encoding="utf-8", errors="replace")
+    except OSError:
+        return out
+    with fh:
+        for n, line in enumerate(fh, 1):
+            m = GEN_LINE_RE.match(line.rstrip("\n"))
+            if not m:
+                continue
+            text = m.group("text").strip()
+            if _skip(skipped, m.group("kind"), text):
+                continue
+            kind = canon_kind(m.group("kind"))
+            if not kind:
+                continue
+            gid = gen_id(kind, text)
+            if gid in seen:
+                continue
+            seen.add(gid)
+            try:
+                loc_t = dt.datetime.fromisoformat(m.group("iso").replace("Z", "+00:00")).astimezone()
+                date, hm = loc_t.strftime("%Y-%m-%d"), loc_t.strftime("%H:%M")
+            except ValueError:
+                date, hm = m.group("iso")[:10], ""
+            out.append({"id": gid, "date": date, "time": hm, "kind": kind, "text": norm(text),
+                        "loc": f"generated/{name}:{n}", "origin": "generated", "utc": m.group("iso")})
+    return out
+
+
+def generated_files(paths, floor, until=None):
+    files = []
+    for f in sorted(glob.glob(os.path.join(paths.generated, "2*.md"))):
+        m = GEN_NAME_RE.match(os.path.basename(f))
+        if not m or m.group(1) < floor or (until and m.group(1) > until):
+            continue
+        files.append(f)
+    return files
+
+
 def journal_files(paths, floor, until=None):
     files = []
     for f in sorted(glob.glob(os.path.join(paths.journal, "2*.md"))):
@@ -373,6 +440,12 @@ def collect_marks(paths, floor, until=None, skipped=None):
     marks = {}
     for f in journal_files(paths, floor, until):
         for mk in scan_journal(f, skipped):
+            if mk["id"] in marks:
+                marks[mk["id"]].setdefault("also", []).append(mk["loc"])
+                continue
+            marks[mk["id"]] = mk
+    for f in generated_files(paths, floor, until):
+        for mk in scan_generated(f, skipped):
             if mk["id"] in marks:
                 marks[mk["id"]].setdefault("also", []).append(mk["loc"])
                 continue
@@ -447,7 +520,7 @@ def card_mark_links(text):
             ids += ID_RE.findall(line)
             continue
         if inside:
-            if re.match(r"^\s*-\s*M-", line) or re.match(r"^\s+M-", line):
+            if re.match(r"^\s*-\s*[MG]-", line) or re.match(r"^\s+[MG]-", line):
                 ids += ID_RE.findall(line)
                 continue
             inside = False
@@ -727,7 +800,7 @@ def derive(paths, floor, until=None, skipped=None):
 # was later dismissed or reopened, the duplicate stayed dismissed and its content was in
 # no card (66 such dismissals; 8 targets were themselves dismissed, one a khms-issue).
 DUP_RE = re.compile(r"(?i)^(?:nightly verdict accepted at review:\s*)?duplicate of\s+"
-                    r"(M-[0-9a-f]{8})\b")
+                    r"([MG]-[0-9a-f]{8})\b")
 
 
 def dup_target(ev):
@@ -790,8 +863,12 @@ def summarize(marks, floor, paths=None, skipped=None):
     proposed = suggested = 0
     oldest = None
     new_kinds = {}
+    gen = {"total": 0, "open": 0}
     for mk in marks.values():
         counts[mk["state"]] += 1
+        if mk.get("origin") == "generated":
+            gen["total"] += 1
+            gen["open"] += mk["state"] == "OPEN"
         if mk["kind"] not in KIND_ALIASES:
             new_kinds[mk["kind"]] = new_kinds.get(mk["kind"], 0) + 1
         if mk["state"] == "OPEN":
@@ -826,6 +903,8 @@ def summarize(marks, floor, paths=None, skipped=None):
                                  if skipped is not None else None),
         # marks of kinds outside the eight base kinds — tracked since #209 A2
         "new_kinds": dict(sorted(new_kinds.items(), key=lambda kv: (-kv[1], kv[0]))),
+        # GENERATED lines (#237 step 2, `G-` ids) among the totals above: not journal MARKs, counted apart
+        "generated_lines": gen,
         # consolidate batches waiting in memory/ledger/carry/ — the night's unfinished work
         "carry": carry_count(paths) if paths else None,
         "oldest_open": ({k: oldest[k] for k in ("id", "date", "time", "kind", "text", "loc")}
@@ -1139,7 +1218,7 @@ def not_carded_events(paths, text, known, by):
         return None
     evs, bad, unproven = [], [], []
     for line in sec.group(1).splitlines():
-        m = re.match(r"^\s*-\s*(M-[0-9a-f]{8})\s*::\s*(.+?)\s*$", line)
+        m = re.match(r"^\s*-\s*([MG]-[0-9a-f]{8})\s*::\s*(.+?)\s*$", line)
         if not m:
             continue
         mid, verdict = m.group(1), m.group(2)
@@ -1241,7 +1320,7 @@ def cmd_dismiss(a, paths):
 # 2026-10-08 on the 1185 such marks: 36 have no distinctive term (kept — cannot be judged
 # lexically), 130 have none of theirs in K-x, 141 under a third, 725 half or more.
 RECHECK_DROP = re.compile(
-    r"\((?:agent|sess|session)\b[^)]*\)|\bM-[0-9a-f]{8}\b|\bK-\d{5}\b"
+    r"\((?:agent|sess|session)\b[^)]*\)|\b[MG]-[0-9a-f]{8}\b|\bK-\d{5}\b"
     r"|\b\d{4}-\d{2}-\d{2}(?:T[\d:+.-]+)?\b|\b\d{1,2}:\d{2}(?::\d{2})?\b|#\d+")
 RECHECK_TOK = re.compile(r"[0-9A-Za-z\u00c0-\u017e_][0-9A-Za-z\u00c0-\u017e_./%+-]*[0-9A-Za-z\u00c0-\u017e_%]")
 RECHECK_MIN_SHARE = 1 / 3

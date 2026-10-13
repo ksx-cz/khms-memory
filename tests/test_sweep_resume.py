@@ -23,19 +23,22 @@ from test_night_pipeline import FAKE, cards_in, env_for, log_of, make_base, unit
 # The fake prepare stage writes ONE candidate per part, labelled by its part number, so the inbox shows which
 # parts arrived and how often. CUT_PART sleeps past the sweep deadline (the retry wrapper clips the call to
 # the deadline, exactly as on 2026-10-11).
-PART_FAKE = FAKE.replace(
-    "else:\n    js = field(",
-    "elif re.search(r'prepare PART (\\d+) OF (\\d+)', prompt):\n"
-    "    k = int(re.search(r'prepare PART (\\d+) OF (\\d+)', prompt).group(1))\n"
-    "    if os.environ.get('CUT_PART') == str(k):\n"
-    "        import time; time.sleep(600)\n"
-    "    if os.environ.get('KILL_PART') == str(k):\n"
-    "        open(out, 'w').write('# nightly sweep - candidates\\n' + card('C1', 'half written part'))\n"
-    "        driver = int(open(f'/proc/{os.getppid()}/stat').read().rsplit(')', 1)[1].split()[1])\n"
-    "        os.kill(driver, 9)\n"
-    "        sys.exit(1)\n"
-    "    open(out, 'w').write('# nightly sweep - candidates\\n' + card('C1', f'prepare part {k:03d} found widget fact').replace('src=journal', 'src=digest'))\n"
-    "else:\n    js = field(", 1)
+# The fake generator part writes ONE line per part; the per-mark evaluator turns it into one candidate titled
+# with the part number, so the inbox shows which parts arrived and how often.
+PART_BRANCH = r"""elif re.search(r'prepare PART (\d+) OF (\d+)', prompt):
+    k = int(re.search(r'prepare PART (\d+) OF (\d+)', prompt).group(1))
+    line = '- 2099-01-01T10:00Z MARK[finding] WHAT (src=digest sess s @10:00) :: "widget unmarked calibration"\n'
+    if os.environ.get('CUT_PART') == str(k):
+        import time; time.sleep(600)
+    if os.environ.get('KILL_PART') == str(k):
+        open(out, 'w').write(line.replace('WHAT', 'half written part'))
+        driver = int(open(f'/proc/{os.getppid()}/stat').read().rsplit(')', 1)[1].split()[1])
+        os.kill(driver, 9)
+        sys.exit(1)
+    open(out, 'w').write(line.replace('WHAT', f'prepare part {k:03d} found widget fact'))
+else:
+    # the generator:"""
+PART_FAKE = FAKE.replace("else:\n    # the generator:", PART_BRANCH, 1)
 assert PART_FAKE != FAKE
 
 

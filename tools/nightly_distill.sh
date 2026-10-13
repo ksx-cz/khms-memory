@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# KHMS nightly sweep driver: preprocess (0 tokens) -> sweep -> QUOTE CHECK -> NEAREST (0
-# tokens) -> consolidate -> QUOTE CHECK -> RELATION GATE (0 tokens) -> optional triage stage.
+# KHMS nightly driver (#237): preprocess (0 tokens) -> GENERATOR (transcript/git passages -> candidate MARK
+# lines, grounded by a tool, committed to memory/ledger/generated/) -> PER-MARK EVALUATOR (journal MARKs and
+# generated lines, one packet and one call each, time-sorted) -> QUOTE CHECK + NEAREST + RELATION GATE (0
+# tokens) -> publish (carried pre-#237 batches are still consolidated) -> optional triage stage.
 # Usage: nightly_distill.sh [--dry-run]   (run once a night by the deployment's scheduler; log: KHMS_NIGHT_LOG)
 #
 # MODEL CHOICE IS EVIDENCE, NOT FASHION. In the reference deployment the cheapest model tier
@@ -180,15 +182,15 @@ CONSOLIDATE_BATCH=${CONSOLIDATE_BATCH:-25}
 LEDGER_TOOL=$CODE/mark_ledger.py
 BATCH_TOOL=$CODE/nightly_batch.py
 CARRY=$ROOT/memory/ledger/carry
-# MARK stage sizing — an ESTIMATE until the first uncapped night measures it: the sweep
-# turned 31–137 candidates out of a whole digest in 9–38 min (3.5–5.7 candidates/min,
-# nightly.log 2026-09-20..10-01); a chunk of 60 one-line marks is therefore ~15–20 min,
-# and 40m is 2x that. Chunks not started before the budget stay OPEN in the ledger.
-# MEASURED (P209N): the only night the stage ran (2026-10-03, 3 chunks of 60) took 10.1, 10.6 and
-# 14.1 min -> 30m (rule above). On the other four uncapped nights it ran NO chunk: the sweep alone
-# put 138-157 candidates over the former MARK_PENDING_MAX (see THE MARK STAGE RUNS FIRST below).
-MARK_CHUNK=${MARK_CHUNK:-60}
-MARK_TIMEOUT=${MARK_TIMEOUT:-30m}
+# THE MARK STAGE IS A PER-MARK EVALUATOR (#237, owner 2026-10-13). Until then the stage sent chunks of 60
+# bare queue lines to an agent with tools (MARK_CHUNK, MARK_TIMEOUT; 2026-10-13: 17 chunks, 44-103 turns and
+# 3.9-8.5 min each) and a consolidate call per chunk merged its candidates. Now permark.py builds a packet
+# per mark with 0 tokens (journal context, nearest cards, tonight's candidates, a transcript excerpt) and
+# makes ONE call without tools per mark; its candidates are approve-ready and published without a
+# consolidate call (`split-run --ready`). PERMARK_TIMEOUT_S bounds one call: a one-shot sonnet call of about
+# 10k tokens in took 12.1 s on average (2026-10-13 triage judge, 42 calls in 509 s); 180 s is the design's
+# bound, well above twice any measured one-shot call.
+PERMARK_TIMEOUT_S=${PERMARK_TIMEOUT_S:-180}
 # Wall-clock budgets, EACH COUNTED FROM THE START OF ITS OWN STAGE (#232): no NEW mark chunk later than
 # MARK_BUDGET_MIN after the MARK stage starts, no NEW sweep part later than SWEEP_BUDGET_MIN after the sweep
 # starts, no NEW consolidate batch later than CARD_BUDGET_MIN after the consolidation starts. Until
@@ -200,7 +202,10 @@ MARK_TIMEOUT=${MARK_TIMEOUT:-30m}
 # -> 2 x 139 = 278 -> 280. (It was 180, then 225 from the run's start since P209M, i.e. what was left after
 # the stages before it.) A night that does not finish its batches carries them; the carry queue is the next
 # night's consolidation, done oldest first.
-MARK_BUDGET_MIN=${MARK_BUDGET_MIN:-90}
+# MARK_BUDGET_MIN 150 (owner 2026-10-13 08:21 on #237: stay sequential, no parallel lanes, 150 min): the
+# evaluator handles marks one after another, so each sees every decision made before it (the in-night
+# duplicate rule) with no locking; 150 min at 12-20 s per mark is ~450-750 marks a night.
+MARK_BUDGET_MIN=${MARK_BUDGET_MIN:-150}
 CARD_BUDGET_MIN=${CARD_BUDGET_MIN:-280}
 # Attempts per batch/chunk (the sweep keeps nightly_retry.sh's default 3): a batch that
 # fails twice is carried, and the next one is tried rather than spending the night on it.
@@ -225,7 +230,7 @@ mkdir -p "$STAGING"
 # produces nothing a review could trust, so a prompt that cannot be rendered stops the night here,
 # loudly and unstamped.
 render_prompt() { python3 "$CODE/khms_prompt.py" "$1" 2>>"$LOG"; }
-if ! SWEEP_BASE=$(render_prompt nightly-sweep) || ! MARKS_BASE=$(render_prompt nightly-marks) \
+if ! SWEEP_BASE=$(render_prompt nightly-generate) || ! MARKS_BASE=$(render_prompt nightly-marks) \
    || ! CONSOLIDATE_BASE=$(render_prompt nightly-consolidate); then
   echo "$(date -Is) nightly FAILED: a stage prompt could not be rendered (khms_prompt.py, see above) — nothing run, nothing stamped" >> "$LOG"
   exit 1
@@ -347,6 +352,17 @@ for _w in "$CARRY"/*/WINDOW; do
     [ "$DRYRUN" = "1" ] || echo "$SINCE" > "$STAMP"
   fi
 done
+
+# THE GENERATED LINES (#237 step 2) carry their window the same way: memory/ledger/generated/<key>.md is
+# committed by one rename with a `WINDOW:` line, and a run killed after that commit but before the stamp
+# must not generate the same window twice.
+GENERATED=$ROOT/memory/ledger/generated
+_gw=$(python3 "$CODE/generated_marks.py" window "$GENERATED" 2>/dev/null || true)
+if [ -n "$_gw" ] && [ "$(date -d "$_gw" +%s 2>/dev/null || echo 0)" -gt "$(date -d "$SINCE" +%s 2>/dev/null || echo 0)" ]; then
+  echo "$(date -Is) window: stamp $SINCE is older than the committed generated window $_gw — generating from it" >> "$LOG"
+  SINCE=$_gw
+  [ "$DRYRUN" = "1" ] || echo "$SINCE" > "$STAMP"
+fi
 
 # THE FROZEN PREPARE LIST (#173; first night on the shared code, 2026-10-11). A window whose sweep has
 # more parts than one night's SWEEP_BUDGET_MIN covers (that night: 42 one-chunk parts at 6-7 min, cut by
@@ -577,7 +593,7 @@ else
 fi
 ledger queue --out "$QUEUE" >> "$LOG" 2>&1 \
   || { echo "$(date -Is) mark ledger queue FAILED (non-fatal) — no MARK stage tonight" >> "$LOG"; : > "$QUEUE"; }
-QUEUE_N=$(grep -c '^- M-' "$QUEUE" 2>/dev/null) || QUEUE_N=0
+QUEUE_N=$(grep -cE '^- [MG]-' "$QUEUE" 2>/dev/null) || QUEUE_N=0
 [ "$DRYRUN" = "1" ] || mkdir -p "$CARRY" 2>/dev/null || true
 carry_batches() {   # never fails: an empty carry queue is a normal night, not an error
   # Legacy flat batches (<night>-cons-NN.md, nights before KHMSFIX) and run directories
@@ -861,9 +877,9 @@ if [ "$DRYRUN" = "1" ]; then
   echo "  queue: $QUEUE_N OPEN mark(s) not held by any pending proposal -> $QUEUE"
   # `|| true`: an EMPTY queue is a normal night; under `set -o pipefail` grep's rc 1 used to end
   # the dry run here with rc 1, before the MARK-stage limits, quote sources and triage were printed.
-  { grep -m3 '^- M-' "$QUEUE" || true; } | cut -c1-160 | sed 's|^|    |'
-  echo "  MARK stage: the FIRST model stage, before the sweep and independent of it; chunks of $MARK_CHUNK, timeout $MARK_TIMEOUT, $BATCH_RETRY_MAX attempt(s), no new chunk later than ${MARK_BUDGET_MIN} min after the stage starts; no candidate-count gate"
-  echo "  each finished chunk is committed on its own as $CARRY/<night key>-mNN/ (cons-NN.md + notcarded.md, no WINDOW: the sweep's stamp does not move)"
+  { grep -m3 -E '^- [MG]-' "$QUEUE" || true; } | cut -c1-160 | sed 's|^|    |'
+  echo "  MARK stage: the per-mark evaluator (permark.py, #237) AFTER the generator: one packet and ONE call without tools per queued id (journal M- and generated G-, one time axis), timeout ${PERMARK_TIMEOUT_S}s per call, no new mark later than ${MARK_BUDGET_MIN} min after the stage starts"
+  echo "  its output is committed once as $CARRY/<night key>-m01/ with every batch's durable output (split-run --ready): published without a consolidate call"
   echo "  grounding journal source (window + every journal from $LFLOOR): $JVERIFY ($(stat -c%s "$JVERIFY") B)"
   echo "  know-how test (K-93929): consolidate prompt $(grep -c 'not know-how' "$CODE/prompts/nightly-consolidate.md" || true) line(s), MARK prompt $(grep -c 'not know-how' "$CODE/prompts/nightly-marks.md" || true) line(s) name the drop reason; each output's drops are logged as 'know-how (<stage>): …'"
   echo
@@ -896,126 +912,15 @@ fi
 # nightly_retry.sh for the incident and the contract. `SWEEP_OK` records whether it
 # eventually succeeded; the rest of the script decides what to skip, but never exits here.
 source "$CODE/nightly_retry.sh"
-SWEEP_PROMPT="$SWEEP_BASE
-
-INPUTS:
-- No primary source chunks available. Produce no candidates.
-OUTPUT FILE: $SWEEP"
-# reassemble <target> <part files...> — the merge described at 2a, as a function since #209
-# follow-up: every sweep PART has its own part files too.
-reassemble() {
-  python3 - "$@" <<'PYMERGE' >> "$LOG" 2>&1 || echo "$(date -Is) reassembly of ${1##*/} FAILED (non-fatal)" >> "$LOG"
-import re, sys, pathlib
-target, parts = pathlib.Path(sys.argv[1]), [pathlib.Path(p) for p in sys.argv[2:]]
-CARD = re.compile(r"^#{2,3} +([A-Z]\d+[a-z]?)\b", re.M)
-text = target.read_text(encoding="utf-8") if target.exists() else ""
-have, added = set(CARD.findall(text)), 0
-for p in sorted(parts):
-    if not p.exists():
-        # nullglob removes unmatched GLOBS, but the -final.md element is a
-        # literal and survives when absent (crashed 2026-08-24: single-file
-        # sweep night, FileNotFoundError). Missing part = nothing to merge.
-        continue
-    t = p.read_text(encoding="utf-8")
-    marks = list(CARD.finditer(t))
-    for i, m in enumerate(marks):
-        if m.group(1) in have:
-            continue
-        end = marks[i + 1].start() if i + 1 < len(marks) else len(t)
-        text += ("\n" if text and not text.endswith("\n") else "") + t[m.start():end]
-        have.add(m.group(1)); added += 1
-if added:
-    target.write_text(text, encoding="utf-8")
-print(f"reassembly: +{added} cards from {len(parts)} part file(s); sweep now holds {len(have)} candidates")
-PYMERGE
-}
 FAILED_STAGES=""
-# 1e) THE MARK STAGE — THE NIGHT'S FIRST MODEL STAGE (board #209; PMARKFIRST, see THE MARK STAGE
-# RUNS FIRST at the top). Queued OPEN journal marks go to the model in chunks of $MARK_CHUNK: every
-# id must end in a candidate (`MARKS:` line) or in a `## MARKS NOT CARDED` line with a reason.
-# It runs BEFORE the sweep and whatever the sweep will do (fail, time out, find nothing, yield 648
-# candidates); its budget is its own, MARK_BUDGET_MIN from the moment it starts, and no count of
-# candidates already waiting stops it.
-# EVERY FINISHED CHUNK IS ITS OWN TRANSACTION: its output (candidates + NOT CARDED verdicts) is
-# relabelled M<chunk*1000+n>, annotated (NEAREST) and quote-checked into staging, then committed by
-# ONE rename (nightly_batch.py split-run, no --window) as $CARRY/<night key>-mNN/ — before the sweep
-# starts, and never into the sweep file (a resumed sweep rebuilds that file from its parts). A kill
-# before the rename leaves the chunk's marks OPEN in the ledger (they are queued again, nothing of
-# the chunk is used); a kill after it leaves the whole chunk in carry, where the ledger counts its
-# ids as proposed (not queued again) and the consolidation publishes it as units <night key>-mNN-bKK.
-# The directory has no WINDOW, so neither the start of a run nor the closing of the directory moves
-# the sweep's stamp. A chunk that fails is not committed: its marks stay OPEN for tomorrow, and so
-# do the chunks the budget did not reach.
-MARKS_PROMPT_FILE=$CODE/prompts/nightly-marks.md
-MARK_PHASE_START=$(date +%s)
-MARK_DEADLINE=$((MARK_PHASE_START + MARK_BUDGET_MIN * 60))
-MCHUNKS=()
-if [ -f "$MARKS_PROMPT_FILE" ] && [ "$QUEUE_N" -gt 0 ] && [ -n "$AGENT_BIN" ]; then
-  mapfile -t MCHUNKS < <(ledger queue --chunk "$MARK_CHUNK" --outdir "$STAGING" \
-                           --prefix "nightly-$NK-markchunk" 2>>"$LOG") || MCHUNKS=()
-fi
-echo "$(date -Is) === marks === FIRST stage: ${#MCHUNKS[@]} chunk(s) of <= $MARK_CHUNK queued mark(s) owned by the record stage; no new chunk after $(date -d @"$MARK_DEADLINE" +%H:%M) (+${MARK_BUDGET_MIN} min from this stage's start)" >> "$LOG"
-# mark_commit <chunk output> <run key> <chunk number> -> 0 when the chunk is committed as $CARRY/<run key>
-mark_commit() {
-  local out="$1" key="$2" k="$3" rel="$STAGING/nightly-$2-carry.md"
-  rm -f "$rel"
-  python3 "$BATCH_TOOL" merge "$rel" "$out" --letter M --relabel-base $((k * 1000)) >> "$LOG" 2>&1 || return 1
-  python3 "$CODE/nearest_cards.py" "$rel" >> "$LOG" 2>&1 \
-    || echo "$(date -Is) === nearest === FAILED for marks-$k (non-fatal) — its batches are consolidated without NEAREST lines" >> "$LOG"
-  python3 "$CODE/verify_quotes.py" "$rel" --source digest="$DIGEST" --source journal="$JVERIFY" \
-    --source gitlog="$GITLOG" > "$STAGING/nightly-$key-quotecheck.txt" 2>&1 || true
-  fault_point "marks-before-commit-$k"
-  if ! python3 "$BATCH_TOOL" split-run "$rel" --size "$CONSOLIDATE_BATCH" --carry "$CARRY" --run "$key" \
-       > /dev/null 2>>"$LOG"; then
-    [ -d "$CARRY/$key" ] || return 1
-    echo "$(date -Is) marks-$k: split reported a failure AFTER its commit — $CARRY/$key is complete" >> "$LOG"
-  fi
-  echo "$(date -Is) marks-$k committed: $(python3 "$BATCH_TOOL" count "$rel") candidate(s) and $(grep -cE '^- M-[0-9a-f]{8} ::' "$rel" || true) NOT CARDED verdict(s) -> $CARRY/$key" >> "$LOG"
-  fault_point "marks-after-commit-$k"
-  return 0
-}
-MK=0
-for MC in "${MCHUNKS[@]}"; do
-  [ -f "$MC" ] || continue
-  MK=$((MK + 1))
-  if limit_stop "MARK chunks $MK..${#MCHUNKS[@]} (their marks stay OPEN)"; then break; fi
-  if [ "$(date +%s)" -ge "$MARK_DEADLINE" ]; then
-    echo "$(date -Is) === marks === budget of ${MARK_BUDGET_MIN} min reached — $(( ${#MCHUNKS[@]} - MK + 1 )) chunk(s) left OPEN in the ledger for the next night" >> "$LOG"
-    break
-  fi
-  MOUT=$STAGING/nightly-$NK-markout-$(printf %02d "$MK").md
-  MKEY=$NK-m$(printf %02d "$MK")
-  MPROMPT="$MARKS_BASE
-
-INPUTS:
-- MARK QUEUE chunk: $MC
-- journal directory (grep around a mark's journal/<file>:<line> for context): $ROOT/journal
-- knowledge base (grep before carding): $ROOT/memory/know
-OUTPUT FILE: $MOUT"
-  if RETRY_MAX_ATTEMPTS=$BATCH_RETRY_MAX retry_claude_call "marks-$MK" "$MARK_TIMEOUT" "$LOG" "$STAGE_MARK" -- \
-       "$AGENT_BIN" -p "$MPROMPT" "${STAGE_ISOLATION[@]}" --output-format json --model "$MARK_MODEL" --allowedTools $TOOLS; then
-    if [ -s "$MOUT" ]; then
-      if ! mark_commit "$MOUT" "$MKEY" "$MK"; then
-        FAILED_STAGES="$FAILED_STAGES marks-$MK"
-        echo "$(date -Is) marks-$MK commit to the carry queue FAILED — nothing of it is used, its $(grep -c '^- M-' "$MC") mark(s) stay OPEN for the next night" >> "$LOG"
-      fi
-    else
-      # rc 0 and no output is a failed chunk, not a quiet one (PDRAIN: 2 of 63 calls on 2026-10-06
-      # printed a delegation and wrote nothing; until then only "coverage: 0/60" in the log said so)
-      FAILED_STAGES="$FAILED_STAGES marks-$MK"
-      echo "$(date -Is) marks-$MK exited 0 but wrote no output ($MOUT) — FAILED, its $(grep -c '^- M-' "$MC") mark(s) stay OPEN for the next night" >> "$LOG"
-    fi
-    ledger coverage "$MOUT" --queue "$MC" >> "$LOG" 2>&1 || true
-    knowhow_line "marks-$MK" "$MOUT"
-  else
-    FAILED_STAGES="$FAILED_STAGES marks-$MK"
-    echo "$(date -Is) marks-$MK FAILED — output not committed, its $(grep -c '^- M-' "$MC") mark(s) stay OPEN for the next night" >> "$LOG"
-  fi
-  python3 "$CODE/maxtok_check.py" --stage "marks-$MK" --since "$STAGE_MARK" \
-    --projects "$PROJ_DIR" >> "$LOG" 2>&1 || true
-done
-
+# 2) THE GENERATOR (#237 step 2; the former sweep). The night's FIRST model stage again: its lines must be
+# committed before the evaluator builds its queue, so they are judged on the same night, time-sorted among
+# the journal MARKs. Each part reads its chunk(s) and writes MARK-shaped LINES (prompts/nightly-generate.md);
+# generated_marks.py keeps the well-formed, know-how, grounded ones and commits them, with the window, to
+# memory/ledger/generated/<SK>.md by one rename; the stamp moves then. The sweep's own consolidation is gone
+# for them: the per-mark evaluator below is the one consolidation path.
 SWEEP_OK=1
+GEN_PARTS=()
 # THE SWEEP'S OWN DEADLINE (#232): counted from here, after the MARK stage, not from the run's start.
 SWEEP_DEADLINE=$(( $(date +%s) + SWEEP_BUDGET_SEC ))
 echo "$(date -Is) === sweep === no new part after $(date -d @"$SWEEP_DEADLINE" +%H:%M:%S) (+$((SWEEP_BUDGET_SEC / 60)) min from this stage's start)" >> "$LOG"
@@ -1039,13 +944,11 @@ elif [ "$NO_WINDOW" = "1" ]; then
   echo "$(date -Is) sweep SKIPPED — nothing new in the window" >> "$LOG"
 elif [ ${#SWEEP_GROUP_FILES[@]} -gt 0 ]; then
   # 2-parts) ONE SWEEP CALL PER PART, EACH PART A TRANSACTION AGAINST THE FROZEN LIST (see THE FROZEN
-  # PREPARE LIST above). Part k writes nightly-<SK>-sweep-gNN.md (and reassembles its own -part files
-  # into it); its completion record is renamed into place only after that, so a part killed at any
-  # point before it has no record and starts again from nothing next time. A part with a valid record
-  # is skipped. Only when EVERY part of the list is complete is $SWEEP built -- from scratch, part 1 as
-  # it is, part k merged with its labels moved to k000+ (a clash is renamed by nightly_batch.py merge,
-  # never dropped) -- so a repeated build gives the same file. The first failing part (call, deadline,
-  # usage limit) stops the loop; what finished stays finished for the next run.
+  # PREPARE LIST above). Part k writes its generated lines to nightly-<SK>-sweep-gNN.md; its completion
+  # record is renamed into place only after that, so a part killed at any point before it has no record
+  # and starts again from nothing next time. A part with a valid record is skipped. Only when EVERY part
+  # of the list is complete are the parts' lines committed (step 2e, generated_marks.py build). The first
+  # failing part (call, deadline, usage limit) stops the loop; what finished stays finished for the next run.
   _K=${#SWEEP_GROUP_FILES[@]}
   PREP_DIR=$STAGING/.prepare-$SK
   if [ -z "$RESUME" ]; then
@@ -1064,7 +967,9 @@ elif [ ${#SWEEP_GROUP_FILES[@]} -gt 0 ]; then
     [ -f "$1" ] || return 1
     [ "$(sed -n 's/^group_sha256=//p' "$1")" = "$(sha_of "$2")" ] || return 1
     if [ -e "$3" ]; then o=$(sha_of "$3"); fi
-    [ "$(sed -n 's/^output_sha256=//p' "$1")" = "$o" ]
+    [ "$(sed -n 's/^output_sha256=//p' "$1")" = "$o" ] || return 1
+    # a part finished by the pre-#237 sweep holds candidate CARDS, not generated lines: it is redone
+    ! grep -qE '^#{2,3} +[A-Z][0-9]+' "$3" 2>/dev/null
   }
   _kept=0
   for _k in $(seq 1 "$_K"); do
@@ -1096,10 +1001,6 @@ $(sweep_group_inputs "$_k" "$_K" "$_gf" "$_gout")" "${STAGE_ISOLATION[@]}" --out
     python3 "$CODE/maxtok_check.py" --stage "sweep-$_k" --since "$STAGE_MARK" \
       --projects "$PROJ_DIR" >> "$LOG" 2>&1 || true
     [ "$SWEEP_OK" = "1" ] || break
-    shopt -s nullglob
-    _gparts=("${_gout%.md}-part"*.md "${_gout%.md}-final.md")
-    shopt -u nullglob
-    if [ ${#_gparts[@]} -gt 0 ]; then reassemble "$_gout" "${_gparts[@]}"; fi
     _o=absent; if [ -e "$_gout" ]; then _o=$(sha_of "$_gout"); fi
     printf 'part=%s\ngroup_sha256=%s\noutput_sha256=%s\nat=%s\n' "$_k" "$(sha_of "$_gf")" "$_o" "$(date -Is)" > "$_rec.tmp"
     mv "$_rec.tmp" "$_rec"
@@ -1112,30 +1013,15 @@ $(sweep_group_inputs "$_k" "$_K" "$_gf" "$_gout")" "${STAGE_ISOLATION[@]}" --out
     SWEEP_OK=0
     echo "$(date -Is) prepare incomplete: $PREPARE_COMPLETED chunk(s) completed, expected $(wc -l < "$SWEEP_SOURCE_INDEX"); source identities must match exactly — $_kept of $_K part(s) kept with a completion record in $PREP_DIR; the next run continues this frozen list before it collects a new window" >> "$LOG"
   else
-    # every part is complete: build the sweep file from the part outputs, in order, from nothing
-    : > "$SWEEP.tmp"
+    # every part is complete: its generated lines are committed below (generated_marks.py build)
     for _k in $(seq 1 "$_K"); do
       _gout=$(part_out "$_k")
-      if [ ! -s "$_gout" ]; then
-        echo "$(date -Is) sweep part $_k/$_K produced no candidates" >> "$LOG"
-      elif [ "$_k" = "1" ]; then
-        cp "$_gout" "$SWEEP.tmp"
-      elif ! python3 "$BATCH_TOOL" merge "$SWEEP.tmp" "$_gout" --relabel-base $((_k * 1000)) >> "$LOG" 2>&1; then
-        SWEEP_OK=0
-        echo "$(date -Is) sweep part $_k/$_K merge FAILED — its candidates are not in $SWEEP, so the sweep is incomplete (the parts stay complete; the next run builds the sweep file again)" >> "$LOG"
-        break
-      fi
+      if [ -s "$_gout" ]; then GEN_PARTS+=("$_gout"); else echo "$(date -Is) generator part $_k/$_K wrote no line" >> "$LOG"; fi
     done
-    if [ "$SWEEP_OK" = "1" ]; then mv "$SWEEP.tmp" "$SWEEP"; else rm -f "$SWEEP.tmp"; fi
   fi
 else
-RETRY_DEADLINE_EPOCH=$SWEEP_DEADLINE retry_claude_call sweep "$SWEEP_TIMEOUT" "$LOG" "$STAGE_MARK" -- \
-  "$AGENT_BIN" -p "$SWEEP_PROMPT" "${STAGE_ISOLATION[@]}" --output-format json --model "$SWEEP_MODEL" --allowedTools $TOOLS || SWEEP_OK=0
-# max_tokens guard over the LAST attempt (STAGE_MARK is re-stamped by each attempt).
-# Report, not gate: `|| true` keeps a check that is meant to be non-fatal from killing the run
-# under `set -e` (already paid for once, with weeks of lost nights).
-python3 "$CODE/maxtok_check.py" --stage sweep --since "$STAGE_MARK" \
-  --projects "$PROJ_DIR" >> "$LOG" 2>&1 || true
+  # no primary source chunk at all (an empty window that is not NO_WINDOW): nothing to generate, no call
+  echo "$(date -Is) generator: no primary source chunk in the window — nothing to generate" >> "$LOG"
 fi
 
 if [ "$SWEEP_OK" -ne 1 ]; then
@@ -1157,110 +1043,35 @@ if [ -s "$SWEEP_FAILED_FILE" ]; then
 fi
 rm -f "$SWEEP_FAILED_FILE"
 
-# 2a) REASSEMBLY. On a day too big for one pass the sweep splits its own output into part files and
-# numbers the chunks A1.., B1.., C1.. — but it is launched with `--allowedTools Read Write Edit Glob
-# Grep` (no Bash) and therefore CANNOT run the merge it writes for itself. Once that left 221 candidates
-# scattered across five parts with the "final" file holding only two of the chunks (77 cards), so
-# consolidating from it would have silently dropped 144 candidates. The driver has Bash; it does the
-# merge. Parts are appended in lexical order AFTER whatever the sweep put in $SWEEP, and only cards
-# whose temp label is not already present are taken, so a part that was already merged by hand — or
-# by the sweep's own merge.py — cannot be duplicated.
-shopt -s nullglob
-PARTS=("$STAGING/nightly-$SK-sweep-part"*.md "$STAGING/nightly-$SK-sweep-final.md")
-shopt -u nullglob
-if [ ${#PARTS[@]} -gt 0 ]; then
-  reassemble "$SWEEP" "${PARTS[@]}"
-fi
-
-# 2b) mechanical grounding check — non-fatal, its report is an INPUT to consolidate.
-# Deliberately not fatal: a sweep with some ungrounded cards is still worth consolidating, and the
-# consolidate stage is instructed to strip exactly what this report names.
-# `|| true` is LOAD-BEARING: verify_quotes.py exits 1 whenever it finds any
-# failure, and this script runs under `set -euo pipefail`. Without it the run
-# died here — silently, before consolidation, before the timestamp, and before
-# its own "FAILED" line could be written. Every nightly from 2026-07-28 onward
-# was lost that way; the comment above already said "deliberately not fatal"
-# while the code made it fatal.
-# journal= is $JVERIFY since board #209: the window's journals PLUS every journal from the ledger
-# floor on, because a MARK-stage candidate quotes a queued mark from its own (older) day.
-run_quotecheck() {   # run_quotecheck <file> -> appends to $QREPORT
-  python3 "$CODE/verify_quotes.py" "$1" \
-    --source digest="$DIGEST" --source journal="$JVERIFY" --source gitlog="$GITLOG" \
-    >> "$QREPORT" 2>&1 || true
-}
-
-# A prepare candidate must never claim journal grounding, even if a model ignores its prompt.
-# Enforce before record-stage candidates join the shared list; legacy carry stays untouched.
-python3 - "$SWEEP" <<'PYPREPARE'
-import pathlib, re, sys
-p = pathlib.Path(sys.argv[1])
-if p.exists():
-    blocks = re.split(r"(?m)(?=^#{2,3} +[A-Z]\d+[a-z]?\b)", p.read_text(encoding="utf-8"))
-    p.write_text("".join(b for b in blocks if not re.search(r"src=journal\s*::", b)), encoding="utf-8")
-PYPREPARE
-python3 "$CODE/verify_quotes.py" "$SWEEP" --source digest="$DIGEST" --source gitlog="$GITLOG" \
-  >> "$QREPORT" 2>&1 || true
-
-run_quotecheck "$SWEEP"
-echo "$(date -Is) quotecheck: $(tail -1 "$QREPORT")" >> "$LOG"
-
-# 2d) === nearest === — the mechanical half of merge pressure, 0 API tokens.
-# Every candidate is annotated with the three ACTIVE cards the retrieval layer
-# ranks closest to it, so the consolidate stage is asked "what does this
-# replace?" with the answer's candidates already in front of it — instead of
-# being asked to link against whatever it happened to read, which is how the
-# reference base accumulated 17 cards about one measured voltage.
-# NON-FATAL (paid for once): a ranking bug must not cost the night's
-# cards. Without NEAREST lines the consolidate stage still runs; only the
-# `RELATION: new` check downstream loses its evidence, and step 4a refuses to
-# run the gate in that case rather than dropping candidates for the tool's own
-# reason.
-echo "$(date -Is) === nearest === annotating $SWEEP" >> "$LOG"
-python3 "$CODE/nearest_cards.py" "$SWEEP" >> "$LOG" 2>&1 \
-  || echo "$(date -Is) === nearest === FAILED (non-fatal) — consolidate runs without NEAREST lines" >> "$LOG"
-
-# 2e) SPLIT INTO THE CARRY QUEUE — ONE ATOMIC COMMIT (review P1-4). Tonight's candidates, the
-# sweep's `## MARKS NOT CARDED` verdicts and tonight's WINDOW are written into (the MARK stage's
-# results are already in carry, each chunk in its own directory, step 1e)
-# $CARRY/.split-$SK.tmp and committed by ONE rename to $CARRY/$SK. A kill before the rename leaves
-# nothing (the window is not stamped and is swept again); a kill after it leaves everything,
-# and the next run reads the window back from $CARRY/$SK/WINDOW. A split failure falls back to
-# ONE batch holding the whole sweep file, committed the same way — never to nothing.
-SPLIT_OK=1
-if [ -s "$SWEEP" ]; then
-  SPLIT_LIST=$STAGING/nightly-$SK-split.txt
-  _bf=""; [ "${NIGHTLY_FAULT:-}" = "split-before-commit" ] && _bf=split-before-commit
-  if NIGHTLY_BATCH_FAULT="$_bf" python3 "$BATCH_TOOL" split-run "$SWEEP" --size "$CONSOLIDATE_BATCH" \
-       --carry "$CARRY" --run "$SK" --window "$WINDOW_END" > "$SPLIT_LIST" 2>>"$LOG"; then
-    echo "$(date -Is) split: $(python3 "$BATCH_TOOL" count "$SWEEP") candidate(s) -> $(grep -c '/cons-' "$SPLIT_LIST") batch(es) of <= $CONSOLIDATE_BATCH committed in $CARRY/$SK" >> "$LOG"
+# 2e) COMMIT THE GENERATED LINES — ONE RENAME (#237 step 2). generated_marks.py keeps every well-formed,
+# know-how line whose span its source really holds, once, and writes them with the window into
+# memory/ledger/generated/<SK>.md (tmp + rename). A kill before the rename leaves nothing (the window is not
+# stamped and is generated again); a kill after it leaves the file, whose WINDOW the next run reads back
+# (see THE GENERATED LINES above). A refusal because the file exists means an earlier run committed it.
+GEN_OK=1
+if [ ${#GEN_PARTS[@]} -gt 0 ]; then
+  GEN_FILE=$GENERATED/$SK.md
+  if [ -e "$GEN_FILE" ]; then
+    echo "$(date -Is) generator: $GEN_FILE is already committed — not rebuilt" >> "$LOG"
+  elif python3 "$CODE/generated_marks.py" build --out "$GEN_FILE" --window "$SINCE -> $WINDOW_END" \
+         --source digest="$DIGEST" --source gitlog="$GITLOG" \
+         --rejects "$STAGING/nightly-$SK-generate-rejects.txt" "${GEN_PARTS[@]}" >> "$LOG" 2>&1; then
+    fault_point generate-after-commit
   else
-    fault_point split-before-commit
-    if [ -d "$CARRY/$SK" ]; then
-      echo "$(date -Is) split reported a failure AFTER its commit — $CARRY/$SK is complete, continuing" >> "$LOG"
-    else
-      SPLIT_OK=0
-      rm -rf "$CARRY/.split-$SK.tmp"
-      mkdir -p "$CARRY/.split-$SK.tmp"
-      cp "$SWEEP" "$CARRY/.split-$SK.tmp/cons-01.md"
-      echo "$WINDOW_END" > "$CARRY/.split-$SK.tmp/WINDOW"
-      mv -T "$CARRY/.split-$SK.tmp" "$CARRY/$SK"
-      echo "$(date -Is) split FAILED (non-fatal) — the whole sweep file is ONE carried batch in $CARRY/$SK" >> "$LOG"
-    fi
+    GEN_OK=0
+    FAILED_STAGES="$FAILED_STAGES generate-commit"
+    echo "$(date -Is) generator: committing the lines FAILED — the window is not stamped and is generated again" >> "$LOG"
   fi
 fi
 
-# THE WINDOW IS PERSISTED NOW, so the stamp moves here (board #209): every candidate of the
-# window is in the committed run directory, and the queue lives in the ledger. Only when the
-# commit really happened (or there was nothing to commit) — a stamp over an uncommitted window
-# is exactly the loss this ordering exists to prevent. A failed SWEEP leaves the stamp alone.
-# The window's END is this run's start -- or, for a resumed frozen list, the start of the run that
-# collected it (WINDOW_END), so the next window begins exactly where the frozen one ended. Only now is
-# the frozen list done with: its parts are committed with the window.
-if [ "$DRYRUN" != "1" ] && { [ -d "$CARRY/$SK" ] || [ ! -s "$SWEEP" ]; }; then
+# THE WINDOW IS PERSISTED NOW, so the stamp moves here: every line of the window is in the committed file (or
+# there was nothing to commit). The window's END is this run's start -- or, for a resumed frozen list, the
+# start of the run that collected it (WINDOW_END). Only now is the frozen list done with.
+if [ "$DRYRUN" != "1" ] && [ "$GEN_OK" = "1" ]; then
   echo "$WINDOW_END" > "$STAMP"
   if [ -d "$STAGING/.prepare-$SK" ]; then
     rm -rf "$STAGING/.prepare-$SK"
-    echo "$(date -Is) prepare: the frozen list $SK is complete and committed to $CARRY/$SK — window stamped at $WINDOW_END" >> "$LOG"
+    echo "$(date -Is) prepare: the frozen list $SK is complete and its lines committed — window stamped at $WINDOW_END" >> "$LOG"
   fi
 fi
 
@@ -1287,13 +1098,15 @@ fi   # SWEEP_OK
 # MOVED, whole, under `## DROPPED (no valid RELATION)`; NO `--max` since board #209). The gate
 # is SKIPPED if the NEAREST annotation fails — a RELATION gate without NEAREST lines would drop
 # candidates for the tool's own reason (a check failing for its own reason, not the candidate's).
-postprocess_batch() {
+postprocess_batch() {   # postprocess_batch <file> <night key> <tag> [digest source] [gitlog source]
   local f="$1" d="$2" tag="${3//\//-}"
   local dg="$STAGING/nightly-$d-digest.txt" jv="$STAGING/nightly-$d-journals-ledger.md"
   local gl="$STAGING/nightly-$d-git.txt" qr="$STAGING/nightly-$NK-quotecheck-$tag.txt"
   local rr="$STAGING/nightly-$NK-relations-$tag.txt"
   [ -f "$jv" ] || jv="$STAGING/nightly-$d-journals.md"
   [ -f "$dg" ] || { dg=$DIGEST; gl=$GITLOG; jv=$JVERIFY; }
+  if [ -n "${4:-}" ]; then dg=$4; fi
+  if [ -n "${5:-}" ]; then gl=$5; fi
   ledger attribute "$f" >> "$LOG" 2>&1 || echo "$(date -Is) mark attribution (post $tag) FAILED (non-fatal)" >> "$LOG"
   python3 "$CODE/verify_quotes.py" "$f" --source digest="$dg" --source journal="$jv" \
     --source gitlog="$gl" > "$qr" 2>&1 || true
@@ -1341,6 +1154,69 @@ finish_batch() {    # the carry cleanup — repeatable, the batch is already pub
   python3 "$BATCH_TOOL" merge "$PROPOSED_SO_FAR" "$UNIT" >> "$LOG" 2>&1 || true
   return 0
 }
+# 2f) THE MARK STAGE — THE PER-MARK EVALUATOR (#237). Every OPEN, not-proposed tracked id -- journal MARKs
+# (`M-`) and the generated lines (`G-`, step 2e, this window's and any earlier one still OPEN) on ONE time
+# axis -- goes through permark.py: one packet, one call without tools, one decision, until MARK_BUDGET_MIN
+# from this stage's start (no new mark after it). Its output is ONE transaction: post-checked (attribute,
+# quote check, NEAREST, RELATION gate) and committed with ONE rename as $CARRY/<night key>-m01/ including
+# every batch's durable output (split-run --ready), so the consolidation below publishes it WITHOUT a model
+# call. A kill before the rename leaves its marks OPEN (they are evaluated again: it costs money, nothing
+# is lost); a kill after it leaves the whole result in carry, where the ledger counts its ids as proposed.
+# A deadline or the usage limit ends the evaluator early: what it decided is committed, the rest stays OPEN.
+mark_commit() {   # mark_commit <evaluator output> <run key> <chunk number> -> 0 when committed as $CARRY/<run key>
+  local out="$1" key="$2" k="$3" rel="$STAGING/nightly-$2-carry.md"
+  local gd="$STAGING/nightly-$NK-ground-digest.txt" gg="$STAGING/nightly-$NK-ground-git.txt"
+  rm -f "$rel"
+  python3 "$BATCH_TOOL" merge "$rel" "$out" --letter M --relabel-base $((k * 1000)) >> "$LOG" 2>&1 || return 1
+  # A generated line is quoted from ITS window's source; the committed generated files hold every such span
+  # verbatim (generated_marks.py checked them against that source), so they ground it on any later night.
+  { cat "$DIGEST" 2>/dev/null; cat "$GENERATED"/*.md 2>/dev/null; } > "$gd" || true
+  { cat "$GITLOG" 2>/dev/null; cat "$GENERATED"/*.md 2>/dev/null; } > "$gg" || true
+  postprocess_batch "$rel" "$NK" "$key" "$gd" "$gg"
+  fault_point "marks-before-commit-$k"
+  if ! python3 "$BATCH_TOOL" split-run "$rel" --size "$CONSOLIDATE_BATCH" --carry "$CARRY" --run "$key" --ready \
+       > /dev/null 2>>"$LOG"; then
+    [ -d "$CARRY/$key" ] || return 1
+    echo "$(date -Is) marks-$k: split reported a failure AFTER its commit — $CARRY/$key is complete" >> "$LOG"
+  fi
+  echo "$(date -Is) marks-$k committed: $(python3 "$BATCH_TOOL" count "$rel") candidate(s) and $(grep -cE '^- [MG]-[0-9a-f]{8} ::' "$rel" || true) NOT CARDED verdict(s) -> $CARRY/$key (ready: no consolidate call)" >> "$LOG"
+  fault_point "marks-after-commit-$k"
+  return 0
+}
+MARK_PHASE_START=$(date +%s)
+MARK_DEADLINE=$((MARK_PHASE_START + ${MARK_BUDGET_S:-$((MARK_BUDGET_MIN * 60))}))   # _S: test seam
+ledger sync >> "$LOG" 2>&1 || echo "$(date -Is) mark ledger sync (marks) FAILED (non-fatal)" >> "$LOG"
+ledger queue --out "$QUEUE" >> "$LOG" 2>&1 \
+  || { echo "$(date -Is) mark ledger queue FAILED (non-fatal) — no MARK stage tonight" >> "$LOG"; : > "$QUEUE"; }
+QUEUE_N=$(grep -cE '^- [MG]-' "$QUEUE" 2>/dev/null) || QUEUE_N=0
+QUEUE_G=$(grep -cE '^- G-' "$QUEUE" 2>/dev/null) || QUEUE_G=0
+echo "$(date -Is) === marks === per-mark evaluator: $QUEUE_N queued id(s) ($QUEUE_G generated line(s)); no new mark after $(date -d @"$MARK_DEADLINE" +%H:%M) (+${MARK_BUDGET_MIN} min from this stage's start)" >> "$LOG"
+MOUT=$STAGING/nightly-$NK-markout.md
+MKEY=$NK-m01
+if [ "$QUEUE_N" -gt 0 ] && [ -n "$AGENT_BIN" ] && ! limit_stop "the MARK stage ($QUEUE_N queued id(s) stay OPEN)"; then
+  PRC=0
+  python3 "$CODE/permark.py" --queue "$QUEUE" --out "$MOUT" --deadline "$MARK_DEADLINE" --agent "$AGENT_BIN" \
+    --model "$MARK_MODEL" --timeout "$PERMARK_TIMEOUT_S" --log "$LOG" --jsonl "$STAGING/nightly-$NK-permark.jsonl" \
+    --served-file "$RETRY_SERVED_FILE" --limit-flag "$RETRY_LIMIT_FLAG" > /dev/null 2>>"$LOG" || PRC=$?
+  if [ "$PRC" = "75" ]; then limit_stop "the rest of the MARK queue" || true; fi
+  if [ "$PRC" != "0" ] && [ "$PRC" != "75" ]; then
+    FAILED_STAGES="$FAILED_STAGES marks"
+    echo "$(date -Is) marks: the evaluator FAILED (rc=$PRC) — what it decided is still committed; the rest stays OPEN" >> "$LOG"
+  fi
+  if [ -s "$MOUT" ] && grep -qE '^(MARKS: |- [MG]-[0-9a-f]{8} ::)' "$MOUT"; then
+    if ! mark_commit "$MOUT" "$MKEY" 1; then
+      FAILED_STAGES="$FAILED_STAGES marks-commit"
+      echo "$(date -Is) marks: commit to the carry queue FAILED — nothing of it is used, its marks stay OPEN for the next night" >> "$LOG"
+    fi
+    ledger coverage "$MOUT" --queue "$QUEUE" >> "$LOG" 2>&1 || true
+    knowhow_line "marks" "$MOUT"
+  else
+    echo "$(date -Is) marks: the evaluator decided no mark tonight — the queue stays OPEN" >> "$LOG"
+  fi
+elif [ "$QUEUE_N" -gt 0 ] && [ -z "$AGENT_BIN" ]; then
+  echo "$(date -Is) marks: NOT STARTED — no agent CLI; $QUEUE_N id(s) stay OPEN" >> "$LOG"
+fi
+
 CB=0; CB_DONE=0; CB_LEFT=0; CB_LIMIT=0
 PUBLISHED_UNITS=()
 # THE CONSOLIDATION'S OWN DEADLINE (#232): counted from here, after the MARK stage and the sweep.

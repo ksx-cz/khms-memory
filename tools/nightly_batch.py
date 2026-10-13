@@ -30,7 +30,7 @@ between them left the batch to be consolidated again and merged again (a label
 clash was renamed, never recognised).  Now every step is idempotent and keyed
 by a stable BATCH ID, so a run killed anywhere repeats nothing that finished:
 
-    split-run SWEEP --carry C --run NK [--window TS]
+    split-run SWEEP --carry C --run NK [--window TS] [--ready]
           writes the batches (+ NOT CARDED + WINDOW) into C/.split-NK.tmp/ and
           COMMITS them with one rename to C/NK/ — a kill before the rename
           leaves no batch (and no stamp), a kill after it leaves all of them
@@ -38,6 +38,10 @@ by a stable BATCH ID, so a run killed anywhere repeats nothing that finished:
           Without --window no WINDOW file is written: a MARK-stage chunk
           (C/<night key>-mNN, PMARKFIRST) is not a window of the sweep and must
           never move the sweep's stamp.
+          --ready (#237): the input is ALREADY consolidated (the per-mark evaluator writes
+          approve-ready candidates), so each cons-NN.md gets its durable output
+          cons-NN.out.md in the same temp directory and the same rename; the
+          night then publishes the batch from it without a model call.
     publish SRC --unit U --batch-id ID --record R [--relabel-base N]
           creates the inbox unit U from SRC with an exclusive link (never an
           overwrite), then records ID in R.  U already there with the same
@@ -235,6 +239,11 @@ def cmd_split_run(a):
                             f"(candidates {k + 1}-{min(k + n, len(cards))} of {len(cards)})\n",
                             cards[k:k + n], rest if idx == 1 else []))
         names.append(name)
+        if a.ready:                        # the batch IS its output (#237): no consolidate call
+            with open(os.path.join(tmp, f"cons-{idx:02d}.out.md"), "x", encoding="utf-8") as fh:
+                fh.write(render(f"# ready output of batch {idx} of run {a.run} — written by the per-mark "
+                                f"evaluator, published without a consolidate call\n",
+                                cards[k:k + n], rest if idx == 1 else []))
     if notc:
         with open(os.path.join(tmp, "notcarded.md"), "x", encoding="utf-8") as fh:
             fh.write(render("", [], [(NOT_CARDED, "".join(b for _h, b in notc))]))
@@ -493,6 +502,9 @@ def main(argv=None):
     s.add_argument("--carry", required=True)
     s.add_argument("--run", required=True)
     s.add_argument("--window", default=None)
+    s.add_argument("--ready", action="store_true",
+                   help="also write each batch's durable output cons-NN.out.md (the batch is already "
+                        "consolidated: the per-mark evaluator's output, #237) in the same commit")
     s.set_defaults(fn=cmd_split_run)
     s = sub.add_parser("publish")
     s.add_argument("src")

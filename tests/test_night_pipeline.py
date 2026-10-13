@@ -20,53 +20,77 @@ CARD = "K-%05d" % 11          # an id a fresh base would allocate; built, never 
 KINDS = ["decision", "finding", "requirement", "gotcha", "error", "khms-issue", "measurement", "refuted"]
 
 FAKE = r'''#!/usr/bin/env python3
-# Fake agent CLI: sweep / MARK stage / consolidate, by the shape of the prompt (`-p <prompt>`).
+# Fake agent CLI, answering each stage by the shape of its call: the per-mark evaluator (#237: `--system-prompt`,
+# the packet on stdin, a JSON result on stdout), the generator (`-p` prompt with `prepare PART k OF n`), and the
+# consolidate stage (pre-#237 carried batches).
 import json, os, re, sys
 args = sys.argv[1:]
 if args[:1] == ["--version"]:        # a real run logs the agent's version once (#232); not a stage call
     print("0.0.0 (fake agent)"); sys.exit(0)
-prompt = args[args.index("-p") + 1] if "-p" in args else ""
+permark = "--system-prompt" in args
+prompt = sys.stdin.read() if permark else (args[args.index("-p") + 1] if "-p" in args else "")
 def field(rx):
     m = re.findall(rx, prompt, re.M)
     return m[-1].strip() if m else ""
 out = field(r"^OUTPUT FILE: (.+)$")
-stage = ("marks" if "MARK QUEUE chunk:" in prompt else
-         "consolidate" if "sweep candidates" in prompt else "sweep")
+mk = re.search(r"^- ([MG]-[0-9a-f]{8}) \|[^|]*\|[^|]*\|[^|]*\| (.*)$", prompt, re.M) if permark else None
+stage = ("permark" if permark else "consolidate" if "sweep candidates" in prompt else "sweep")
 with open(os.environ["FAKE_CALLS"], "a") as fh:
-    fh.write(stage + " " + os.path.basename(out) + "\n")
+    fh.write(stage + " " + (mk.group(1) if mk else os.path.basename(out)) + "\n")
 with open(os.environ["FAKE_CALLS"] + ".jsonl", "a") as fh:
-    fh.write(json.dumps({"stage": stage, "prompt": prompt, "args": args, "pid": os.getpid()}) + "\n")
+    fh.write(json.dumps({"stage": stage, "prompt": prompt, "args": [a for a in args if len(a) < 400],
+                         "id": mk.group(1) if mk else "", "pid": os.getpid()}) + "\n")
 if os.environ.get("FAKE_FAIL") == stage:
     sys.exit(1)
-def card(label, text, extra=""):
+def card(label, text, extra="", src="journal", quote=None):
     return (f"### {label}: {text[:40]}\nWHAT: {text}\n{extra}RELATION: supports CARDID\n"
-            f"NEAREST: CARDID (0.0300)\n**QUOTES:**\n- src=journal :: {text}\n\n")
-if stage == "marks":
-    body = "# marks\n"
-    dropped = []
-    for i, line in enumerate(open(field(r"^- MARK QUEUE chunk: (.+)$")), 1):
-        m = re.match(r"^- (M-[0-9a-f]{8}) \|[^|]*\|[^|]*\|[^|]*\| (.*)$", line)
-        if m and "status line" in m.group(2):
-            dropped.append(f"- {m.group(1)} :: not know-how: status line")
-        elif m:
-            body += card(f"M{i}", m.group(2), f"MARKS: {m.group(1)}\n")
-    body += "## MARKS NOT CARDED\n" + "\n".join(dropped) + "\n"
-    open(out, "w").write(body)
+            f"NEAREST: CARDID (0.0300)\n**QUOTES:**\n- src={src} :: {quote or text}\n\n")
+if permark:
+    mid, text = mk.group(1), mk.group(2)
+    if os.environ.get("FAKE_PERMARK_KILL") == mid:     # an OOM kill or a reboot: the driver AND its evaluator die
+        pp = os.getppid()
+        driver = int(open(f"/proc/{pp}/stat").read().rsplit(")", 1)[1].split()[1])
+        os.kill(driver, 9); os.kill(pp, 9); sys.exit(1)
+    if os.environ.get("FAKE_MARK_SLEEP"):
+        import time; time.sleep(float(os.environ["FAKE_MARK_SLEEP"]))
+    if os.environ.get("FAKE_PERMARK_NOJSON"):           # a CLI that printed no JSON result
+        print("no json here"); sys.exit(0)
+    g = re.search(r"\(src=(digest|gitlog) [^)]*\) :: \"(.*)\"$", text)
+    if os.environ.get("FAKE_UNPARSED") and mid in os.environ["FAKE_UNPARSED"]:
+        ans = "I am not sure."
+    elif g:
+        ans = "DECISION: new\n" + card("M1", text.split(" (src=")[0], f"MARKS: {mid}\n", g.group(1), g.group(2))
+    else:
+        ans = "DECISION: new\n" + card("M1", text, f"MARKS: {mid}\n")
+    print(json.dumps({"type": "result", "result": ans, "is_error": False, "total_cost_usd": 0.01,
+                      "num_turns": 1, "modelUsage": {os.environ.get("FAKE_SERVED") or "fake-model-1": {}},
+                      "usage": {"input_tokens": 100, "output_tokens": 50}}))
 elif stage == "consolidate":
     text = open(field(r"^- sweep candidates[^:]*: (.+)$")).read()
     cards = [re.split(r"(?m)^## ", b)[0] for b in re.split(r"(?m)^(?=#{2,3} +[A-Z]\d+)", text)
              if re.match(r"#{2,3} +[A-Z]\d+", b)]
     open(out, "w").write("## Cards\n\n" + "".join(c.rstrip("\n") + "\n\n" for c in cards))
 else:
-    js = field(r"^- journal[^:]*: (.+)$")
-    body, n = "# nightly sweep - candidates\n", 0
-    for line in open(js) if js and os.path.exists(js) else []:
-        m = re.search(r"MARK\[[^\]]+\]\s*(.*)$", line)
-        if not m or "status line" in line:
-            continue
-        n += 1
-        body += card(f"C{n}", m.group(1).strip())
-    open(out, "w").write(body)
+    # the generator: one line per transcript record / commit subject of its chunks, grounded in the chunk
+    lines, sid = [], "00000000"
+    for chunk in re.findall(r"^  \* (.+)$", prompt, re.M):
+        for ln in open(chunk, encoding="utf-8", errors="replace"):
+            sm = re.match(r"^===== SESSION (\S+) =====", ln)
+            if sm:
+                sid = sm.group(1)
+            rm = re.match(r"^\[(\d{4}-\d{2}-\d{2}T\d{2}:\d{2})\] (?:USER|ASSISTANT): (.+)$", ln)
+            if rm:
+                span = rm.group(2).strip()[:60].strip()
+                lines.append(f"- {rm.group(1)}Z MARK[finding] generated {span[:40]} (src=digest sess {sid} "
+                             f"@{rm.group(1)[11:]}) :: \"{span}\"")
+            cm = re.match(r"^commit ([0-9a-f]{40})", ln)
+            if cm:
+                sha = cm.group(1)
+            gm = re.match(r"^    (\S.*)$", ln)
+            if gm and "sha" in dir():
+                lines.append(f"- 2099-01-01T10:00Z MARK[finding] generated {gm.group(1)[:40]} "
+                             f"(src=gitlog {sha[:12]}) :: \"{gm.group(1).strip()}\"")
+    open(out, "w").write("".join(l + "\n" for l in dict.fromkeys(lines)))
 '''.replace("CARDID", CARD)
 
 
@@ -187,18 +211,33 @@ def test_configured_sources_are_read(tmp_path):
 
 
 # --- carry and failure handling ---------------------------------------------------------------------
+def carry_legacy(root, n_batches=2, per=5, key="2099-01-01"):
+    """Batches a pre-#237 sweep left in the carry queue: they still need their consolidate call."""
+    d = root / "memory/ledger/carry" / key
+    d.mkdir(parents=True)
+    for b in range(1, n_batches + 1):
+        (d / f"cons-{b:02d}.md").write_text(f"# consolidate batch {b} of run {key}\n" + "".join(
+            f"### C{i}: carried candidate {b}-{i}\nWHAT: carried widget fact {b}-{i}\nRELATION: supports {CARD}\n"
+            f"NEAREST: {CARD} (0.0300)\n**QUOTES:**\n- src=digest :: carried widget fact {b}-{i}\n\n"
+            for i in range(1, per + 1)))
+    return d
+
+
 def test_a_failed_batch_is_carried_reported_and_finished_the_next_night(tmp_path):
     root, fake = make_base(tmp_path, n_marks=10)
+    carry_legacy(root)
     r = run_night(tmp_path, root, fake, FAKE_FAIL="consolidate", CONSOLIDATE_BATCH="5")
     log = log_of(root)
     assert r.returncode == 1 and "nightly INCOMPLETE" in log and "consolidate-" in log, log
-    assert cards_in(units(root)) == 0
+    # the evaluator's 10 candidates are published WITHOUT a consolidate call (#237); the carried batches wait
+    assert cards_in(units(root)) == 10
+    assert "consolidate-2099-01-02-m01" not in log, "an evaluator batch never gets a consolidate call"
     carried = list((root / "memory/ledger/carry").rglob("cons-*.md"))
     assert len(carried) == 2, carried
     assert (root / "state/shared/last-nightly").exists()            # the window itself is persisted
     r2 = run_night(tmp_path, root, fake, NIGHTLY_DATE="2099-01-03", CONSOLIDATE_BATCH="5")
     assert r2.returncode == 0, log_of(root)
-    assert cards_in(units(root)) == 10 and not list((root / "memory/ledger/carry").rglob("cons-*.md"))
+    assert cards_in(units(root)) == 20 and not list((root / "memory/ledger/carry").rglob("cons-*.md"))
 
 
 def test_a_failed_sweep_is_reported_unstamped_and_recorded(tmp_path):
@@ -270,14 +309,15 @@ def test_an_update_holding_the_code_lock_stops_the_night_and_a_running_night_sto
 
 
 # --- prompts ---------------------------------------------------------------------------------------
-@pytest.mark.parametrize("name", ["nightly-sweep", "nightly-marks", "nightly-consolidate",
+@pytest.mark.parametrize("name", ["nightly-generate", "nightly-marks", "nightly-consolidate",
                                   "weekly-part", "weekly-synthesis"])
 def test_every_stage_prompt_renders_completely_without_private_extensions(tmp_path, name):
     env = dict(os.environ, KHMS_ROOT=str(tmp_path))
     r = subprocess.run([sys.executable, os.path.join(TOOLS, "khms_prompt.py"), name], env=env,
                        capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
-    assert "{{" not in r.stdout and str(tmp_path) in r.stdout or name == "weekly-part"
+    # nightly-marks names no path since #237: permark.py inlines the schema and the tag registry itself
+    assert "{{" not in r.stdout and (str(tmp_path) in r.stdout or name in ("weekly-part", "nightly-marks"))
 
 
 def test_an_extension_replaces_the_shipped_default_and_a_bad_field_fails(tmp_path):
@@ -286,11 +326,11 @@ def test_an_extension_replaces_the_shipped_default_and_a_bad_field_fails(tmp_pat
     env = dict(os.environ, KHMS_ROOT=str(tmp_path))
     run = lambda n: subprocess.run([sys.executable, os.path.join(TOOLS, "khms_prompt.py"), n], env=env,
                                    capture_output=True, text=True)
-    base = run("nightly-sweep").stdout
-    assert "English only." in base
-    (ext / "nightly-sweep.summary-line.md").write_text("Use temp ids as headings. Add a SUMMARY line.\n")
-    got = run("nightly-sweep").stdout
-    assert "Add a SUMMARY line." in got and "English only." not in got
+    base = run("nightly-marks").stdout
+    assert "rarely `not know-how`" in base
+    (ext / "nightly-marks.principal-words.md").write_text("Quote the principal. Add a SUMMARY line.\n")
+    got = run("nightly-marks").stdout
+    assert "Add a SUMMARY line." in got and "rarely `not know-how`." not in got.split("## Your answer")[0]
     import khms_prompt
     tpl = os.path.join(TOOLS, "prompts", "zz-test.md")
     try:
@@ -515,15 +555,23 @@ def test_prepare_cannot_inject_journal_candidates(tmp_path):
     f.write_text(json.dumps({"type": "user", "timestamp": "2099-01-01T10:00:00Z",
                              "message": {"content": "unmarked calibration " * 30}}) + "\n")
     os.utime(f, (time.time() + 3600,) * 2)
-    # Deliberately disobedient fake prepare output: real journal text is not permission to ingest it.
-    fake.write_text(FAKE.replace('js = field(r"^- journal[^:]*: (.+)$")',
-                                'js = os.environ["INJECT_JOURNAL"]'))
+    # Deliberately disobedient fake generator output: real journal text is not permission to ingest it --
+    # neither under a journal label nor passed off as a digest span (#237: generated_marks.py rejects both).
+    inject = ("    jt = re.search(r'MARK\\[[^\\]]+\\] (.+)$', open(os.environ['INJECT_JOURNAL']).read(), re.M).group(1)\n"
+              "    lines = [f'- 2099-01-01T10:00Z MARK[finding] injected one (src=journal) :: \"{jt}\"',\n"
+              "             f'- 2099-01-01T10:00Z MARK[finding] injected two (src=digest sess s @10:00) :: \"{jt}\"']\n"
+              "    open(out, \"w\").write(\"\".join(l + ")
+    bad = FAKE.replace('    open(out, "w").write("".join(l + ', inject, 1)
+    assert bad != FAKE
+    fake.write_text(bad)
     r = run_night(tmp_path, root, fake, KHMS_TRANSCRIPTS=tr,
                   INJECT_JOURNAL=root / "journal/2099-01-01.md")
     assert r.returncode == 0, log_of(root)
     assert cards_in(units(root)) == 1
     text = "".join(p.read_text() for p in units(root))
-    assert "### C1:" not in text and "MARKS: M-" in text
+    assert "injected" not in text and "MARKS: M-" in text and "MARKS: G-" not in text
+    rejects = (root / "memory/inbox/.staging/nightly-2099-01-02-generate-rejects.txt").read_text()
+    assert "no source label and span" in rejects and "ungrounded" in rejects, rejects
 
 
 @pytest.mark.parametrize("group_size", [1, 2])

@@ -150,7 +150,7 @@ NEAREST_LINE_RE = re.compile(r"^[ \t]*NEAREST:.*$\n?", re.M)
 # REQUIRED, as for LINKS (review FRVCONVB probe PH: a wrapped prose line `MARKS it
 # finds there become verdicts.` was deleted from the body and the audit was silent).
 MARKS_LINE_RE = re.compile(r"^[ \t]*\*{0,2}MARKS:\*{0,2}[ \t]*(.*?)[ \t]*$\n?", re.M)
-MARK_ID_RE = re.compile(r"\bM-[0-9a-f]{8}\b")
+MARK_ID_RE = re.compile(r"\b[MG]-[0-9a-f]{8}\b")   # M- journal MARK, G- generated line (#237)
 
 
 def parse_marks(prose):

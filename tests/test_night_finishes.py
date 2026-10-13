@@ -21,29 +21,30 @@ import shutil
 import subprocess
 import sys
 
-from test_night_pipeline import TOOLS, WFAKE, env_for, journal, log_of, make_base, run_week
+from test_night_pipeline import TOOLS, WFAKE, carry_legacy, env_for, journal, log_of, make_base, run_week
 from test_sweep_resume import PART_FAKE, make_parts_base
 
-# The fake answers --version, can sleep in the MARK stage and in the FIRST consolidate call, and prints the
-# CLI's JSON result (modelUsage) when it is asked for `--output-format json` and FAKE_SERVED names a model.
+# The fake answers --version, can sleep in a generator part, in every evaluator call (FAKE_MARK_SLEEP, the base
+# fake) and in the FIRST consolidate call, and prints the CLI's JSON result (modelUsage) when it is asked for
+# `--output-format json` and FAKE_SERVED names a model (the evaluator's calls print their own JSON result).
 NF_FAKE = PART_FAKE.replace(
     "args = sys.argv[1:]\n",
     "args = sys.argv[1:]\n"
     "if args[:1] == ['--version']:\n"
     "    print('9.9.9 (fake agent)'); sys.exit(0)\n"
     "import atexit, time\n"
-    "if '--output-format' in args and os.environ.get('FAKE_SERVED'):\n"
+    "if '--output-format' in args and os.environ.get('FAKE_SERVED') and '--system-prompt' not in args:\n"
     "    atexit.register(lambda: print(json.dumps({'type': 'result', 'is_error': False, 'num_turns': 3,\n"
     "        'result': 'stage said done', 'total_cost_usd': 0.0123,\n"
     "        'modelUsage': {os.environ['FAKE_SERVED']: {'costUSD': 0.0123}}})))\n", 1).replace(
     "with open(os.environ[\"FAKE_CALLS\"], \"a\") as fh:\n    fh.write(stage",
-    "if stage == 'marks' and os.environ.get('FAKE_MARK_SLEEP'):\n"
-    "    time.sleep(float(os.environ['FAKE_MARK_SLEEP']))\n"
+    "if stage == 'sweep' and os.environ.get('FAKE_SWEEP_SLEEP'):\n"
+    "    time.sleep(float(os.environ['FAKE_SWEEP_SLEEP']))\n"
     "_slept = os.environ['FAKE_CALLS'] + '.cons-slept'\n"
     "if stage == 'consolidate' and os.environ.get('FAKE_CONS_SLEEP') and not os.path.exists(_slept):\n"
     "    open(_slept, 'w').close(); time.sleep(float(os.environ['FAKE_CONS_SLEEP']))\n"
     "with open(os.environ[\"FAKE_CALLS\"], \"a\") as fh:\n    fh.write(stage", 1)
-assert NF_FAKE.count("FAKE_MARK_SLEEP") == 2 and "--version" in NF_FAKE
+assert NF_FAKE.count("FAKE_SWEEP_SLEEP") == 2 and "--version" in NF_FAKE
 
 
 def base(tmp_path, n_marks=10):
@@ -57,7 +58,6 @@ def base(tmp_path, n_marks=10):
 
 
 def run(tmp_path, root, fake, tr, **extra):
-    extra.setdefault("MARK_CHUNK", "10")
     extra.setdefault("KHMS_TRANSCRIPTS", str(tr))
     return subprocess.run(["bash", os.path.join(TOOLS, "nightly_distill.sh")],
                           env=env_for(tmp_path, root, fake, **extra), capture_output=True, text=True,
@@ -76,14 +76,25 @@ def n_parts(log):
 
 
 # --- 1. own stage budgets ---------------------------------------------------------------------------
-def test_a_mark_stage_longer_than_the_sweep_budget_does_not_stop_the_sweep(tmp_path):
-    root, fake, tr = base(tmp_path)
-    r = run(tmp_path, root, fake, tr, FAKE_MARK_SLEEP="9", SWEEP_BUDGET_S="8")
+def test_a_generator_longer_than_the_mark_budget_does_not_stop_the_evaluator(tmp_path):
+    # #237: the generator runs first; the evaluator's budget is counted from ITS own start
+    root, fake, tr = base(tmp_path, n_marks=4)
+    r = run(tmp_path, root, fake, tr, FAKE_SWEEP_SLEEP="3", MARK_BUDGET_S="2")
     log = log_of(root)
-    assert "NOT STARTED" not in log, log
     k = n_parts(log)
     assert len(calls(tmp_path, "sweep")) == k and k >= 1, (calls(tmp_path, "sweep"), log)
-    assert "sweep OK" in log or "nightly done" in log, log
+    n_gen = len(re.findall(r"(?m)^- \S+Z MARK\[", (root / "memory/ledger/generated/2099-01-02.md").read_text()))
+    assert len(calls(tmp_path, "permark")) == 4 + n_gen and "deadline reached" not in log, log
+    assert r.returncode == 0, log
+
+
+def test_an_evaluator_call_past_its_own_deadline_stops_the_next_mark(tmp_path):
+    root, fake, tr = base(tmp_path, n_marks=3)
+    r = run(tmp_path, root, fake, tr, FAKE_MARK_SLEEP="3", MARK_BUDGET_S="2")
+    log = log_of(root)
+    assert len(calls(tmp_path, "permark")) == 1, (calls(tmp_path, "permark"), log)
+    assert re.search(r"permark: deadline reached — \d+ mark\(s\) left OPEN", log), log
+    assert "marks-1 committed: 1 candidate(s)" in log, log           # what it decided is committed
     assert r.returncode == 0, log
 
 
@@ -96,9 +107,10 @@ def test_a_sweep_part_is_still_clipped_to_the_sweeps_own_deadline(tmp_path):
 
 
 def test_consolidation_counts_its_budget_from_its_own_start(tmp_path):
-    # 10 marks in one MARK chunk -> 2 batches of 5 (plus the sweep's own); the MARK stage alone outlasts the
-    # consolidation budget (so batch 1 must still start), batch 1 outlasts it (so batch 2 must not)
-    root, fake, tr = base(tmp_path)
+    # two carried pre-#237 batches; the evaluator alone outlasts the consolidation budget (so batch 1 must
+    # still start), batch 1 outlasts it (so batch 2 must not)
+    root, fake, tr = base(tmp_path, n_marks=1)
+    carry_legacy(root)
     run(tmp_path, root, fake, tr, FAKE_MARK_SLEEP="7", CARD_BUDGET_S="5", FAKE_CONS_SLEEP="6",
         CONSOLIDATE_BATCH="5")
     log = log_of(root)
@@ -150,14 +162,15 @@ def test_a_real_run_logs_the_agent_path_and_version_once(tmp_path):
 
 def test_every_model_call_logs_the_model_that_served_it(tmp_path):
     root, fake, tr = base(tmp_path, n_marks=10)
+    carry_legacy(root)
     r = run(tmp_path, root, fake, tr, FAKE_SERVED="claude-fake-7", CONSOLIDATE_BATCH="5")
     log = log_of(root)
     assert r.returncode == 0, log
     served = re.findall(r"(?m) (\S+) served-by: (\S+)", log)
-    stages = {s.rsplit("-", 1)[0] if re.search(r"-\d+$", s) else s for s, _m in served}
-    assert {"marks", "sweep"} <= stages and any(s.startswith("consolidate") for s, _ in served), served
+    stages = {re.match(r"[a-z]+", s).group(0) for s, _m in served}
+    assert {"permark", "sweep", "consolidate"} <= stages, served
     assert all(m == "claude-fake-7" for _s, m in served), served
-    n_model_calls = sum(len(calls(tmp_path, s)) for s in ("marks", "sweep", "consolidate"))
+    n_model_calls = sum(len(calls(tmp_path, s)) for s in ("permark", "sweep", "consolidate"))
     assert len(served) == n_model_calls, (served, n_model_calls)
     assert "stage said done" in log                      # the stage's own answer is still in the log
     summary = [ln for ln in log.splitlines() if "models served this night:" in ln]
@@ -166,11 +179,15 @@ def test_every_model_call_logs_the_model_that_served_it(tmp_path):
 
 def test_a_call_without_a_json_result_is_logged_as_unknown_not_skipped(tmp_path):
     root, fake, tr = base(tmp_path, n_marks=3)
-    r = run(tmp_path, root, fake, tr)                     # FAKE_SERVED unset: the CLI printed no JSON
+    r = run(tmp_path, root, fake, tr, FAKE_PERMARK_NOJSON="1")   # FAKE_SERVED unset: the CLI printed no JSON
     log = log_of(root)
-    assert r.returncode == 0, log
     served = re.findall(r"(?m) (\S+) served-by: (\S+)", log)
     assert served and all(m == "UNKNOWN" for _s, m in served), served
+    # an evaluator call without a JSON result is retried once and then FAILED: the mark stays OPEN, nothing
+    # of it is written
+    n_eval = len(calls(tmp_path, "permark"))
+    assert n_eval > 0 and n_eval % 2 == 0 and sum(s.startswith("permark-") for s, _m in served) == n_eval
+    assert re.search(rf"failed={n_eval // 2}\b", log) and "the evaluator decided no mark tonight" in log, log
 
 
 def test_the_weekly_refuses_a_bare_agent_name_too(tmp_path):

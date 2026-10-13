@@ -167,27 +167,43 @@ check the review hashes, and rebuild the views before resuming. Per-file history
 is not an atomic history of the whole base. Missing history remains unavailable;
 it cannot be reconstructed as evidence from a derived packet or today's card.
 
-### The MARK stage runs first and keeps what it finished
+### The generator, then ONE per-mark evaluator for everything (#237)
 
-The OPEN journal MARKs of the coverage ledger (`mark_ledger.py queue`) are the
-night's FIRST model stage, before the sweep and whatever the sweep does (fail,
-time out, find nothing, find hundreds of candidates). It has its own budget,
-`MARK_BUDGET_MIN` counted from the stage's own start, and no gate on how many
-candidates already wait for consolidation; the night's other deadlines are
-unchanged. Every finished chunk — candidates and `## MARKS NOT CARDED` verdicts —
-is committed on its own, by one rename, as the carry directory
-`memory/ledger/carry/<night key>-mNN/` (no `WINDOW` file, so it never moves the
-sweep's stamp) and is published by the consolidation as units
-`<night key>-mNN-bKK.md`. A chunk killed before its commit leaves its marks OPEN
-(queued again, nothing of it used); a committed chunk counts as proposed and is
-never queued again.
+The night's sources reach the base through one evaluator:
+
+1. **The generator** (the former sweep, `prompts/nightly-generate.md`) reads the window's transcript and git
+   chunks, one fresh session per part, and writes candidate MARK-shaped LINES, not cards:
+   `- <UTC time>Z MARK[<kind>] <finding> (src=digest sess <id> @<HH:MM> | src=gitlog <sha>) :: "<span>"`.
+   `generated_marks.py build` keeps the well-formed, know-how lines whose span its source really holds,
+   once, and commits them with the window to `memory/ledger/generated/<night key>.md` by one rename; the
+   stamp moves then. Generated lines are NOT journal MARKs: their own file, their own `G-` id space,
+   `origin: generated` in the ledger; they are quoted with their own label (`src=digest`/`src=gitlog`).
+2. **The per-mark evaluator** (`permark.py`, `prompts/nightly-marks.md`) takes the ledger's queue — the OPEN
+   journal MARKs (`M-`) and generated lines (`G-`) on one time axis — and handles them one after another
+   until `MARK_BUDGET_MIN` (150 min) from its own start. For each it assembles a packet with 0 tokens (the
+   journal context, the cards the mark names, the lexical and hybrid top 8, tonight's candidates, a
+   transcript excerpt or `git show --stat` when the mark names a session or a commit) and makes ONE call
+   without tools; the answer is one decision (not carded, new, belongs to tonight's candidate X, already
+   carded K-x with a verbatim quote, supersede / contradict / erratum K-x). Marks are sequential on purpose:
+   each one sees every decision made before it, so a second mark on the same matter joins the first one's
+   candidate instead of becoming a duplicate.
+3. Its output is post-checked (attribute, quote check, NEAREST, RELATION gate) and committed once, by one
+   rename, as `memory/ledger/carry/<night key>-m01/` together with every batch's durable output
+   (`nightly_batch.py split-run --ready`), so it is published as units `<night key>-m01-bKK.md` WITHOUT a
+   consolidate call. A kill before that commit leaves its marks OPEN (they are evaluated again); a
+   committed result counts as proposed and is never queued again. Batches a pre-#237 night left in the
+   carry queue are still consolidated as before.
+
+`night_yield.py <night key>` reports what a night's proposals cost and how many the morning accepted, per
+stage: proposals, accepted, accepted/reviewed, $ per proposal and $ per accepted card (0 tokens, from the
+night log's `served-by` lines, the published units and the approval receipts).
 
 ### A night longer than its budget resumes, it does not start over
 
 The nightly sweep reads one window of sources (since the night stamp) in parts,
 one fresh model session per part (`SWEEP_GROUP_CHUNKS`). Each stage counts its time
-budget from its OWN start (`MARK_BUDGET_MIN`, `SWEEP_BUDGET_MIN`, `CARD_BUDGET_MIN`), so a
-long MARK stage cannot eat the sweep's time. When a window has more
+budget from its OWN start (`SWEEP_BUDGET_MIN`, `MARK_BUDGET_MIN`, `CARD_BUDGET_MIN`), so a
+long generator cannot eat the evaluator's time. When a window has more
 parts than one night's `SWEEP_BUDGET_MIN` covers, the finished parts are kept:
 
 - Before part 1, the run freezes the window's input list in
@@ -199,12 +215,12 @@ parts than one night's `SWEEP_BUDGET_MIN` covers, the finished parts are kept:
   CONTENT, not only their names. The window's inputs stay in staging under that
   run's night key.
 - Each finished part gets a completion record `done-NNN` beside `FROZEN`, renamed
-  into place after its call and reassembly: the sha256 of its part list and of its
+  into place after its call: the sha256 of its part list and of its
   output `nightly-<night key>-sweep-gNN.md`. A part without a valid record (killed,
   timed out, cut by the deadline) is redone from nothing; a recorded part never is.
 - The next run finds the frozen list, collects no new window, runs only the
-  parts without a record, and builds the sweep file from all part outputs in
-  order. Only when the whole list is complete and committed to the carry queue
+  parts without a record, and commits the lines of all part outputs (step 1
+  above). Only when the whole list is complete and its lines are committed
   does the stamp move — to the frozen `end`, so the next window starts exactly
   there and no input is skipped. A list the stamp already covers is removed; a
   damaged one (an input missing, or its content sha256 not the frozen one) is set

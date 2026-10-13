@@ -45,16 +45,16 @@ def _run(args, root, **env):
 # --- the ledger ---------------------------------------------------------------------------------------
 def test_default_denylist_is_the_owner_list():
     want = {'agent-done', 'agent-done-check', 'agent-fail', 'agent-partial', 'board-reply', 'board-archive',
-            'board', 'hotovo', 'stav', 'done', 'check', 'dispatch', 'deploy', 'review', 'merge', 'plan',
-            'handoff', 'report', 'overeno', 'potvrzeno', 'pending', 'resolved', 'verified', 'khms'}
+            'board', 'done', 'check', 'dispatch', 'deploy', 'review', 'merge', 'plan',
+            'handoff', 'report', 'pending', 'resolved', 'verified', 'khms'}
     assert set(ML.DEFAULT_STATUS_KINDS) == want
     # know-how kinds that #209 A2 decided to track stay tracked
-    for kind in ('owner-request', 'prusvih', 'fix', 'vyreseno', 'correction', 'owner-decision', 'defect',
-                 'khms-issue', 'nalez', 'chyba'):
+    for kind in ('owner-request', 'incident', 'fix', 'solved', 'correction', 'owner-decision', 'defect',
+                 'khms-issue', 'finding', 'error'):
         assert ML.status_kind(kind) is None, kind
 
 
-@pytest.mark.parametrize('raw', ['agent-done', 'AGENT-DONE', 'board-reply', 'ov\u011b\u0159eno', 'overeno',
+@pytest.mark.parametrize('raw', ['agent-done', 'AGENT-DONE', 'board-reply', 'v\u00e9rified', 'Verified',
                                  'agent-done→x', '**done**'])
 def test_status_kind_matches_spellings(raw):
     assert ML.status_kind(raw)
@@ -116,7 +116,7 @@ def fire(base, tool, tool_input, cwd=None):
 
 
 STATUS_LINE = '- 08:55 MARK[agent-done] NOSTAT #236: package finished\n'
-KNOW_LINE = '- 08:55 MARK[nalez] the ledger floor default is 1970-01-01, not the first tracked day\n'
+KNOW_LINE = '- 08:55 MARK[finding] the ledger floor default is 1970-01-01, not the first tracked day\n'
 PLAIN_LINE = '- 08:55 agent-done NOSTAT #236: package finished\n'
 
 
@@ -166,7 +166,7 @@ def test_bash_append_of_status_mark_is_refused_and_reads_pass(base):
 @pytest.mark.parametrize('cmd', [
     'echo "$(date -Is) MARK[board-reply] #236 answered (agent x)" >> {j}',
     "printf -- '- %s MARK[agent-done] %s\\n' \"$(date +%H:%M)\" X >> {j}",
-    "cat >> {j} <<'X'\n- 10:00 MARK[ov\u011b\u0159eno] CHECK green\nX",
+    "cat >> {j} <<'X'\n- 10:00 MARK[v\u00e9rified] CHECK green\nX",
     "echo '- 10:00 MARK[done] x' | tee -a {j}",
 ])
 def test_bash_writer_shapes_are_refused(base, cmd):
@@ -198,11 +198,11 @@ def test_relay_refuses_a_direct_status_mark(tmp_path):
 
 def test_relay_leaves_status_marks_of_a_handoff_out_and_says_so(tmp_path):
     h = tmp_path / 'handoff.md'
-    h.write_text('## MARKs\n- MARK[nalez] a reusable lesson (agent programmer #236)\n'
+    h.write_text('## MARKs\n- MARK[finding] a reusable lesson (agent programmer #236)\n'
                  '- MARK[done] package finished (agent programmer #236)\n## Other\n', encoding='utf-8')
     r = _run([TOOLS / 'journal_marks.py', '--handoff', h,
               '--journal-dir', tmp_path / 'journal', '--runtime-dir', tmp_path / 'rt'], tmp_path / 'base')
     assert r.returncode == 0, r.stderr
     text = ''.join(p.read_text() for p in (tmp_path / 'journal').glob('*.md'))
-    assert 'MARK[nalez]' in text and 'MARK[done]' not in text, text
+    assert 'MARK[finding]' in text and 'MARK[done]' not in text, text
     assert '1 status' in r.stdout + r.stderr, r.stdout + r.stderr
