@@ -10,7 +10,8 @@ a knowledge item that is neither carded nor consciously dismissed simply stopped
 since: no daily card limit at all, everything in the queue is processed, and every tracked MARK is
 accounted for.
 
-WHAT.  Every actual journal MARK, of any kind, gets a stable id and ends in exactly one state:
+WHAT.  Every actual journal MARK of any kind except a STATUS kind (below) gets a stable id and ends in
+exactly one state:
 
     CARDED     a card in memory/know/ covers it (card id recorded)
     DISMISSED  the reviewer dismissed it at morning review, with a reason, through this tool
@@ -41,7 +42,8 @@ marker directory, KHMS_SHARED_STATE/reviewed) counts only while it still describ
 `sha256=<hash of the unit>` (approve writes it), and a legacy marker without a hash counts only when
 the unit is not newer than the marker.  Anything appended after a review is unreviewed again.
 
-WHAT THE LEDGER DOES NOT COVER (printed by `sync`/`status`): journals before the floor and knowledge that never got a MARK line.  "OPEN 0" therefore means
+WHAT THE LEDGER DOES NOT COVER (printed by `sync`/`status`): journals before the floor, MARKs of a status
+kind (counted as `status_skipped`) and knowledge that never got a MARK line.  "OPEN 0" therefore means
 "every tracked MARK since the floor is carded or dismissed", not "nothing was lost anywhere".
 
 MARK KINDS.  The tracked kinds and their spellings are a table (canonical kind -> aliases).  The
@@ -49,6 +51,11 @@ shipped table is English.  A deployment whose journals use other words sets LEDG
 patterns file (KHMS_PATTERNS) to `canon:alias,alias;canon:alias,...`, which REPLACES the table.  The
 canonical name is part of every mark id (`M-` + sha1 of `<canon>|<text>`), so a deployment keeps its
 canonical names for as long as its ledger lives — renaming one re-ids every mark of that kind.
+
+STATUS KINDS (#236, owner 2026-10-13).  A status line (package done, board reply, deployed, checked, ...)
+is a plain journal line without MARK.  A MARK of a kind on the status DENYLIST (DEFAULT_STATUS_KINDS, or
+LEDGER_STATUS_KINDS in the patterns file) is not tracked; `sync`, summary.json (`status_skipped`) and the
+status line say how many such lines were skipped.  Every kind NOT on the denylist stays tracked.
 
 FLOOR.  The first journal day tracked: --floor, else $MARK_LEDGER_FLOOR, else memory/ledger/FLOOR,
 else 1970-01-01 (everything).  `floor` prints the one in effect.
@@ -84,6 +91,7 @@ import json
 import os
 import re
 import sys
+import unicodedata
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import khms_messages as M  # noqa: E402
@@ -96,7 +104,7 @@ DEFAULT_FLOOR = "1970-01-01"
 
 # --- which MARKs are knowledge -------------------------------------------------
 # Canonical aliases preserve existing IDs; unlisted real kinds are tracked under their
-# own names. Status/progress MARKs require an explicit review verdict too.
+# own names -- except the STATUS kinds below, which are never tracked.
 DEFAULT_KINDS = {
     "decision": ("decision", "decided"),
     "finding": ("finding", "found", "solved", "problem"),
@@ -126,6 +134,43 @@ def _kind_table():
 KIND_ALIASES = _kind_table()
 CANON = {alias: canon for canon, aliases in KIND_ALIASES.items() for alias in aliases}
 
+# Status / progress kinds are NOT know-how and are never tracked (#236, owner 2026-10-13: drop the status
+# lines and stop producing them): a status line is a plain journal line without MARK.  A DENYLIST, not an
+# allowlist: the closed allowlist before #209 A2 lost know-how written under kinds nobody had listed
+# (K-05341), so every kind not named here stays tracked.  The default is the status kinds the ledger
+# counted on 2026-10-13; a deployment replaces it with LEDGER_STATUS_KINDS in its patterns file (words
+# separated by spaces, commas or semicolons; `none` = track every kind).  Matching ignores case, the
+# diacritics (an accented spelling equals the plain one) and a `→status` tail.  A skipped status line is COUNTED
+# (`status_skipped` in summary.json, the sync output and the status line), never dropped silently (K-00586).
+DEFAULT_STATUS_KINDS = (
+    "agent-done", "agent-done-check", "agent-fail", "agent-partial", "board-reply", "board-archive",
+    "board", "hotovo", "stav", "done", "check", "dispatch", "deploy", "review", "merge", "plan",
+    "handoff", "report", "overeno", "potvrzeno", "pending", "resolved", "verified", "khms")
+
+
+def fold_kind(raw):
+    """A MARK kind token as the status denylist compares it: lower-case, no diacritics, no `**`/`` ` ``."""
+    k = unicodedata.normalize("NFKD", raw.strip("*`:").lower())
+    return "".join(c for c in k if not unicodedata.combining(c))
+
+
+def _status_table():
+    raw = PT.value("LEDGER_STATUS_KINDS", "")
+    if not raw.strip():
+        return frozenset(fold_kind(k) for k in DEFAULT_STATUS_KINDS)
+    if raw.strip().lower() == "none":
+        return frozenset()
+    return frozenset(fold_kind(w) for w in re.split(r"[\s,;]+", raw) if w.strip())
+
+
+STATUS_KINDS = _status_table()
+
+
+def status_kind(raw):
+    """-> the (folded) status kind of a MARK token when it is on the status denylist, else None."""
+    k = fold_kind(raw).split("→", 1)[0]
+    return k if k in STATUS_KINDS else None
+
 # A kind is a word (Czech letters, digits, `-`, `_`, one optional `→status` tail); a
 # placeholder in prose (`MARK[...]`, `MARK[<kind>]`, `MARK[..]`) is not a mark.
 KIND_SHAPE_RE = re.compile(r"^[^\W\d_][\w-]*(?:→[\w-]+)?$")
@@ -133,7 +178,9 @@ KIND_PLACEHOLDERS = frozenset(("kind", "x", "xxx"))
 
 
 def canon_kind(raw):
-    """-> the canonical tracked kind of a MARK token, or None (prose placeholder)."""
+    """-> the canonical tracked kind of a MARK token, or None (status kind, prose placeholder)."""
+    if status_kind(raw):
+        return None
     k = raw.strip("*`:").lower()
     if k in CANON:
         return CANON[k]
@@ -216,11 +263,20 @@ def mark_id(kind, text):
     return "M-" + h[:8]
 
 
-def parse_marks(line):
+def _skip(skipped, raw, text):
+    """True when the MARK token `raw` is a status kind; counts it into `skipped` (a dict) when given."""
+    sk = status_kind(raw)
+    if sk and text and skipped is not None:
+        skipped[sk] = skipped.get(sk, 0) + 1
+    return bool(sk)
+
+
+def parse_marks(line, skipped=None):
     """-> [(canonical kind, time 'HH:MM' or '', text), ...] — every tracked mark of a line.
     The FIRST mark's text runs to the end of the line exactly as before #209 A3, so its id
     is unchanged; a later MARK token (after a sentence end, outside backticks) adds a mark
-    whose text starts at that token."""
+    whose text starts at that token.  A token of a STATUS kind is not a tracked mark: it is
+    counted into `skipped` ({status kind: n}) when the caller passes one."""
     m = MARK_RE.match(line)
     if not m:
         entry = ENTRY_RE.match(line)
@@ -234,8 +290,10 @@ def parse_marks(line):
             before = line[:token.start()]
             if before.count("`") % 2 or not LATER_LEAD_RE.search(before):
                 continue
-            kind = canon_kind(token.group("kind"))
             text = line[token.end():].strip()
+            if _skip(skipped, token.group("kind"), text):
+                continue
+            kind = canon_kind(token.group("kind"))
             if kind and text:
                 out.append((kind, hm, text))
         return out
@@ -248,16 +306,19 @@ def parse_marks(line):
     if hm and len(hm) == 4:
         hm = "0" + hm
     out = []
-    kind = canon_kind(m.group("kind"))
-    if kind and text:
-        out.append((kind, hm, text))
+    if not _skip(skipped, m.group("kind"), text):
+        kind = canon_kind(m.group("kind"))
+        if kind and text:
+            out.append((kind, hm, text))
     rest_at = m.start("text")
     for t in TOKEN_RE.finditer(line, rest_at):
         before = line[:t.start()]
         if before.count("`") % 2 or not LATER_LEAD_RE.search(before):
             continue
-        k2 = canon_kind(t.group("kind"))
         t2 = line[t.end():].strip()
+        if _skip(skipped, t.group("kind"), t2):
+            continue
+        k2 = canon_kind(t.group("kind"))
         if k2 and t2:
             out.append((k2, hm, t2))
     return out
@@ -269,8 +330,9 @@ def parse_line(line):
     return p[0] if p else None
 
 
-def scan_journal(path):
-    """-> list of mark dicts found in one journal file (first occurrence per id)."""
+def scan_journal(path, skipped=None):
+    """-> list of mark dicts found in one journal file (first occurrence per id).  Status-kind
+    lines are counted into `skipped` ({status kind: n}) when given."""
     name = os.path.basename(path)
     jm = JOURNAL_NAME_RE.match(name)
     date = jm.group(1) if jm else ""
@@ -283,7 +345,7 @@ def scan_journal(path):
         for n, line in enumerate(fh, 1):
             if "MARK[" not in line:
                 continue
-            for kind, hm, text in parse_marks(line.rstrip("\n")):
+            for kind, hm, text in parse_marks(line.rstrip("\n"), skipped):
                 mid = mark_id(kind, text)
                 if mid in seen:
                     continue
@@ -305,11 +367,12 @@ def journal_files(paths, floor, until=None):
     return files
 
 
-def collect_marks(paths, floor, until=None):
-    """-> ordered dict id -> mark; a mark seen on several days keeps its first."""
+def collect_marks(paths, floor, until=None, skipped=None):
+    """-> ordered dict id -> mark; a mark seen on several days keeps its first.  Status-kind
+    lines are counted into `skipped` when given."""
     marks = {}
     for f in journal_files(paths, floor, until):
-        for mk in scan_journal(f):
+        for mk in scan_journal(f, skipped):
             if mk["id"] in marks:
                 marks[mk["id"]].setdefault("also", []).append(mk["loc"])
                 continue
@@ -612,13 +675,13 @@ def floor_of(paths, arg):
     return DEFAULT_FLOOR
 
 
-def derive(paths, floor, until=None):
+def derive(paths, floor, until=None, skipped=None):
     """State of every tracked mark.  CARDED only by a structured link — the card's
     `marks:` frontmatter or the coordinator's `card` event; the LAST event of an id
     wins; a `reopen` ignores the `marks:` links of the cards it names (the ones that
     existed when it was recorded), so it really reopens, and a card written later closes
     the mark again.  Heuristic matches are kept as `suggested`, never as coverage."""
-    marks = collect_marks(paths, floor, until)
+    marks = collect_marks(paths, floor, until, skipped)
     events = read_events(paths)
     cards = read_cards(paths)
     links = structural_links(cards)
@@ -717,10 +780,12 @@ def carry_count(paths):
 
 
 TRACKED_KINDS = sorted(KIND_ALIASES)  # base canonical kinds, not a tracking allowlist
-NOT_COVERED = "journals before the floor; knowledge without an actual MARK line"
+NOT_COVERED = ("journals before the floor; status MARK kinds (LEDGER_STATUS_KINDS: agent-done, "
+               "board-reply, done, check, ...; counted as skipped); knowledge without an actual MARK line")
 
 
-def summarize(marks, floor, paths=None):
+def summarize(marks, floor, paths=None, skipped=None):
+    """`skipped` = {status kind: n} from derive(); None = not counted (the summary then says so)."""
     counts = {"OPEN": 0, "CARDED": 0, "DISMISSED": 0}
     proposed = suggested = 0
     oldest = None
@@ -753,8 +818,12 @@ def summarize(marks, floor, paths=None):
             (dt.date.today() - dt.date.fromisoformat(oldest["date"])).days
             if oldest and re.match(r"^\d{4}-\d{2}-\d{2}$", oldest["date"]) else None),
         # what "OPEN 0" does and does not promise (review P2-6)
-        "scope": {"floor": floor, "kinds": TRACKED_KINDS, "status_kinds": [], "all_kinds": True,
-                  "not_covered": NOT_COVERED},
+        "scope": {"floor": floor, "kinds": TRACKED_KINDS, "status_kinds": sorted(STATUS_KINDS),
+                  "all_kinds": not STATUS_KINDS, "not_covered": NOT_COVERED},
+        # status-kind MARK lines left out of the ledger (#236) -- counted, never silent (K-00586)
+        "status_skipped": sum(skipped.values()) if skipped is not None else None,
+        "status_skipped_kinds": (dict(sorted(skipped.items(), key=lambda kv: (-kv[1], kv[0])))
+                                 if skipped is not None else None),
         # marks of kinds outside the eight base kinds — tracked since #209 A2
         "new_kinds": dict(sorted(new_kinds.items(), key=lambda kv: (-kv[1], kv[0]))),
         # consolidate batches waiting in memory/ledger/carry/ — the night's unfinished work
@@ -780,7 +849,21 @@ def status_line(s):
                  carded=s["carded"], dismissed=s["dismissed"], carry=s.get("carry", "?"), oldest=old,
                  age=M.msg("LEDGER_AGE", days=age) if age is not None else "",
                  generated=s["generated"],
-                 nkinds="all actual MARK")
+                 nkinds="all actual MARK") + skipped_part(s, "LEDGER_STATUS_SKIPPED")
+
+
+def skipped_part(s, key, top=3):
+    """The status-line tail that says how many status-kind lines the ledger left out.  Appended OUTSIDE the
+    deployment's status template, so a private wording cannot hide the skip.  A summary written before
+    #236 has no count: nothing was skipped then, and nothing is said."""
+    n = s.get("status_skipped")
+    if n is None:
+        return ""
+    kinds = s.get("status_skipped_kinds") or {}
+    items = list(kinds.items())
+    shown = ", ".join(f"{k} {c}" for k, c in items[:top])
+    more = f", +{len(items) - top} more kinds" if len(items) > top else ""
+    return M.msg(key, n=n, kinds=f" ({shown}{more})" if shown else "")
 
 
 def _new_kinds_part(nk, top=3):
@@ -891,23 +974,28 @@ def attribute_text(text, marks):
 # --- CLI ----------------------------------------------------------------------------
 def cmd_sync(a, paths):
     floor = floor_of(paths, a.floor)
+    skipped = {}
     if a.dry:
-        marks = derive(paths, floor, a.until)
-        s = summarize(marks, floor, paths)
+        marks = derive(paths, floor, a.until, skipped)
+        s = summarize(marks, floor, paths, skipped)
     else:
         with ledger_lock(paths):
-            marks = derive(paths, floor, a.until)
-            s = summarize(marks, floor, paths)
+            marks = derive(paths, floor, a.until, skipped)
+            s = summarize(marks, floor, paths, skipped)
             write_state(paths, marks, s)
     print(status_line(s))
     print(f"total tracked marks: {s['total']} (floor {floor}"
           f"{', until ' + a.until if a.until else ''}){' [dry: nothing written]' if a.dry else ''}")
     nk = s.get("new_kinds") or {}
-    print("scope: every actual MARK kind; "
+    print("scope: every actual MARK kind except the status kinds; "
           f"base kinds {', '.join(TRACKED_KINDS)}; NOT covered: {NOT_COVERED}")
     if nk:
         print(f"tracked kinds outside the base list: "
               f"{', '.join(f'{k} {n}' for k, n in nk.items())}")
+    print(f"status lines skipped (status MARK kinds are not tracked, owner 2026-10-13): "
+          f"{s['status_skipped']}"
+          + (f" ({', '.join(f'{k} {n}' for k, n in s['status_skipped_kinds'].items())})"
+             if s['status_skipped'] else ""))
     return 0
 
 

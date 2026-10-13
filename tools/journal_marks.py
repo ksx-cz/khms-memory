@@ -2,6 +2,9 @@
 """Append findings once, independently of tokens, transcripts and board availability.
 
 A package relays ONLY its ## MARKs section; a session appends directly with --mark.
+A status-kind MARK (mark_ledger.STATUS_KINDS: agent-done, board-reply, done, ...) is never written:
+--mark refuses it, a handoff's is left out and counted (#236, owner 2026-10-13 -- a status line is a
+plain line without MARK).
 Stable source+content identities are embedded in the journal itself. Thus losing a
 cache or dying after append cannot duplicate a finding on retry, even the next day.
 All cooperating writers use one flock; each complete line is one O_APPEND write.
@@ -19,7 +22,12 @@ import khms_paths as P
 import mark_ledger as ML
 
 
-def marks(text):
+STATUS_REFUSED = 'status lines are plain lines without MARK (owner 2026-10-13)'
+
+
+def marks(text, skipped=None):
+    """The MARK lines of a handoff's ## MARKs section. A status-kind MARK is left out and counted into
+    `skipped` ({status kind: n}) when given."""
     active = False
     for line in text.splitlines():
         if re.match(r'^##\s+MARKs\b', line, re.I):
@@ -30,7 +38,7 @@ def marks(text):
         if active:
             line = re.sub(r'^\s*(?:[-*]\s+)?', '', line).strip('` ')
             # Preserve an original timestamp in backlog handoffs.
-            if ML.parse_marks(line):
+            if ML.parse_marks(line, skipped):
                 yield line
 
 
@@ -101,16 +109,26 @@ def main(argv=None):
     a = p.parse_args(argv)
     try:
         journal, runtime = destinations(a.journal_dir, a.runtime_dir)
+        skipped = {}
         if a.handoff:
             path = Path(a.handoff).resolve(strict=True)
-            entries = list(marks(path.read_text()))
+            entries = list(marks(path.read_text(), skipped))
             source = a.source or str(path)
         else:
+            if a.source and re.match(r'^MARK\[[^\]]+\]', a.mark):
+                ML.parse_marks(a.mark, skipped)
+                if skipped:
+                    print(f'journal: REFUSED {a.mark[:120]!r}: {STATUS_REFUSED}; write it without MARK',
+                          file=sys.stderr)
+                    return 2
             if not a.source or not re.match(r'^MARK\[[^\]]+\]', a.mark) or not ML.parse_marks(a.mark):
                 p.error('--mark requires MARK[kind] and a stable --source')
             entries, source = [a.mark], a.source
         n = append_once(journal, runtime, entries, source, a.dry_run)
         print(f'journal: {n} MARKs {"planned" if a.dry_run else "appended"}; source={source}')
+        if skipped:
+            print(f'journal: {sum(skipped.values())} status MARK line(s) not relayed '
+                  f'({", ".join(f"{k} {c}" for k, c in sorted(skipped.items()))}): {STATUS_REFUSED}')
     except (OSError, ValueError, P.KhmsPathError) as exc:
         print(f'journal: FAILED: {exc}', file=sys.stderr)
         return 8

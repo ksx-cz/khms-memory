@@ -70,9 +70,10 @@ def ledger_report():
     try:
         paths = mark_ledger.Paths(BRAIN)
         floor = mark_ledger.floor_of(paths, None)
+        skipped = {}          # status-kind lines the ledger leaves out -- counted, not silent (#236)
         with mark_ledger.ledger_lock(paths):
-            marks = mark_ledger.derive(paths, floor)
-            summary = mark_ledger.summarize(marks, floor, paths)
+            marks = mark_ledger.derive(paths, floor, skipped=skipped)
+            summary = mark_ledger.summarize(marks, floor, paths, skipped)
             mark_ledger.write_state(paths, marks, summary)
         return ("\n" + mark_ledger.status_line(summary)
                 + "\n  an OPEN mark with no card and no reason goes back to the night queue; dismiss only with a reason:"

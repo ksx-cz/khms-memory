@@ -140,8 +140,11 @@ def test_every_mark_reaches_the_inbox_and_the_ledger_with_no_cap(tmp_path):
     assert len(us) == 6 and cards_in(us) == 30, (us, log)          # 30 candidates in batches of 7
     assert "DEFERRED" not in "".join(u.read_text() for u in us)
     marks = [json.loads(ln) for ln in open(root / "memory/ledger/marks.jsonl")]
-    assert len(marks) == 31 and {m["kind"] for m in marks} == set(KINDS) | {"done"}
-    assert all(m["state"] == "OPEN" and m.get("proposed_in") for m in marks if m["kind"] != "done"), marks[:2]
+    # the `MARK[done]` status line is not tracked (#236) -- and the summary says it was skipped
+    assert len(marks) == 30 and {m["kind"] for m in marks} == set(KINDS)
+    assert all(m["state"] == "OPEN" and m.get("proposed_in") for m in marks), marks[:2]
+    summary = json.loads((root / "memory/ledger/summary.json").read_text())
+    assert summary["status_skipped"] == 1 and summary["status_skipped_kinds"] == {"done": 1}, summary
     assert (root / "state/shared/last-nightly").read_text().strip(), "the window was not stamped"
     assert "nightly done" in log and "INCOMPLETE" not in log
 

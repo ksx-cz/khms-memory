@@ -9,6 +9,8 @@ Wire it (see claude-code/README.md) to:
   UserPromptSubmit             open a turn, score the prompt, inject matching cards, one directive line
   PreToolUse  Bash             record recall intents; run precheck.sh for a risky-command class; score
   PreToolUse  Edit|Write       score the file path and the edited text (only text matching HOOK_DOMAIN)
+  PreToolUse  Edit|Write|Bash  the status-MARK gate: a write that adds a `MARK[<status kind>]` line to a
+                               journal file of the base is refused -- a status line is a plain line (#236)
   PreToolUse  Agent|Task       the dispatch gate: a proposal inside a brief needs a bound recall
   PreToolUse  <report tool>    the retrieval-claim gate and the proposal gate on a report to the principal
   Stop                         the reply-owed gate: the principal's last channel message gets an answer
@@ -232,7 +234,17 @@ def mark_ledger_line():
                  queued=s.get("open_queued"), proposed=s.get("open_proposed"),
                  suggested=M.msg("HOOK_LEDGER_SUGGESTED", n=sug) if sug else "",
                  carded=s.get("carded"), dismissed=s.get("dismissed"), carry=s.get("carry", "?"),
-                 oldest=old, generated=s.get("generated"))
+                 oldest=old, generated=s.get("generated")) + _ledger_skipped_part(s)
+
+
+def _ledger_skipped_part(s):
+    """How many status-kind lines the ledger left out (#236), appended outside HOOK_LEDGER_LINE so a private
+    wording cannot hide it. A summary from before #236 has no count and gets no tail."""
+    try:
+        import mark_ledger as _ml
+    except Exception:                                              # noqa: BLE001
+        return ""
+    return _ml.skipped_part(s, "HOOK_LEDGER_SKIPPED")
 
 
 # Is the night pipeline running? Without per-stage caps the night publishes its inbox units one batch at a
@@ -366,6 +378,103 @@ def handle_session_start(payload):
     # The full directive enters the session ONCE, here, instead of riding on every prompt.
     parts.append(directive_text())
     emit("SessionStart", "\n".join(parts))
+
+
+# --- the status-MARK gate (#236, owner 2026-10-13) ---------------------------------------------------------
+# "drop the status lines, stop producing them, nobody is to even write them": a status line (package done, board
+# reply, deployed, checked, ...) is a plain journal line without MARK. A write that would ADD a MARK line of a
+# status kind (mark_ledger.STATUS_KINDS, the ledger's own denylist and grammar) to a journal file of the base
+# is refused, for every agent: Edit and Write by their text, Bash when the command redirects or tees into a
+# journal file. A know-how MARK and a plain status line pass; so does an edit that only keeps an old one.
+# What is refused here is exactly what the ledger would skip, because both use mark_ledger.parse_marks().
+BASH_TARGET_RE = re.compile(r"""(?:&>>?|\d?>>?|\btee\b(?:\s+-{1,2}[\w-]+)*)\s*(["']?)([^\s"';|&<>()]+)\1""")
+SHELL_EXPANSION_RE = re.compile(r"\$\([^()]*\)|\$\{[^{}]*\}|\$\w+|%[-\d.]*[sdif]")
+QUOTED_RE = re.compile(r"'([^']*)'|\"((?:[^\"\\]|\\.)*)\"")
+
+
+def _journal_dir():
+    j = P.soft("JOURNAL") or (os.path.join(BRAIN, "journal") if BRAIN else None)
+    return os.path.realpath(j) if j else None
+
+
+def _in_journal(path, cwd):
+    """True for a file directly inside the base's journal directory."""
+    jd = _journal_dir()
+    if not jd or not path:
+        return False
+    p = os.path.expanduser(str(path))
+    if "$" in p:                                       # an unexpanded variable: judge by the shape
+        return bool(re.search(r"(?:^|/)journal/[^/]+\.md$", p))
+    if not os.path.isabs(p):
+        p = os.path.join(cwd or os.getcwd(), p)
+    rp = os.path.realpath(p)
+    return os.path.dirname(rp) == jd and rp.endswith(".md")
+
+
+def _status_mark_lines(text):
+    """The lines of `text` that carry a status-kind MARK by the ledger's own grammar."""
+    import mark_ledger as _ml
+    out = []
+    for line in str(text or "").splitlines():
+        if "MARK[" not in line:
+            continue
+        skipped = {}
+        _ml.parse_marks(line, skipped)
+        if skipped:
+            out.append(line.strip())
+    return out
+
+
+def _bash_candidates(cmd):
+    """Text a shell command would write: its own lines and every quoted string (split on real and `\\n`
+    newlines), with shell expansions and printf conversions read as a time so `"$(date -Is) MARK[x] ..."`
+    and `printf '- %s MARK[x] ...'` parse like the journal line they produce."""
+    parts = list(cmd.splitlines())
+    for m in QUOTED_RE.finditer(cmd):
+        parts.extend(re.split(r"\\n|\n", m.group(1) if m.group(1) is not None else m.group(2)))
+    return "\n".join(SHELL_EXPANSION_RE.sub("00:00", x) for x in parts)
+
+
+def status_mark_violations(payload):
+    """-> the status-MARK lines a PreToolUse payload would ADD to a journal file ([] = allowed)."""
+    tool = payload.get("tool_name")
+    ti = payload.get("tool_input") or {}
+    cwd = payload.get("cwd") or ""
+    if tool in ("Edit", "Write"):
+        path = ti.get("file_path", "")
+        if not _in_journal(path, cwd):
+            return []
+        if tool == "Write":
+            new = ti.get("content", "")
+            try:
+                with open(path, encoding="utf-8", errors="replace") as fh:
+                    old = fh.read()
+            except OSError:
+                old = ""
+        else:
+            new, old = ti.get("new_string", ""), ti.get("old_string", "")
+        before = set(_status_mark_lines(old))
+        return [ln for ln in _status_mark_lines(new) if ln not in before]
+    if tool == "Bash":
+        cmd = str(ti.get("command", ""))
+        if "MARK" not in cmd:
+            return []
+        if not any(_in_journal(m.group(2), cwd) for m in BASH_TARGET_RE.finditer(cmd)):
+            return []
+        # the redirection itself must not read as part of the line: drop `>> target` before parsing
+        return list(dict.fromkeys(_status_mark_lines(_bash_candidates(BASH_TARGET_RE.sub(" ", cmd)))))
+    return []
+
+
+def run_status_mark_gate(payload):
+    """True == refused (the deny was printed)."""
+    bad = status_mark_violations(payload)
+    if not bad:
+        return False
+    shown = " | ".join(b[:140] for b in bad[:3]) + (" | +%d more" % (len(bad) - 3) if len(bad) > 3 else "")
+    _deny("PreToolUse", M.msg("HOOK_STATUS_MARK_DENY", lines=shown))
+    log("PreToolUse", shown[:200], action="DENY (status MARK into the journal: %d line(s))" % len(bad))
+    return True
 
 
 # --- tool events -----------------------------------------------------------------------------------------
@@ -1599,6 +1708,14 @@ def main():
         except Exception as exc:                                   # noqa: BLE001
             stop_log(payload.get("session_id", ""), "ERROR->ALLOW", "%s: %s" % (type(exc).__name__, exc))
         return
+    # The status-MARK gate (#236) first: it needs no experiment, no state and no card base, and it applies
+    # to every agent. Like every gate it fails OPEN, logged.
+    if event == "PreToolUse" and payload.get("tool_name") in ("Edit", "Write", "Bash"):
+        try:
+            if run_status_mark_gate(payload):
+                return
+        except Exception as exc:                                   # noqa: BLE001
+            log(event, "status-mark-gate", action="ERROR->ALLOW %s: %s" % (type(exc).__name__, exc))
     exp = load_experiment()
     EXP_TAG = exp_tag(exp)
     # Every prompt opens a turn for the dispatch gate -- task notifications too -- before anything below

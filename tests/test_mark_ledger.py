@@ -1,4 +1,5 @@
-"""Every real journal MARK has a ledger entry, including status and private kinds."""
+"""Every real journal MARK has a ledger entry, including private kinds -- except the status kinds of the
+denylist (#236, owner 2026-10-13), which are counted as skipped (tests/test_status_marks.py)."""
 import hashlib
 import sys
 from pathlib import Path
@@ -10,10 +11,11 @@ import mark_ledger as ml
 
 
 @pytest.mark.parametrize('kind', list(ml.DEFAULT_KINDS) + [
-    'done', 'agent-done', 'agent-done-check', 'agent-partial', 'status',
-    'result', 'check', 'dispatch', 'deploy', 'merge', 'handoff', 'plan',
-    'report', 'todo', 'pending', 'spawn', 'tokens', 'board', 'board-reply',
-    'board-archive', 'progress', 'private-kind', 'm\u011b\u0159en\u00ed', 'finding→status',
+    # progress words NOT on the status denylist stay tracked: the denylist names kinds, it does not guess
+    'status', 'result', 'todo', 'spawn', 'tokens', 'progress',
+    # know-how kinds #209 A2 decided to track
+    'owner-request', 'prusvih', 'fix', 'vyreseno', 'correction', 'owner-decision', 'defect',
+    'private-kind', 'm\u011b\u0159en\u00ed', 'finding→status',
 ])
 def test_every_actual_kind_is_accounted_for(tmp_path, kind):
     journal = tmp_path / 'journal'
@@ -28,7 +30,19 @@ def test_every_actual_kind_is_accounted_for(tmp_path, kind):
     assert marks[expected_id]['kind'] == expected_kind
     summary = ml.summarize(marks, '2026-10-10')
     assert summary['open_queued'] == 1
-    assert summary['scope'].get('status_kinds', []) == []
+    assert kind not in summary['scope']['status_kinds']
+
+
+@pytest.mark.parametrize('kind', ml.DEFAULT_STATUS_KINDS)
+def test_status_kinds_are_skipped_and_counted(tmp_path, kind):
+    journal = tmp_path / 'journal'
+    journal.mkdir()
+    (journal / '2026-10-10.md').write_text(f'- 10:00 MARK[{kind}] Specific status line\n')
+    skipped = {}
+    marks = ml.derive(ml.Paths(str(tmp_path)), '2026-10-10', skipped=skipped)
+    assert marks == {}
+    assert skipped == {kind: 1}
+    assert ml.summarize(marks, '2026-10-10', skipped=skipped)['status_skipped'] == 1
 
 
 @pytest.mark.parametrize('line', [
@@ -51,9 +65,10 @@ def test_existing_alias_ids_remain_stable(canon, aliases):
 
 
 def test_status_record_needs_explicit_dismissal_and_keeps_reason(tmp_path):
+    """A progress MARK of a kind NOT on the status denylist is tracked, and leaves OPEN only by a reason."""
     journal = tmp_path / 'journal'
     journal.mkdir()
-    (journal / '2026-10-10.md').write_text('MARK[done] Completed the deployment\n')
+    (journal / '2026-10-10.md').write_text('MARK[result] Completed the deployment\n')
     paths = ml.Paths(str(tmp_path))
     mid = next(iter(ml.derive(paths, '2026-10-10')))
     paths_dir = tmp_path / 'memory' / 'ledger'

@@ -61,7 +61,7 @@ def test_handoff_cli_needs_no_project_board_or_transcript(tmp_path):
     assert journal_text(tmp_path).count('MARK[finding]') == 1
 
 
-@pytest.mark.parametrize('kind', ['finding', 'done', 'khms-issue', 'private-kind', '\u010dm\u011b\u0159en\u00ed'])
+@pytest.mark.parametrize('kind', ['finding', 'result', 'khms-issue', 'private-kind', '\u010dm\u011b\u0159en\u00ed'])
 def test_every_mark_kind_is_relayed_to_the_ledger(tmp_path, kind):
     text = f'MARK[{kind}] A reusable lesson.'
     assert list(J.marks('## MARKs\n' + text)) == [text]

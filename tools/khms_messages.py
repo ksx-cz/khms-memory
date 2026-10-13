@@ -66,9 +66,11 @@ DEFAULTS = {
     "LEDGER_NO_STATE": "MARK LEDGER: no state -- run mark_ledger.py sync",
     "LEDGER_STATUS": ("MARK LEDGER (since {floor}): OPEN {open} (queued {queued}, proposed in an unreviewed "
                       "inbox/carry {proposed}{suggested}) · CARDED {carded} · DISMISSED {dismissed} · carry "
-                      "{carry} batch(es) · {oldest}{age} · state of {generated} · scope: all actual MARK "
-                      "kinds since {floor} -- not covered: journals before the floor, "
+                      "{carry} batch(es) · {oldest}{age} · state of {generated} · scope: all MARK kinds except "
+                      "the status kinds since {floor} -- not covered: status MARKs, journals before the floor, "
                       "knowledge without a MARK line"),
+    # appended after LEDGER_STATUS / HOOK_LEDGER_LINE (outside them, so a private wording cannot hide it)
+    "LEDGER_STATUS_SKIPPED": " · status lines skipped, not tracked: {n}{kinds}",
     "LEDGER_SUGGESTED": ", with a card suggestion {n}",
     "LEDGER_AGE": " (age {days} d)",
     "LEDGER_OLDEST": "oldest OPEN {id} {date} {time} [{kind}] {text}",
@@ -89,10 +91,16 @@ DEFAULTS = {
     "HOOK_LEDGER_SUGGESTED": ", with a card proposal {n} -- a proposal is not coverage, `mark_ledger.py suggest`",
     "HOOK_LEDGER_LINE": ("MARK LEDGER (since {floor}): OPEN {open} (queued {queued}, in the unreviewed inbox/carry "
                          "{proposed}{suggested}) \u00b7 CARDED {carded} \u00b7 DISMISSED {dismissed} \u00b7 carry "
-                         "{carry} batches \u00b7 {oldest} \u00b7 state of {generated} \u00b7 scope: all actual "
-                         "MARK kinds since {floor}; outside it: journals before the floor, "
+                         "{carry} batches \u00b7 {oldest} \u00b7 state of {generated} \u00b7 scope: all MARK "
+                         "kinds except the status kinds since {floor}; outside it: status MARKs, journals "
+                         "before the floor, "
                          "findings without a MARK line -- OPEN 0 does not mean \"nothing was lost\""),
+    "HOOK_LEDGER_SKIPPED": " \u00b7 status lines skipped, not tracked: {n}{kinds}",
     "HOOK_LEDGER_ERROR": "MARK LEDGER: report failed ({exc}) -- run tools/mark_ledger.py status",
+    # #236: a journal write that adds a status-kind MARK line is refused (khms_hook.py, journal_marks.py)
+    "HOOK_STATUS_MARK_DENY": ("status lines are plain lines without MARK (owner 2026-10-13). Refused: {lines}. "
+                              "Write the line without `MARK[...]` (e.g. `- HH:MM agent-done <what>`); a MARK is "
+                              "only for know-how (a finding, refutation, measurement, decision, mistake)."),
     "HOOK_INBOX_UNREVIEWED": ("KHMS: UNREVIEWED INBOX: {files} -- do the review (approve_inbox.py, "
                               "build_views.py, report) BEFORE other work."),
     "HOOK_INBOX_NIGHT_UNKNOWN": (" (Night pipeline state unknown: {exc} -- before you start, check in "
