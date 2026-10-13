@@ -221,9 +221,14 @@ import json, os, re, sys
 args = sys.argv[1:]
 packet = sys.stdin.read()
 with open(os.environ["STUB_LOG"], "a") as fh:
-    fh.write(json.dumps({"args": [a if len(a) < 200 else "<long>" for a in args]}) + "\n")
+    fh.write(json.dumps({"args": [a if len(a) < 200 else "<long>" for a in args], "packet": packet}) + "\n")
 mid = re.search(r"^- ([MG]-[0-9a-f]{8}) \|", packet, re.M).group(1)
-if mid in os.environ.get("STUB_GARBLE", ""):
+if os.environ.get("STUB_ANSWERS"):                  # a JSON list: call n answers item n (the last one repeats)
+    with open(os.environ["STUB_LOG"]) as fh:
+        n = sum(1 for _ in fh) - 1
+    seq = json.load(open(os.environ["STUB_ANSWERS"]))
+    ans = seq[min(n, len(seq) - 1)].replace("{mid}", mid)
+elif mid in os.environ.get("STUB_GARBLE", ""):
     ans = "no decision at all"
 elif os.environ.get("STUB_COVERED"):
     q = f'"{os.environ["STUB_QUOTE"]}" — ' if os.environ.get("STUB_QUOTE") else ""
@@ -686,3 +691,128 @@ def test_a_covered_verdict_without_a_verifiable_quote_is_counted_unproven(tmp_pa
     dec = PM.parse_answer(f'DECISION: not-carded\n- M-0000aaaa :: covered by {CA}: "the widget bus voltage sags '
                           f'under load" — the extra date changes no action', "M-0000aaaa")
     assert dec["kind"] == "notcarded" and dec["arg"] == CA
+
+
+# --- the format check: the later stages' checks on the candidate, one retry with their message (#237) ------
+GOOD = ("DECISION: new\n### M1: the widget bus sags to 46.0 V at 40 A on the bench\ntype: fact\nlevel: observation\n"
+        "tags: [power]\nWHAT: the widget bus sags to 46.0 V at 40 A, measured on the bench with a clamp meter.\n"
+        "RELATION: supports {ca}\n**QUOTES:**\n- src=journal :: the widget bus voltage sags to 46.0 V at 40 A\n"
+        ).replace("{ca}", CA)
+BAD_RELATION = GOOD.replace(f"RELATION: supports {CA}", f"RELATION: new — {CA} is about the idle sag")
+
+
+def fmt_base(tmp_path, answers, n=1):
+    """run_base plus a real tag registry table (the converter derives tags from it) and the stub's answers."""
+    root, q, stub = run_base(tmp_path, n=n)
+    (root / "memory/views/tags.md").write_text(
+        "# Tag registry\n\n| tag | group | description | aliases | cards |\n|---|---|---|---|---|\n"
+        "| power | subsystem | power supply and the widget bus | — | 1 |\n")
+    seq = tmp_path / "answers.json"
+    seq.write_text(json.dumps(answers))
+    return root, q, stub, seq
+
+
+def rows_of(tmp_path):
+    return [json.loads(ln) for ln in (tmp_path / "rows.jsonl").read_text().splitlines()]
+
+
+def test_a_valid_candidate_is_kept_after_one_call_without_a_retry(tmp_path):
+    root, q, stub, seq = fmt_base(tmp_path, [GOOD])
+    r = run_pm(tmp_path, root, q, stub, STUB_ANSWERS=seq)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert len(stub_calls(tmp_path)) == 1
+    assert "### M1: the widget bus sags" in (tmp_path / "out.md").read_text()
+    assert "new=1" in r.stdout and "format-retry=0 format-failed=0" in r.stdout, r.stdout
+    row = rows_of(tmp_path)[0]
+    assert row["decision"] == "new" and row["format"] == {"checked": True, "problems": []}, row
+
+
+def test_a_malformed_candidate_is_retried_once_and_the_valid_retry_is_kept(tmp_path):
+    root, q, stub, seq = fmt_base(tmp_path, [BAD_RELATION, GOOD])
+    r = run_pm(tmp_path, root, q, stub, STUB_ANSWERS=seq)
+    assert r.returncode == 0, r.stdout + r.stderr
+    calls = stub_calls(tmp_path)
+    assert len(calls) == 2
+    assert calls[1]["packet"].startswith(calls[0]["packet"]), "the retry is the same packet, with the correction after it"
+    tail = calls[1]["packet"][len(calls[0]["packet"]):]
+    assert "malformed RELATION" in tail and "expected 'supersedes K-xxxxx BECAUSE" in tail, tail
+    assert "RELATION: new — K-00101 is about the idle sag" in tail, "the retry shows the answer it corrects"
+    out = (tmp_path / "out.md").read_text()
+    assert f"RELATION: supports {CA}" in out and "idle sag" not in out
+    assert "format-retry=1 format-failed=0" in r.stdout and "new=1" in r.stdout, r.stdout
+    row = rows_of(tmp_path)[0]
+    assert row["decision"] == "new" and row["format"]["retry"] == "passed", row
+    assert any("malformed RELATION" in p for p in row["format"]["problems"])
+    assert row["total_cost_usd"] == pytest.approx(0.004) and row["turns"] == 2, "both calls are the mark's cost"
+    assert "format retry" in r.stdout and "M-00000001" in r.stdout
+
+
+def test_a_candidate_malformed_twice_keeps_todays_path_and_the_relation_gate_drops_it_with_its_reason(tmp_path):
+    root, q, stub, seq = fmt_base(tmp_path, [BAD_RELATION, BAD_RELATION])
+    r = run_pm(tmp_path, root, q, stub, STUB_ANSWERS=seq)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert len(stub_calls(tmp_path)) == 2, "exactly one retry"
+    assert "format-retry=1 format-failed=1" in r.stdout, r.stdout
+    assert "format check FAILED after the retry" in r.stdout and "malformed RELATION" in r.stdout
+    row = rows_of(tmp_path)[0]
+    assert row["format"]["retry"] == "failed" and any("malformed RELATION" in p for p in row["format"]["retry_problems"])
+    # today's behaviour from here on: the candidate is in the night's output and the night's relation gate
+    # (verify_relations, the stage that ran on it before) moves it under ## DROPPED with that reason
+    import verify_relations as VR
+    out, _rep, counts = VR.process((tmp_path / "out.md").read_text(), str(root / "memory/know"),
+                                   str(root / "memory/archive/know"))
+    assert counts["dropped"] == 1 and counts["kept"] == 0, counts
+    assert "<!-- dropped: malformed RELATION" in out.split(VR.DROPPED_HEAD)[1]
+
+
+def test_the_format_check_is_a_config_key_and_off_means_todays_single_call(tmp_path):
+    root, q, stub, seq = fmt_base(tmp_path, [BAD_RELATION, GOOD])
+    r = run_pm(tmp_path, root, q, stub, STUB_ANSWERS=seq, KHMS_PERMARK_FORMAT_CHECK="0")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert len(stub_calls(tmp_path)) == 1 and "format check off" in r.stdout
+    assert "idle sag" in (tmp_path / "out.md").read_text(), "off: the answer lands unchecked, as before"
+    assert PM.FORMAT_CHECK == 1
+
+
+def test_each_later_check_runs_on_one_candidate(tmp_path, monkeypatch):
+    """The header gate, the relation gate, the converter's self-check (card_problems) and the approve lint,
+    each on a single composed candidate — the same functions the night and the morning call."""
+    root, _q, _stub, _seq = fmt_base(tmp_path, [GOOD])
+    monkeypatch.setenv("KHMS_ROOT", str(root))
+    fc = PM.FormatCheck(str(root))
+    mk = mark("the widget bus voltage sags", mid="M-0000aaaa")
+
+    def probs(answer):
+        dec = PM.parse_answer(answer, mk["id"])
+        return fc.problems(PM.Doc(), mk, dec, [CA])
+
+    assert probs(GOOD) == []
+    assert any("malformed RELATION" in p for p in probs(BAD_RELATION))
+    assert any("no such card" in p for p in probs(GOOD.replace(CA, "K-09999")))
+    lint = probs(GOOD.replace("WHAT: the widget", "WHAT: CORRECTED: the widget"))
+    assert any("correction language" in p for p in lint), lint
+    schema = probs(GOOD.replace("type: fact\nlevel: observation\n", "type: policy\nlevel: derived\n"))
+    assert any("derived card with empty derived_from" in p for p in schema), schema
+    header = probs(GOOD.replace("type: fact\nlevel: observation\n", "type: fact level observation\n"))
+    assert header, "a header the converter cannot read is a problem"
+    nohead = probs(GOOD.replace("### M1: the widget", "### M1 the widget"))
+    assert nohead, "a heading the converter cannot read is a problem"
+
+
+def test_a_check_that_cannot_run_costs_no_call(tmp_path, monkeypatch):
+    """No tag table: the run says the check is unavailable and the answer lands as before, with one call."""
+    root, q, stub, seq = fmt_base(tmp_path, [BAD_RELATION, GOOD])
+    (root / "memory/views/tags.md").write_text("# tags\n- power\n")
+    r = run_pm(tmp_path, root, q, stub, STUB_ANSWERS=seq)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "format check UNAVAILABLE" in r.stdout and len(stub_calls(tmp_path)) == 1
+    # ... and a check that raises on one candidate leaves that answer unchecked, without a retry
+    class Boom:
+        def problems(self, *a):
+            raise RuntimeError("converter crashed")
+    row = {"wall_s": 0.0, "usage": {}}
+    C = PM.Counters()
+    dec = PM.parse_answer(GOOD, "M-0000aaaa")
+    got, limit = PM.format_gate(Boom(), PM.Doc(), mark("x"), dec, [CA], {"text": GOOD}, "packet",
+                                lambda *a: pytest.fail("no call may be made"), row, C, None)
+    assert got is dec and limit is None and row["format"]["checked"] is False and C.fretry == 0

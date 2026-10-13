@@ -110,6 +110,7 @@ DEFAULTS = [
     ("KHMS_PERMARK_SHORT_ANSWERS", "1"),     # 1 = three-line carded / not-carded answers (#237)
     ("KHMS_PERMARK_COVERED_RULE", "0"),      # 1 = the `covered by K-x` not-carded verdict in the per-mark rules (#237)
     ("KHMS_PERMARK_EFFORT", "high"),         # the per-mark call's --effort: low|medium|high|xhigh|max (#237)
+    ("KHMS_PERMARK_FORMAT_CHECK", "1"),      # 1 = the later stages' checks on each candidate + one retry (#237)
     ("KHMS_WEEK_PART_MODEL", "sonnet"),
     ("KHMS_WEEK_MODEL", "opus"),
     ("KHMS_PROJECT_SLUG", ""),             # only transcript paths containing this text ("" = every transcript)

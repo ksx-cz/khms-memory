@@ -196,7 +196,14 @@ The night's sources reach the base through one evaluator:
    a future agent does; otherwise the verdict is `covered by K-x: "<verbatim sentence of K-x>" — <why>`, a
    NOT CARDED reason that `mark_ledger.py` records as a dismissal, never as coverage, and only when the
    quote is in K-x (the `already carded` check); without one the mark stays OPEN. `KHMS_PERMARK_EFFORT` (default `high`) is
-   the call's `--effort`. Marks are sequential on purpose:
+   the call's `--effort`. With `KHMS_PERMARK_FORMAT_CHECK=1` (the default) every candidate an answer
+   proposes (new, supersede, contradict, a belongs revision) goes, right after parsing and with 0 tokens,
+   through the checks the later stages would run on it — the card header gate, the RELATION gate
+   (`verify_relations.py`), the converter's self-check with the per-card schema gate
+   (`build_views.card_problems`) and the approve lint (`khms_lint.py`); a failure costs ONE retry of the
+   same call with the checks' messages appended, a passing retry replaces the answer, and a second failure
+   keeps the first answer, which the later stage then drops or flags as before (`format-retry=` and
+   `format-failed=` in the decisions line, `format` in the JSONL row). Marks are sequential on purpose:
    each one sees every decision made before it, so a second mark on the same matter joins the first one's
    candidate instead of becoming a duplicate.
 3. Its output is post-checked (attribute, quote check, NEAREST, RELATION gate) and committed once, by one

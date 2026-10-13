@@ -5,7 +5,7 @@ Usage:
   permark.py --queue Q --out OUT [--deadline EPOCH] [--limit N] [--agent BIN] [--model sonnet]
              [--log LOG] [--jsonl J] [--served-file F] [--limit-flag F] [--timeout 180]
              [--packets DIR] [--dry] [--tonight-k 5] [--packet-chars 32000] [--whole-top 3]
-             [--links-line 0|1] [--short-answers 0|1]
+             [--links-line 0|1] [--short-answers 0|1] [--covered-rule 0|1] [--effort E] [--format-check 0|1]
 
   Q     the ledger's queue file (`mark_ledger.py queue --out Q`): `- <id> | <date time> | <kind> | <where> | <text>`,
         journal MARKs (`M-`) and generated lines (`G-`, #237 step 2) on one time axis.
@@ -82,6 +82,17 @@ stays OPEN.  The row logs its K-x as `target` and the decisions line counts it a
 EFFORT (KHMS_PERMARK_EFFORT / --effort low|medium|high|xhigh|max, default high): the `--effort` of the
 per-mark call.
 
+FORMAT CHECK (KHMS_PERMARK_FORMAT_CHECK / --format-check 0|1, default 1): a decision that carries a candidate
+block (new, supersede, contradict, a belongs revision) is checked, with 0 tokens, by the functions the later
+stages run on it (FormatCheck: card_header, verify_relations.judge, convert_inbox2's self-check with
+build_views.card_problems, khms_lint.lint_batch) on the block exactly as apply() would write it.  A failure
+costs ONE retry: the same packet, then the checks' messages and the rejected answer.  A retry that parses and
+passes replaces the decision; otherwise the FIRST answer is applied as before and the later stage drops or
+flags it with its reason.  Counted as `format-retry=` (retries made) and `format-failed=` (retries that did not
+pass) in the decisions line; the JSONL row gets `format` (problems, retry passed|failed, retry problems) and
+both calls' cost.  A check that cannot run (no tag registry, …) is logged once and the candidates go unchecked —
+a check failing for its own reason must not cost calls.
+
 LOGGED, NEVER GATED: `quotes-unproven` (an "already carded" or "covered by" quote mark_ledger.quote_in_card does not find
 in the card) and `unseen-nearest` (a new candidate whose own nearest top 3 hold an id the packet lacked).
 """
@@ -129,6 +140,10 @@ SHORT_ANSWERS = 1             # 1 = three-line carded / not-carded answers (KHMS
 COVERED_RULE = 0              # 1 = the `covered by K-x` not-carded verdict (KHMS_PERMARK_COVERED_RULE)
 EFFORT = "high"               # the per-mark call's --effort (KHMS_PERMARK_EFFORT, --effort)
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
+FORMAT_CHECK = 1              # 1 = the later stages' checks on a candidate + one retry (KHMS_PERMARK_FORMAT_CHECK)
+FORMAT_CHECKED = ("new", "supersede", "contradict", "belongs")   # the decisions that carry a candidate block
+FORMAT_ANSWER_CHARS = 6000    # the rejected answer shown in the retry, at most
+FORMAT_RETRY_HEAD = "## FORMAT CHECK FAILED — ANSWER AGAIN"
 RULE_MARK_RE = re.compile(r"^[ \t]*<!-- (?P<end>/?)rule:(?P<name>[a-z-]+)(?:=(?P<val>\d))? -->[ \t]*$")
 COVERED_RE = re.compile(r"::\s*covered by\s+(K-\d{5})\b")
 LINK_LINE_KEYS = ("supersedes", "superseded_by", "contradicts", "refuted_by", "derived_from")
@@ -802,12 +817,95 @@ def with_nearest(block, ids):
                            "NEAREST: (no card scored above zero)") + "\n"
 
 
+def would_be(doc, mid, dec, shown):
+    """-> (label, block): the candidate exactly as apply() writes it into OUT, or None (no block to write)."""
+    k = dec["kind"]
+    if k in ("new", "supersede", "contradict"):
+        lab = doc.next_label()
+        return lab, with_nearest(ensure_marks(set_label(dec["block"], lab), [mid]), shown)
+    if k == "belongs" and dec.get("block"):
+        c = doc.find(dec["arg"])
+        if c is None:
+            return None
+        rev = ensure_marks(set_label(dec["block"], c[0]), [mid])
+        return c[0], with_nearest(rev, CARD_ID_RE.findall((NEAREST_LINE_RE.search(c[1]) or [""])[0]) + list(shown))
+    return None
+
+
+class FormatCheck:
+    """The checks the LATER stages run on a candidate, run on ONE candidate right after its answer is parsed.
+
+    The same functions, called the way their stage calls them — nothing re-implemented:
+      header    card_header.normalise_text + check_text  (publish: `fix`, then a malformed header is quarantined
+                under ## DROPPED);
+      relation  verify_relations.judge                   (postprocess: a DROP moves the candidate under ## DROPPED);
+      schema    convert_inbox2.convert + render + selfcheck, i.e. approve_inbox.parse_cards and
+                build_views.card_problems, the one per-card gate  (morning: convert_inbox2's SELF-CHECK);
+      lint      khms_lint.lint_batch with known_card_ids + load_retracted  (morning: approve_inbox refuses).
+    The block checked is the one apply() writes (label, MARKS and NEAREST lines included), after the header
+    normalisation the night applies before publishing.  Non-blocking flags (a verify_relations FLAG,
+    khms_lint.flag_batch, the converter's t/e/g/s columns) are not problems.
+    """
+
+    def __init__(self, root):
+        import card_header
+        import convert_inbox2
+        import khms_lint
+        import verify_relations
+        self.CH, self.CI, self.KL, self.VR = card_header, convert_inbox2, khms_lint, verify_relations
+        self.know = os.path.join(root, "memory", "know")
+        self.archive = os.path.join(root, "memory", "archive", "know")
+        tags = os.path.join(root, "memory", "views", "tags.md")
+        self.registry = convert_inbox2.load_tags(tags)
+        if not self.registry:     # every candidate would fail "no tags" for the registry's reason, not its own
+            raise ValueError(f"no tag table in {tags}")
+        self.known = khms_lint.known_card_ids(self.know)
+        self.retracted = khms_lint.load_retracted(root)
+        self.ledger_ids = {t["ts"] for t in self.retracted}
+
+    def problems(self, doc, mk, dec, shown):
+        """-> [problem text] for the candidate `dec` would write; [] when it passes or carries no block."""
+        wb = would_be(doc, mk["id"], dec, shown)
+        if wb is None:
+            return []
+        label, block = wb
+        block, _changed = self.CH.normalise_text(block)
+        out = [f"card header: {p}" for p in self.CH.check_text(block)]
+        verdict, msg = self.VR.judge(label, block, self.know, self.archive)
+        if verdict == "DROP":
+            out.append(f"RELATION: {msg}")
+        cards, _rows = self.CI.convert(block, mk["date"], self.registry)
+        if not cards:
+            return out + ["the converter finds no card in the candidate — it starts with `### M<n>: <title>`"]
+        fd, path = tempfile.mkstemp(prefix="permark-fmt-", suffix=".md")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(self.CI.render(cards))
+            schema, parsed = self.CI.selfcheck(path, len(cards), self.registry)
+        finally:
+            os.unlink(path)
+        out += [f"card schema: {p}" for p in schema]
+        batch = [(str(m.get("id")), m, b) for m, b in parsed]
+        out += [f"approve lint: {p}" for p in
+                self.KL.lint_batch(batch, self.known | {i for i, _m, _b in batch}, self.retracted, self.ledger_ids)]
+        return out
+
+
+def retry_packet(packet, answer, problems):
+    """The same packet, then the rejected answer and the checks' own messages as a short correction."""
+    return (packet.rstrip("\n") + "\n\n" + FORMAT_RETRY_HEAD + "\n"
+            "Your answer below proposes a candidate that the checks of the later stages reject; as it stands it "
+            "would be dropped or refused at review. Answer again for the same mark, with exactly one DECISION, "
+            "and fix what these messages name — keep the content otherwise:\n"
+            + "".join(f"- {p}\n" for p in problems)
+            + "\nYOUR ANSWER:\n" + clip(answer.strip(), FORMAT_ANSWER_CHARS) + "\n")
+
+
 def apply(doc, mid, dec, shown):
     """Apply one parsed decision to `doc`. -> (decision label for the counters, target, label or None)."""
     k = dec["kind"]
     if k in ("new", "supersede", "contradict"):
-        lab = doc.next_label()
-        block = with_nearest(ensure_marks(set_label(dec["block"], lab), [mid]), shown)
+        lab, block = would_be(doc, mid, dec, shown)
         doc.cands.append([lab, block])
         return k, dec.get("arg") or "", lab
     if k == "belongs":
@@ -833,6 +931,7 @@ class Counters:
         self.cost = 0.0
         self.dec = {k: 0 for k in DECISIONS}
         self.unparsed = self.failed = self.unproven = self.unseen = self.covered = 0
+        self.fretry = self.ffailed = 0
         self.sizes, self.trimmed = [], 0
         self.dense_err_logged = False
         self.t0 = time.time()
@@ -844,7 +943,7 @@ class Counters:
     def decisions_line(self):
         return ("permark: decisions " + " ".join(f"{k}={v}" for k, v in self.dec.items())
                 + f" covered={self.covered} unparsed={self.unparsed} failed={self.failed} quotes-unproven={self.unproven}"
-                f" unseen-nearest={self.unseen}")
+                f" unseen-nearest={self.unseen} format-retry={self.fretry} format-failed={self.ffailed}")
 
     def packet_line(self, budget):
         z = sorted(self.sizes)
@@ -853,6 +952,49 @@ class Counters:
         med = z[len(z) // 2] if len(z) % 2 else (z[len(z) // 2 - 1] + z[len(z) // 2]) // 2
         return (f"permark: packet_chars n={len(z)} min={z[0]} median={med} max={z[-1]} budget={budget} "
                 f"trimmed={self.trimmed}")
+
+
+def format_gate(FC, doc, mk, dec, shown, res, packet, one_call, row, C, log):
+    """The format check and its ONE retry. -> (the decision to apply, the usage-limit text or None).
+
+    Passes: the decision as it is.  Fails: one more call with the same packet + the checks' messages; a retry
+    that parses and passes replaces the decision (counted format-retry), anything else keeps the FIRST answer,
+    i.e. today's path — the later stage drops or flags it with its reason (counted format-failed too)."""
+    try:
+        probs = FC.problems(doc, mk, dec, shown)
+    except Exception as exc:      # the check's own failure: logged, the answer goes on unchecked, no call spent
+        row["format"] = {"checked": False, "error": f"{type(exc).__name__}: {exc}"}
+        log_to(log, f"permark-{mk['id']} format check could not run ({type(exc).__name__}: {exc}) — unchecked")
+        return dec, None
+    row["format"] = {"checked": True, "problems": probs}
+    if not probs:
+        return dec, None
+    C.fretry += 1
+    log_to(log, f"permark-{mk['id']} format check: {len(probs)} problem(s), one retry — " + " | ".join(probs))
+    r2 = one_call(retry_packet(packet, res["text"], probs), "format retry")
+    for k in ("in", "out", "cache_read", "cache_write"):
+        if isinstance(r2["usage"].get(k), int):
+            row["usage"][k] = (row["usage"].get(k) or 0) + r2["usage"][k]
+    if r2["cost"] is not None:
+        row["total_cost_usd"] = (row.get("total_cost_usd") or 0) + r2["cost"]
+    if r2["turns"] is not None:
+        row["turns"] = (row.get("turns") or 0) + r2["turns"]
+    row["wall_s"] = round(row["wall_s"] + r2["wall"], 2)
+    if not r2["ok"]:
+        probs2 = [f"the retry call failed: {r2['err']}"]
+    else:
+        dec2 = parse_answer(r2["text"], mk["id"])
+        probs2 = ([f"the retry is unparsed: {dec2['why']}"] if dec2["kind"] == "unparsed" else
+                  FC.problems(doc, mk, dec2, shown) if dec2["kind"] in FORMAT_CHECKED else [])
+        if not probs2:
+            row["format"]["retry"] = "passed"
+            log_to(log, f"permark-{mk['id']} format retry passed ({dec2['kind']})")
+            return dec2, None
+    C.ffailed += 1
+    row["format"].update(retry="failed", retry_problems=probs2, retry_answer=r2["text"][:600])
+    log_to(log, f"permark-{mk['id']} format check FAILED after the retry — the first answer is kept, the later "
+                f"stage drops or flags it: " + " | ".join(probs2))
+    return dec, (r2["text"] if r2["limit"] else None)
 
 
 def log_to(path, line):
@@ -906,6 +1048,7 @@ def run(a):
     short = config_int(a.short_answers, "KHMS_PERMARK_SHORT_ANSWERS", SHORT_ANSWERS)
     covered = config_int(a.covered_rule, "KHMS_PERMARK_COVERED_RULE", COVERED_RULE)
     effort = config_str(a.effort, "KHMS_PERMARK_EFFORT", EFFORT)
+    fmt_on = config_int(a.format_check, "KHMS_PERMARK_FORMAT_CHECK", FORMAT_CHECK)
     if effort not in EFFORTS:
         print(f"permark: KHMS_PERMARK_EFFORT={effort!r} is not one of {', '.join(EFFORTS)}", file=sys.stderr)
         return 2
@@ -931,11 +1074,17 @@ def run(a):
     C = Counters()
     if a.packets:
         os.makedirs(a.packets, exist_ok=True)
+    FC, fmt_note = None, "off"
+    if fmt_on and not a.dry:
+        try:
+            FC, fmt_note = FormatCheck(root), "on"
+        except Exception as exc:   # a check that cannot run must not cost a retry: the candidates go unchecked
+            fmt_note = f"UNAVAILABLE ({type(exc).__name__}: {exc}) — candidates go unchecked"
     log_to(a.log, f"permark: {len(queue)} queued mark(s), {len(queue) - len(todo)} already decided in {a.out}; "
                   f"{len(R.cards)} active cards, dense channel {'on' if R.hy is not None else 'OFF'}; model {a.model}; "
                   f"tonight's candidates k={k}, packet budget {budget} characters; whole top {whole_top}, "
                   f"links line {'on' if links else 'off'}, short answers {'on' if short else 'off'}, "
-                  f"covered rule {'on' if covered else 'off'}, effort {effort}")
+                  f"covered rule {'on' if covered else 'off'}, effort {effort}, format check {fmt_note}")
     rc = 0
     for i, mk in enumerate(todo):
         if a.limit and C.n >= a.limit:
@@ -963,20 +1112,24 @@ def run(a):
             log_to(a.log, f"permark-{mk['id']} dry: packet_chars={len(packet)}"
                           + (f", trimmed {len(ps['trimmed'])}" if ps.get("trimmed") else ""))
             continue
-        res = None
-        for attempt in (1, 2):
-            res = call(agent, a.model, rules, packet, a.timeout, effort)
+        def one_call(pk, tag, mk=mk):
+            res = call(agent, a.model, rules, pk, a.timeout, effort)
             extra = [f"${res['cost']:.4f}" if res["cost"] is not None else "", f"{res['turns']} turns"
                      if res["turns"] is not None else "", res["err"] if res["err"] else "",
-                     f"packet_chars={len(packet)}"]
+                     f"packet_chars={len(pk)}"]
             log_to(a.log, f"permark-{mk['id']} served-by: {','.join(res['models']) or 'UNKNOWN'} "
-                          f"(attempt {attempt}/2, rc={'0' if res['ok'] else '1'}"
+                          f"({tag}, rc={'0' if res['ok'] else '1'}"
                           + "".join(", " + e for e in extra if e) + ")")
             if a.served_file:
                 with open(a.served_file, "a", encoding="utf-8") as fh:
                     fh.write(f"permark-{mk['id']}\t{','.join(res['models']) or 'UNKNOWN'}\n")
             C.cost += float(res["cost"] or 0)
             C.turns += int(res["turns"] or 0)
+            return res
+
+        res = None
+        for attempt in (1, 2):
+            res = one_call(packet, f"attempt {attempt}/2")
             if res["ok"] or res["limit"]:
                 break
         C.n += 1
@@ -1005,6 +1158,9 @@ def run(a):
             row.update(decision="unparsed", why=dec["why"], answer=res["text"][:600])
             _jsonl(a.jsonl, row)
             continue
+        limit_text = None
+        if FC is not None and dec["kind"] in FORMAT_CHECKED:
+            dec, limit_text = format_gate(FC, doc, mk, dec, shown, res, packet, one_call, row, C, a.log)
         kind, target, lab = apply(doc, mk["id"], dec, shown)
         if kind is None:
             C.unparsed += 1
@@ -1033,6 +1189,14 @@ def run(a):
             row["reason"] = dec["reason"]
         write_atomic(a.out, doc.render())
         _jsonl(a.jsonl, row)
+        if limit_text is not None:
+            if a.limit_flag:
+                with open(a.limit_flag, "w", encoding="utf-8") as fh:
+                    fh.write(f"permark {mk['id']} (format retry): {limit_text[:200]}\n")
+            log_to(a.log, f"permark: USAGE LIMIT at the format retry of {mk['id']} (its first answer is kept) — "
+                          f"{len(todo) - i - 1} later mark(s) stay OPEN")
+            rc = EXIT_USAGE_LIMIT
+            break
         if C.n % 60 == 0:
             log_to(a.log, C.stage_line())
             log_to(a.log, C.decisions_line())
@@ -1088,6 +1252,9 @@ def main(argv=None):
                          f"content changes an action (KHMS_PERMARK_COVERED_RULE, default {COVERED_RULE})")
     ap.add_argument("--effort", choices=EFFORTS, default=None,
                     help=f"the per-mark call's --effort (KHMS_PERMARK_EFFORT, default {EFFORT})")
+    ap.add_argument("--format-check", type=int, choices=(0, 1), default=None,
+                    help=f"1 = the later stages' checks on every candidate, one retry with their message "
+                         f"(KHMS_PERMARK_FORMAT_CHECK, default {FORMAT_CHECK})")
     a = ap.parse_args(argv)
     return run(a)
 
