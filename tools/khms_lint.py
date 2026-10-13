@@ -47,7 +47,7 @@ BACK_EDGES = ("contradicts", "supersedes", "refuted_by")
 ESCAPE_RE = re.compile(r"^\s*NO-CORRECTION-TARGET:\s*\S", re.M)
 CARD_ID_RE = re.compile(r"\bK-\d{5}\b")
 
-# Correction language, in two tiers, because the word list alone does not
+# Correction language, in tiers, because the word list alone does not
 # separate "this card corrects the record" from "we fixed a bolt".  Measured on
 # the 2187-card base of 2026-08-28: the flat word list fires on 476 cards (22 %
 # of everything, 270 of them on the Czech stem "oprav*", which in a robotics
@@ -57,13 +57,35 @@ CARD_ID_RE = re.compile(r"\bK-\d{5}\b")
 #   BLOCK — the KHMS body markers, upper-case, as the spec and the card corpus
 #           actually write them (spec §4.2: "SUPERSEDES K-x BECAUSE"; a
 #           correcting card opens with "CORRECTED (owner: …)").  Unambiguous.
-#   CONTEXT — everything else, only on a line that ALSO talks about the record
-#           (a K-id, "card", "knowledge base", plus deployment vocabulary from
-#           khms_patterns.py).  "We fixed the cable" does not fire; "correction
-#           of card K-xxxxx" does.
+#   CONTEXT — a phrase that states a claim is false ("was wrong", "no longer
+#           true", "supersedes"), only on a line that ALSO names a specific card:
+#           a K-id or a definite reference ("this/the/that/its card", plus the
+#           deployment's forms in LINT_RECORD_REF).  "K-xxxxx was wrong" fires.
+#   WEAK — a word that names correcting as an activity as often as it performs
+#           one ("corrected"; deployment repair stems in LINT_WEAK_<n>): only on a
+#           line with a DEFINITE reference.  "corrected the cron line (K-xxxxx)"
+#           does not fire; "the card corrected …" does.
 #
-# Same list of words the rule names, anchored so each means what the rule means.
-# Calibrated together: 41 of 2187 cards (1.9 %), the motivating correction among them.
+# Narrowed 2026-10-13 (#237), measured on the 5840-card base.  Escape set = the 136
+# cards with a NO-CORRECTION-TARGET line (a refusal a human judged false; the old
+# rule fired on 124).  True set = cards with a backward edge whose body uses
+# correction words (473; the old rule fired on 291 with the edge removed).  The
+# escapes came from four shapes:
+#   * a generic record word on the line ("card", "knowledge base", deployment
+#     words in the retired LINT_RECORD_CTX) — a line that mentions cards at all,
+#     not one that names the card being corrected;
+#   * the lint's own vocabulary as a subject: the escape token NO-CORRECTION-TARGET
+#     (it contains CORRECTION), field names in code spans (`supersedes:`), pipeline
+#     annotations in HTML comments, verbatim source quotes (`- src=… :: …`, evidence
+#     of what a source said, not this card's claim);
+#   * the noun "correction" / repair stems naming the topic of a KHMS card;
+#   * and, the other way round, the K-id arm of the old context never matched: it
+#     was upper-case and the lines are lower-cased first, so "K-xxxxx was wrong"
+#     passed unrefused.
+# Measured after (same base, deployment repair stems moved to LINT_WEAK_): escapes 124 -> 34,
+# true set 291 -> 299 (285 of the old 291 kept, 14 corrections the dead K-id arm missed),
+# cards with neither edge nor escape 35 -> 32.  The 6 lost: each corrects only through a
+# noun ("flagged for correction"), a generic record word or a quoted source.
 BLOCK_PATTERNS = (
     ("CORRECTED", re.compile(r"\bCORRECT(ED|ION|IONS|S)\b")),
     # ACTIVE voice only: "SUPERSEDES K-x" is the replacing card speaking. The
@@ -75,15 +97,31 @@ CONTEXT_PATTERNS = (
     ("contrary to", re.compile(r"\bcontrary to\b")),
     ("was wrong", re.compile(r"\b(was|were|is|are) wrong\b")),
     ("no longer true", re.compile(r"\bno longer (true|holds|valid|the case)\b")),
-    ("corrected", re.compile(r"\bcorrect(ed|ion|ions|s)\b")),
     ("supersedes", re.compile(r"\bsupersed(es|ing)\b")),
 )
-# "this line is about the record itself", diacritics already stripped.
-RECORD_CTX = re.compile(
-    r"\bK-\d{5}\b|\bcard\b|\bknowledge base\b" + KP.extra("LINT_RECORD_CTX"))
+WEAK_PATTERNS = (
+    # the verb only: the noun "correction" names the topic ("a correction is reached by
+    # an edge"); the upper-case marker CORRECTION in the BLOCK tier still counts.
+    ("corrected", re.compile(r"\bcorrect(ed|s)\b")),
+)
+# Matched on norm()ed (lower-case, diacritics stripped) lines.
+DEFINITE_REF = re.compile(r"\b(?:this|the|that|its) card\b" + KP.extra("LINT_RECORD_REF"))
+RECORD_REF = re.compile(r"\bk-\d{5}\b|" + DEFINITE_REF.pattern)
 # Deployment vocabulary (private config, khms_patterns.py) is appended in file order.
 BLOCK_PATTERNS = BLOCK_PATTERNS + tuple(KP.labelled("LINT_BLOCK_"))
 CONTEXT_PATTERNS = CONTEXT_PATTERNS + tuple(KP.labelled("LINT_CONTEXT_"))
+WEAK_PATTERNS = WEAK_PATTERNS + tuple(KP.labelled("LINT_WEAK_"))
+if KP.extra("LINT_RECORD_CTX"):
+    # Retired key: generic record words were an escape source (above). Say so instead
+    # of ignoring a configured value silently.
+    print("khms_lint: LINT_RECORD_CTX is no longer read (#237); put definite card "
+          "references in LINT_RECORD_REF", file=sys.stderr)
+
+# Text that talks ABOUT correction without being one (see above).
+ESCAPE_TOKEN_RE = re.compile(r"NO-CORRECTION-TARGET", re.I)
+CODE_SPAN_RE = re.compile(r"`[^`\n]*`")
+SOURCE_QUOTE_RE = re.compile(r"^[ \t]*-[ \t]*src=.*$", re.M)
+HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.S)   # pipeline annotations ("dropped: …")
 
 
 def norm(s):
@@ -96,14 +134,19 @@ def correction_terms(body):
     """Which correction phrases the body uses, in the order they are listed.
 
     ERRATUM blocks are excluded first: "the sentence … was wrong at the time of writing"
-    corrects THIS card's own text, not another card, so it owes no backward edge."""
+    corrects THIS card's own text, not another card, so it owes no backward edge.
+    The escape token, code spans, HTML comments and verbatim source quotes are excluded: they
+    mention correction vocabulary, they do not state a correction by this card."""
     body, _, _ = strip_errata(body or "")
+    body = SOURCE_QUOTE_RE.sub("", ESCAPE_TOKEN_RE.sub(" ", HTML_COMMENT_RE.sub(" ", body)))
+    body = CODE_SPAN_RE.sub(" ", body)
     terms = [name for name, rx in BLOCK_PATTERNS if rx.search(body)]
     for line in body.splitlines():
         nl = norm(line)
-        if not RECORD_CTX.search(nl):
+        if not RECORD_REF.search(nl):
             continue
-        for name, rx in CONTEXT_PATTERNS:
+        tiers = CONTEXT_PATTERNS + (WEAK_PATTERNS if DEFINITE_REF.search(nl) else ())
+        for name, rx in tiers:
             if rx.search(nl) and name not in terms:
                 terms.append(name)
     return terms

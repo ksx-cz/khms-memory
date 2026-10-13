@@ -571,6 +571,18 @@ def normalise_type(written, body_type, written_level=None):
     return typ, level, note
 
 
+def declared_type(raw):
+    """The §4.2 type a written `type:` value names by itself (`fact`, `observation (fact)`),
+    or None — a value whose type half is prose is resolved from the body template, which
+    is a guess (normalise_type), so it does not count as declared."""
+    canon = _canon_type(raw)
+    if canon in SPEC_TYPES:
+        return canon
+    m = COMPOUND_TYPE_RE.match(str(raw).strip())
+    inner = _canon_type(m.group(2)) if m else None
+    return inner if inner in SPEC_TYPES else None
+
+
 def derive_evidence(prose, typ):
     """-> (evidence, certain?).  §4.7.
 
@@ -825,6 +837,20 @@ def convert(text, date, registry):
                                                    written.get("level"))
         if resolved:
             meta["type"], meta["level"] = resolved, r_level
+        # A field the writer DECLARED is not a guess (#237). The t/e/g/s calls above were
+        # made from the prose before the card's own lines were merged, so on 2026-10-13-2
+        # 24 of 31 candidates carried flags for type/evidence/tags they had written out.
+        # And a scope nobody wrote was derived from the GUESSED tags, not the declared
+        # ones: a card declaring `tags: [khms, …]` got the project scope with no `s`.
+        declared = {k for k in ("type", "evidence", "tags", "scope")
+                    if written.get(k) not in (None, "", [])}
+        t_ok = t_ok or ("type" in declared and resolved == declared_type(written["type"]))
+        e_ok = e_ok or "evidence" in declared
+        tag_ok = tag_ok or "tags" in declared
+        if "scope" in declared:
+            s_ok = True
+        elif "tags" in declared:
+            meta["scope"], s_ok = derive_scope(meta["tags"])
         # §4.7 puts `evidence` on OBSERVATION cards only, and the corpus agrees:
         # 86 of 121 derived cards in know/ carry none. Derived cards MUST instead
         # carry derived_from (§4.3) — build_views.py hard-fails on an empty one,
@@ -834,7 +860,7 @@ def convert(text, date, registry):
             meta.pop("evidence", None)
             # a principle's reach is exactly the editorial question the body cannot
             # answer — a principle may hold `universal`ly, this tool's default does not
-            s_ok = False
+            s_ok = s_ok and "scope" in declared
         body = (prose + ("\n" + quotes if quotes else "")).strip()
         cards.append((meta, title, body))
         notes = []

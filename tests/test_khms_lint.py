@@ -84,6 +84,76 @@ class LintRule(unittest.TestCase):
         self.assertIsNotNone(L.check_correction_edges("C1", meta(), body, None))
 
 
+class NarrowedToTheCardBeingCorrected(unittest.TestCase):
+    """#237: the refusals a human answered with NO-CORRECTION-TARGET (124 of 136 on the
+    deployment's base) came from lines that MENTION correcting or cards without stating
+    that a named card is wrong.  Each case here was refused before the narrowing; each
+    sibling is a real correction with no edge and must still be refused."""
+
+    def refused(self, body):
+        return L.check_correction_edges("C1", meta(), body, None)
+
+    def test_an_ordinary_repair_beside_a_card_id_is_not_a_correction(self):
+        for body in ("FIX: fixed the script; K-90042 records the original bug.\n",
+                     "We corrected the cron line in the deploy script; the knowledge base "
+                     "card K-90042 describes the job.\n"):
+            self.assertIsNone(self.refused(body), body)
+
+    def test_the_escape_hatch_named_in_prose_is_not_a_correction(self):
+        body = ("Both refusals of K-90042's batch were answered with a NO-CORRECTION-TARGET "
+                "line, as the gate asks.\n")
+        self.assertIsNone(self.refused(body))
+
+    def test_quotes_code_and_annotations_are_not_this_cards_claim(self):
+        body = ("The edge is written as `supersedes: K-90042` in the frontmatter.\n"
+                "<!-- dropped: malformed relation, expected 'supersedes K-xxxxx because' -->\n"
+                "**QUOTES:**\n- src=journal :: CORRECTED the timer in K-90042's unit file\n")
+        self.assertIsNone(self.refused(body))
+
+    def test_a_real_correction_of_a_named_card_is_still_refused(self):
+        for body in ("K-90042 was wrong: the topic is /plant/rh, not /rh.\n",
+                     "The claim in K-90042 no longer holds since the probe moved.\n",
+                     "This card corrected the wiring note of K-90042.\n",
+                     "CORRECTED (operator): the probe is on bus 2.\n"):
+            self.assertIsNotNone(self.refused(body), body)
+
+
+def _terms_with_patterns(tmp, patterns, body):
+    """correction_terms() in a fresh interpreter that reads `patterns` as the private file."""
+    pat = os.path.join(tmp, "patterns.env")
+    with open(pat, "w", encoding="utf-8") as f:
+        f.write(patterns)
+    code = ("import sys; sys.path.insert(0, %r); import khms_lint as L; "
+            "print(L.correction_terms(sys.stdin.read()))" % TOOLS)
+    env = {k: v for k, v in os.environ.items() if not k.startswith("KHMS_")}
+    env["KHMS_PATTERNS"] = pat
+    r = subprocess.run([sys.executable, "-c", code], input=body, env=env,
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    return r.stdout.strip(), r.stderr
+
+
+class DeploymentVocabulary(unittest.TestCase):
+    """A deployment's repair stem (private patterns file) is a WEAK word: beside a bare card
+    id it names an activity; beside a definite reference ("this card") it corrects."""
+
+    def test_weak_stem_needs_a_definite_reference(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pats = "LINT_WEAK_1=repairo::\\brepairo\\b\n"
+            bare, _ = _terms_with_patterns(tmp, pats, "Did the repairo of the timer, see K-90042.\n")
+            self.assertEqual(bare, "[]")
+            definite, _ = _terms_with_patterns(tmp, pats, "This card is the repairo of K-90042.\n")
+            self.assertIn("repairo", definite)
+
+    def test_the_retired_generic_record_key_is_reported_not_silently_read(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out, err = _terms_with_patterns(
+                tmp, "LINT_RECORD_CTX=\\bdossier\n",
+                "We corrected the timer; the dossier lists it.\n")
+            self.assertEqual(out, "[]")
+            self.assertIn("LINT_RECORD_CTX", err)
+
+
 CARD = """---
 id: T1
 type: fact
