@@ -73,12 +73,12 @@ def test_the_packet_holds_the_journal_context_the_named_and_the_nearest_cards(tm
     assert "TONIGHT'S CANDIDATES\nnone yet tonight" in packet
 
 
-def test_tonights_candidates_are_shown_whole_with_their_marks_line():
+def test_tonights_nearest_candidate_is_shown_whole_with_its_marks_line():
     doc = PM.Doc()
     doc.cands.append(["M1", "### M1: widget bus voltage sag\nWHAT: sags\nMARKS: M-0000bbbb\n"])
     doc.cands.append(["M2", "### M2: gearbox backlash\nWHAT: two degrees\nMARKS: M-0000cccc\n"])
     block, labs = PM.tonight_block(doc, "widget bus voltage again")
-    assert labs[0] == "M1" and "M2" in labs                                       # closest + the latest
+    assert labs == ["M1"], "lexical alone ranks only what shares a token; the latest is not added"
     assert "### M1: widget bus voltage sag" in block and "MARKS: M-0000bbbb" in block
 
 
@@ -329,3 +329,118 @@ def test_the_mark_budget_is_150_minutes():
     text = open(os.path.join(TOOLS, "nightly_distill.sh"), encoding="utf-8").read()
     assert re.search(r"(?m)^MARK_BUDGET_MIN=\$\{MARK_BUDGET_MIN:-150\}$", text)
     assert "MARK_CHUNK" not in re.sub(r"(?m)^#.*$", "", text), "the 60-mark chunks are retired"
+
+
+# --- #237 follow-up: tonight's candidates are the k NEAREST, and the whole packet has a character budget -----
+WORDS = ["alder", "birch", "cedar", "dogwood", "elm", "fir", "ginkgo", "hazel", "ironwood", "juniper"]
+
+
+def night_of(n=50, body_lines=40):
+    """A synthetic night: n prior candidates, each on its own topic word, every one long enough that showing it
+    whole costs ~2,500 characters."""
+    doc = PM.Doc()
+    for i in range(1, n + 1):
+        topic = f"{WORDS[i % 10]}{i:03d}"
+        body = "".join(f"filler line {j} about the {topic} grove and its soil\n" for j in range(body_lines))
+        doc.cands.append([f"M{i}", f"### M{i}: sensor {topic} reading drifts after warmup\ntype: fact\n"
+                                   f"WHAT: the {topic} sensor reading drifts\n{body}MARKS: M-{i:08x}\n"
+                                   f"NEAREST: {CA}\n"])
+    return doc
+
+
+def tonight_section(packet):
+    return packet.split("## TONIGHT'S CANDIDATES")[1].split("\n## ")[0]
+
+
+def test_a_night_of_50_candidates_shows_at_most_k_nearest_and_the_duplicate_is_first_and_whole(tmp_path):
+    root = journal_root(tmp_path)
+    doc = night_of(50)
+    mk = mark("sensor hazel037 reading drifts by 3 percent after warmup", mid="M-0000ffff")
+    packet, _shown, labs = PM.build_packet(mk, str(root), retrieval(), doc, PM.Transcripts(dirs=[], slug=""))
+    sec = tonight_section(packet)
+    heads = re.findall(r"(?m)^### (M\d+):", sec)
+    assert 1 <= len(heads) <= 5, heads
+    assert heads[0] == "M37" and labs[0] == "M37", "the near-duplicate is ranked first"
+    m37 = sec.split("### M37:")[1].split("\n### ")[0]
+    assert "filler line 39 about the hazel037" in m37, "the nearest one is shown whole when it fits"
+    assert "M50" not in heads, "the latest candidate is not attached unless it is near"
+    for lab in heads[1:]:                                    # the others: title + the first lines only
+        other = sec.split(f"### {lab}:")[1].split("\n### ")[0]
+        assert len(other) < 700 and "filler line 39" not in other, (lab, len(other))
+    assert len(sec) < 2600 + 4 * 700
+    assert PM.TONIGHT_K == 5, "the default k"
+
+
+def test_k_is_configurable(tmp_path, monkeypatch):
+    monkeypatch.setattr(PM, "TONIGHT_K", 2, raising=False)
+    packet, _s, _l = PM.build_packet(mark("sensor hazel037 reading drifts", mid="M-0000ffff"),
+                                     str(journal_root(tmp_path)), retrieval(), night_of(50),
+                                     PM.Transcripts(dirs=[], slug=""))
+    assert len(re.findall(r"(?m)^### M\d+:", tonight_section(packet))) == 2
+
+
+def concept_embedder(texts, kind="doc"):
+    """A fake dense channel: a text's vector is the one-hot of the concept it is about, whatever the wording
+    (`<word>NNN` in a candidate, the spelled-out number in the mark)."""
+    out = []
+    for t in texts:
+        v = [0.0] * 64
+        n = ks.norm(t)
+        m = re.search(r"[a-z]+(\d{3})\b", n)
+        if "twelfth" in n:
+            v[12] = 1.0
+        elif m:
+            v[int(m.group(1)) % 64] = 1.0
+        out.append(v)
+    return out
+
+
+def test_the_dense_channel_finds_a_duplicate_the_lexical_channel_cannot(tmp_path):
+    """The cross-language gap: a mark worded differently (another language, in the real base) shares no token with
+    tonight's candidate about the same finding."""
+    R = retrieval()
+    R.embed = concept_embedder
+    mk = mark("twelfth probe wanders once heated", mid="M-0000ffff")
+    packet, _s, labs = PM.build_packet(mk, str(journal_root(tmp_path)), R, night_of(50),
+                                       PM.Transcripts(dirs=[], slug=""))
+    assert labs and labs[0] == "M12", labs
+    assert "### M12:" in tonight_section(packet)
+
+
+def test_the_packet_budget_trims_lowest_rank_first_and_keeps_the_mark_and_its_journal_line(tmp_path, monkeypatch):
+    root = journal_root(tmp_path)
+    doc = night_of(50)
+    mk = mark(f"the widget bus voltage sags to 46.0 V at 40 A, sensor hazel037 reading drifts, see {CB}",
+              mid="M-0000ffff")
+    T = PM.Transcripts(dirs=[], slug="")
+    full, full_shown, full_labs = PM.build_packet(mk, str(root), retrieval(), doc, T)
+    assert len(full) > 7000 and len(full_shown) >= 2 and len(full_labs) == 5
+    monkeypatch.setattr(PM, "PACKET_CHARS", 4000, raising=False)
+    packet, shown, labs = PM.build_packet(mk, str(root), retrieval(), doc, T)
+    assert len(packet) <= 4000, len(packet)
+    assert mk["line"] in packet                                                   # the mark itself
+    assert ">> 20: - 09:20 MARK[finding] the widget bus voltage sags" in packet   # its journal line, whole
+    assert shown == full_shown[:len(shown)] and labs == full_labs[:len(labs)], "kept = a rank prefix"
+    assert len(shown) + len(labs) < len(full_shown) + len(full_labs), "something was trimmed"
+    for cid in set(full_shown) - set(shown):
+        assert f"{cid} [" not in packet, "a trimmed card is not shown, and not in the NEAREST ids"
+    assert "left out for the packet budget" in packet
+    # a budget smaller than the mark and its journal line keeps both anyway
+    monkeypatch.setattr(PM, "PACKET_CHARS", 50, raising=False)
+    tiny, _s, _l = PM.build_packet(mk, str(root), retrieval(), doc, T)
+    assert mk["line"] in tiny and ">> 20: - 09:20 MARK[finding]" in tiny
+
+
+def test_packet_chars_is_logged_per_call_and_summarised(tmp_path):
+    root, q, stub = run_base(tmp_path, n=3)
+    log = tmp_path / "night.log"
+    r = run_pm(tmp_path, root, q, stub, "--log", log, KHMS_PERMARK_PACKET_CHARS="2500")
+    assert r.returncode == 0, r.stderr
+    served = [ln for ln in log.read_text().splitlines() if " served-by: " in ln]
+    assert len(served) == 3
+    sizes = [int(re.search(r"\bpacket_chars=(\d+)", ln).group(1)) for ln in served]
+    assert all(0 < s <= 2500 for s in sizes), sizes
+    rows = [json.loads(ln) for ln in (tmp_path / "rows.jsonl").read_text().splitlines()]
+    assert [row["packet_chars"] for row in rows] == sizes
+    assert re.search(r"permark: packet_chars n=3 min=\d+ median=\d+ max=\d+ budget=2500 trimmed=\d+",
+                     log.read_text())

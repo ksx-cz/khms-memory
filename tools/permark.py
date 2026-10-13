@@ -4,7 +4,7 @@
 Usage:
   permark.py --queue Q --out OUT [--deadline EPOCH] [--limit N] [--agent BIN] [--model sonnet]
              [--log LOG] [--jsonl J] [--served-file F] [--limit-flag F] [--timeout 180]
-             [--packets DIR] [--dry]
+             [--packets DIR] [--dry] [--tonight-k 5] [--packet-chars 32000]
 
   Q     the ledger's queue file (`mark_ledger.py queue --out Q`): `- <id> | <date time> | <kind> | <where> | <text>`,
         journal MARKs (`M-`) and generated lines (`G-`, #237 step 2) on one time axis.
@@ -33,12 +33,25 @@ THE PACKET (build_packet):
      (at most 3 shown whole), the lexical top 8 (khms_search, glossary-expanded) and the hybrid top 8
      (khms_recall_hybrid, when the dense daemon answers).  The named cards and the top-1 of each channel
      are shown WHOLE (4,000 characters at most), the rest by id, status, title and 3 body lines;
-  4. TONIGHT'S CANDIDATES — the 3 of OUT's candidates the lexical channel ranks closest plus the most
-     recently written one, whole, 8,000 characters in all;
+  4. TONIGHT'S CANDIDATES — the k (default 5, KHMS_PERMARK_TONIGHT_K / --tonight-k) of OUT's candidates
+     nearest to the mark by the same retrieval as the cards: the lexical channel (glossary-expanded) fused by
+     RRF with the dense channel (the warm daemon embeds each candidate once, op=embed) when it answers.  The
+     nearest one is shown whole if it fits in 4,000 characters, the others by their heading, the first 3
+     lines and their MARKS line.  So the section stays a few thousand characters on a night of 300
+     candidates, and a second mark about the same finding still sees the first one's candidate (the
+     in-night duplicate rule);
   5. SOURCE EXCERPT — `(sess <8 hex>)` in a journal mark or `src=digest sess <id>` in a generated line: the
      transcript's USER/ASSISTANT records of [t-20 min, t+2 min] (t = the mark's local time in UTC; TOOL
      records dropped, continuation lines kept, the last 6,000 characters); `src=gitlog <sha>`: the
      commit's `git show --stat`, 4,000 characters.
+
+THE PACKET BUDGET (KHMS_PERMARK_PACKET_CHARS / --packet-chars, default 32,000 characters): when a packet is
+longer, the lowest-ranked items go first — cards by their place in the NEAREST order and tonight's
+candidates by theirs, a card before a candidate of the same rank — then the source excerpt is cut from its
+start (the end nearest the mark stays), then the journal context lines farthest from the mark.  The mark's
+queue line and its own journal line are never trimmed.  What was left out is named in the packet, and a
+trimmed card is not among the NEAREST ids.  Every call logs `packet_chars=` (the served-by line and the
+JSONL row), and the run ends with `permark: packet_chars n= min= median= max= budget= trimmed=`.
 
 THE DECISIONS (parse_answer / apply): not-carded, new, belongs <label>, carded K-x, supersede K-x,
 contradict K-x, erratum K-x.  An answer without a parseable block for THIS id is not written: the mark
@@ -90,7 +103,11 @@ TOPK = 8
 NAMED_MAX = 3
 SUMMARY_CHARS = 500
 WHOLE_CHARS = 4000
-TONIGHT_CHARS = 8000
+TONIGHT_K = 5                 # tonight's candidates shown per mark (KHMS_PERMARK_TONIGHT_K, --tonight-k)
+TONIGHT_LINES = 3             # a candidate not shown whole: its heading, these first lines, its MARKS line
+PACKET_CHARS = 32000          # the packet budget (KHMS_PERMARK_PACKET_CHARS, --packet-chars)
+EMBED_TIMEOUT_S = 10.0        # one op=embed call (a batch of tonight's new candidates, or the mark's query)
+EMBED_BATCH = 32
 EXCERPT_BEFORE_MIN, EXCERPT_AFTER_MIN, EXCERPT_CHARS = 20, 2, 6000
 GIT_CHARS = 4000
 DECISIONS = ("new", "belongs", "carded", "notcarded", "supersede", "contradict", "erratum")
@@ -177,21 +194,26 @@ def clip(s, n):
     return s if len(s) <= n else s[:n] + f" […{len(s) - n} more chars]"
 
 
-def journal_context(root, loc):
+def journal_context_lines(root, loc):
+    """-> [(distance from the mark's line, rendered line)]; distance 0 is the mark's own line, whole."""
     m = re.match(r"^(journal|generated)/(.+):(\d+)$", loc)
     if not m or m.group(1) != "journal":
-        return ""
+        return []
     try:
         lines = open(os.path.join(root, "journal", m.group(2)), encoding="utf-8",
                      errors="replace").read().splitlines()
     except OSError:
-        return ""
+        return []
     n = int(m.group(3))
     out = []
     for i in range(max(1, n - CTX_BEFORE), min(len(lines), n + CTX_AFTER) + 1):
         t = lines[i - 1]
-        out.append(f"{'>>' if i == n else '  '} {i}: {t if i == n else clip(t, CTX_CLIP)}")
-    return "\n".join(out)
+        out.append((abs(i - n), f"{'>>' if i == n else '  '} {i}: {t if i == n else clip(t, CTX_CLIP)}"))
+    return out
+
+
+def journal_context(root, loc):
+    return "\n".join(t for _d, t in journal_context_lines(root, loc))
 
 
 def query_of(text):
@@ -226,6 +248,11 @@ class Retrieval:
         self.glossary = glossary if glossary is not None else ks.load_glossary()
         self.hy = hy if hy is not None else (NC.open_dense(timeout_ms) if dense else None)
         self.timeout_ms = timeout_ms
+        # tonight's candidates are not in the card index: the warm daemon embeds them (op=embed), each text
+        # once per run.  `embed(texts, kind)` -> vectors; replaced by a fake in tests; None = lexical only.
+        self.embed = self._daemon_embed if self.hy is not None else None
+        self.vectors = {}
+        self.tonight_dense_err = None
 
     def lexical(self, q, topn=TOPK):
         if not q:
@@ -243,6 +270,46 @@ class Retrieval:
             return []
         return [c for _s, _m, c in res] if meta.get("mode") == "hybrid" else []
 
+    def _daemon_embed(self, texts, kind="doc"):
+        import embed_index as ei
+        cfg = ei.MODELS.get(self.hy.MODEL, {})
+        pre = cfg.get("query_prefix" if kind == "query" else "doc_prefix", "")
+        return ei.daemon_embed([pre + t for t in texts], self.hy.MODEL, timeout_s=EMBED_TIMEOUT_S,
+                               sock_path=self.hy.SOCKET)
+
+    def rank_texts(self, q, items, topn):
+        """Rank [(key, text)] against the query `q` the way the cards are ranked: the lexical channel
+        (glossary-expanded khms_search over the texts) fused by reciprocal rank with the dense channel
+        (cosine of the embedded texts) when `self.embed` answers.  -> keys, nearest first, at most topn.
+        Lexical alone ranks only texts that share a token with the query; the dense channel ranks every text,
+        so with it the k nearest are always k."""
+        if not items or not q:
+            return []
+        pseudo = [{"id": key, "body": text, "nbody": ks.norm(text), "first": text.split("\n", 1)[0],
+                   "ntags": "", "tags": [], "fog": False} for key, text in items]
+        exp, _ = ks.expand_query(q, self.glossary)
+        lex = [c["id"] for _s, _m, c in ks.search(exp, cards=pseudo, topn=len(pseudo))[0]]
+        dense = []
+        if self.embed is not None and self.tonight_dense_err is None:
+            try:
+                new = list(dict.fromkeys(t for _k, t in items if t not in self.vectors))
+                for j in range(0, len(new), EMBED_BATCH):    # each call bounded by EMBED_TIMEOUT_S
+                    for t, v in zip(new[j:j + EMBED_BATCH], self.embed(new[j:j + EMBED_BATCH], "doc")):
+                        self.vectors[t] = v
+                qv = self.embed([q], "query")[0]
+                sims = [(sum(a * b for a, b in zip(qv, self.vectors[t])), i) for i, (_k, t) in enumerate(items)]
+                sims.sort(key=lambda x: (-x[0], x[1]))
+                dense = [items[i][0] for _sim, i in sims]
+            except Exception as exc:       # one failure decides the channel for the run (NC.open_dense's rule)
+                self.tonight_dense_err = f"{type(exc).__name__}: {exc}"
+                dense = []
+        if not dense:
+            return lex[:topn]
+        import khms_recall_hybrid as HY
+        fused = HY.rrf(lex, dense)
+        order = {key: i for i, (key, _t) in enumerate(items)}
+        return sorted(fused, key=lambda key: (-fused[key], order[key]))[:topn]
+
 
 def nearest(text, R):
     """-> (named cards, lexical, hybrid, ordered shown ids, ids shown whole)."""
@@ -258,28 +325,39 @@ def nearest(text, R):
     return named, lex, hyb, shown, whole
 
 
-def tonight_block(doc, text):
+def candidate_summary(block):
+    """A candidate not shown whole: its heading, its first TONIGHT_LINES lines and its MARKS line."""
+    lines = [ln for ln in block.rstrip("\n").splitlines() if ln.strip()]
+    marks = [ln for ln in lines if MARKS_LINE_RE.match(ln)]
+    body = [ln for ln in lines[1:] if not MARKS_LINE_RE.match(ln)]
+    out = [clip(lines[0], 300)] + [clip(ln, 200) for ln in body[:TONIGHT_LINES]]
+    if len(body) > TONIGHT_LINES:
+        out.append(f"[… {len(body) - TONIGHT_LINES} more line(s) of this candidate not shown]")
+    return "\n".join(out + marks[:1])
+
+
+def tonight_items(doc, text, R=None, k=None):
+    """-> [(label, rendered)] — the k of tonight's candidates nearest to the mark, nearest first; the nearest
+    whole when it fits in WHOLE_CHARS, the others summarised."""
     if not doc.cands:
-        return "", []
-    pseudo = []
-    for lab, block in doc.cands:
-        body = NEAREST_LINE_RE.sub("", block)
-        first = body.splitlines()[0] if body else ""
-        pseudo.append({"id": lab, "body": body, "nbody": ks.norm(body), "first": first, "ntags": "",
-                       "tags": [], "fog": False})
-    res, _ = ks.search(query_of(text), cards=pseudo, topn=3)
-    labs = [c["id"] for _s, _m, c in res]
-    last = doc.cands[-1][0]
-    if last not in labs:
-        labs.append(last)
-    out, used = [], 0
-    for lab in labs:
-        block = doc.find(lab)[1].rstrip("\n")
-        if used + len(block) > TONIGHT_CHARS and out:
-            break
-        out.append(block)
-        used += len(block)
-    return "\n\n".join(out), labs
+        return []
+    k = TONIGHT_K if k is None else k
+    items = [(lab, NEAREST_LINE_RE.sub("", block).rstrip("\n")) for lab, block in doc.cands]
+    q = query_of(text)
+    if R is None:
+        R = Retrieval(cards=[], hy=None, glossary={})
+    labs = R.rank_texts(q, items, k) if k > 0 else []
+    body = dict(items)
+    out = []
+    for i, lab in enumerate(labs):
+        b = body[lab]
+        out.append((lab, b if i == 0 and len(b) <= WHOLE_CHARS else candidate_summary(b)))
+    return out
+
+
+def tonight_block(doc, text, R=None, k=None):
+    items = tonight_items(doc, text, R, k)
+    return "\n\n".join(t for _l, t in items), [lab for lab, _t in items]
 
 
 def local_to_utc(date, hm):
@@ -386,29 +464,78 @@ def source_excerpt(mk, T, repos=None):
     return "", ""
 
 
-def build_packet(mk, root, R, doc, T, repos=None):
-    """-> (packet text, shown card ids, tonight's labels shown)."""
-    parts = ["## THE MARK", mk["line"], ""]
-    ctx = journal_context(root, mk["loc"])
-    if ctx:
-        parts += ["## JOURNAL CONTEXT (`>>` = the mark's own line)", ctx, ""]
+def build_packet(mk, root, R, doc, T, repos=None, k=None, budget=None, stats=None):
+    """-> (packet text, shown card ids, tonight's labels shown).  `stats` (a dict) receives `chars` and
+    `trimmed` (the items left out for the budget, lowest rank first)."""
+    budget = PACKET_CHARS if budget is None else budget
+    ctx = journal_context_lines(root, mk["loc"])
     named, lex, hyb, shown, whole = nearest(mk["text"], R)
-    parts.append("## NEAREST CARDS")
     hyb_ids = "unavailable tonight" if R.hy is None else (", ".join(c["id"] for c in hyb) or "none")
-    parts.append(f"named by the mark: {', '.join(c['id'] for c in named) or 'none'}; "
-                 f"lexical top {TOPK}: {', '.join(c['id'] for c in lex) or 'none'}; "
-                 f"hybrid top {TOPK}: {hyb_ids}")
+    cards_head = (f"named by the mark: {', '.join(c['id'] for c in named) or 'none'}; "
+                  f"lexical top {TOPK}: {', '.join(c['id'] for c in lex) or 'none'}; "
+                  f"hybrid top {TOPK}: {hyb_ids}")
+    cards = []
     for cid in shown:
         c = R.any_by_id.get(cid) or R.by_id[cid]
-        parts += ["", "---", card_whole(c) if cid in whole else card_summary(c)]
-    parts.append("")
-    tb, labs = tonight_block(doc, mk["text"])
-    parts += ["## TONIGHT'S CANDIDATES", tb or "none yet tonight", ""]
+        cards.append((cid, card_whole(c) if cid in whole else card_summary(c)))
+    tonight = tonight_items(doc, mk["text"], R, k)
     head, ex = source_excerpt(mk, T, repos)
-    if head:
-        parts += ["## SOURCE EXCERPT — " + head, ex, ""]
-    parts.append(f"Answer with exactly one decision block for {mk['id']}.")
-    return "\n".join(parts) + "\n", shown, labs
+    # the trim order, lowest rank first: rank i of the cards before rank i of tonight's candidates
+    ranked = sorted([(i, 1, "card", key) for i, (key, _t) in enumerate(cards)]
+                    + [(i, 0, "tonight", key) for i, (key, _t) in enumerate(tonight)], reverse=True)
+    drop, trimmed = set(), []
+    ex_keep = len(ex)
+    ctx_keep = list(ctx)
+
+    def render():
+        parts = ["## THE MARK", mk["line"], ""]
+        if ctx_keep:
+            parts += ["## JOURNAL CONTEXT (`>>` = the mark's own line)", "\n".join(t for _d, t in ctx_keep), ""]
+        parts += ["## NEAREST CARDS", cards_head]
+        for key, t in cards:
+            if ("card", key) not in drop:
+                parts += ["", "---", t]
+        parts.append("")
+        shown_t = [t for key, t in tonight if ("tonight", key) not in drop]
+        none = "none yet tonight" if not doc.cands else f"none of tonight's {len(doc.cands)} near this mark"
+        parts += ["## TONIGHT'S CANDIDATES", "\n\n".join(shown_t) or none, ""]
+        if head and ex_keep > 0:
+            body = ex if ex_keep >= len(ex) else "[… cut for the packet budget]\n" + ex[len(ex) - ex_keep:]
+            parts += ["## SOURCE EXCERPT — " + head, body, ""]
+        elif head and not ex:
+            parts += ["## SOURCE EXCERPT — " + head, ex, ""]
+        out = trimmed + ([f"{len(ctx) - len(ctx_keep)} journal context line(s)"] if len(ctx_keep) < len(ctx)
+                         else [])
+        if out:
+            parts.append(f"({len(out)} item(s) left out for the packet budget of {budget} characters, "
+                         f"lowest rank first: {', '.join(out)})")
+        parts.append(f"Answer with exactly one decision block for {mk['id']}.")
+        return "\n".join(parts) + "\n"
+
+    text = render()
+    for _i, _o, sec, key in ranked:                     # 1. the lowest-ranked cards and candidates
+        if len(text) <= budget:
+            break
+        drop.add((sec, key))
+        trimmed.append(key)
+        text = render()
+    if len(text) > budget and ex_keep > 0:              # 2. the source excerpt, from its start
+        over = len(text) - budget + 40
+        ex_keep = max(0, ex_keep - over)
+        if ex_keep < 200:
+            ex_keep = 0
+        trimmed.append("source excerpt" if ex_keep == 0 else "the start of the source excerpt")
+        text = render()
+    for d, t in sorted(ctx, key=lambda x: -x[0]):       # 3. journal context, farthest from the mark first
+        if len(text) <= budget or d == 0:
+            break
+        ctx_keep.remove((d, t))
+        text = render()
+    if stats is not None:
+        stats.update(chars=len(text), trimmed=list(trimmed) + (
+            [f"{len(ctx) - len(ctx_keep)} journal context line(s)"] if len(ctx_keep) < len(ctx) else []))
+    return (text, [key for key, _t in cards if ("card", key) not in drop],
+            [key for key, _t in tonight if ("tonight", key) not in drop])
 
 
 # --- the rules (system prompt) --------------------------------------------------------------------------
@@ -605,6 +732,8 @@ class Counters:
         self.cost = 0.0
         self.dec = {k: 0 for k in DECISIONS}
         self.unparsed = self.failed = self.unproven = self.unseen = 0
+        self.sizes, self.trimmed = [], 0
+        self.dense_err_logged = False
         self.t0 = time.time()
 
     def stage_line(self):
@@ -615,6 +744,14 @@ class Counters:
         return ("permark: decisions " + " ".join(f"{k}={v}" for k, v in self.dec.items())
                 + f" unparsed={self.unparsed} failed={self.failed} quotes-unproven={self.unproven}"
                 f" unseen-nearest={self.unseen}")
+
+    def packet_line(self, budget):
+        z = sorted(self.sizes)
+        if not z:
+            return f"permark: packet_chars n=0 budget={budget} trimmed=0"
+        med = z[len(z) // 2] if len(z) % 2 else (z[len(z) // 2 - 1] + z[len(z) // 2]) // 2
+        return (f"permark: packet_chars n={len(z)} min={z[0]} median={med} max={z[-1]} budget={budget} "
+                f"trimmed={self.trimmed}")
 
 
 def log_to(path, line):
@@ -635,8 +772,24 @@ def card_text(root, cid):
     return None
 
 
+def config_int(cli, key, default):
+    """--flag, else the KHMS_* key (environment, config file), else the module default."""
+    if cli is not None:
+        return cli
+    try:
+        v = P.get(key)
+    except Exception:
+        v = os.environ.get(key)
+    try:
+        return int(v) if v not in (None, "") else default
+    except ValueError:
+        raise SystemExit(f"permark: {key}={v!r} is not an integer")
+
+
 def run(a):
     root = a.root or P.get("KHMS_ROOT")
+    k = config_int(a.tonight_k, "KHMS_PERMARK_TONIGHT_K", TONIGHT_K)
+    budget = config_int(a.packet_chars, "KHMS_PERMARK_PACKET_CHARS", PACKET_CHARS)
     try:
         queue = parse_queue(open(a.queue, encoding="utf-8").read())
     except OSError as exc:
@@ -660,7 +813,8 @@ def run(a):
     if a.packets:
         os.makedirs(a.packets, exist_ok=True)
     log_to(a.log, f"permark: {len(queue)} queued mark(s), {len(queue) - len(todo)} already decided in {a.out}; "
-                  f"{len(R.cards)} active cards, dense channel {'on' if R.hy is not None else 'OFF'}; model {a.model}")
+                  f"{len(R.cards)} active cards, dense channel {'on' if R.hy is not None else 'OFF'}; model {a.model}; "
+                  f"tonight's candidates k={k}, packet budget {budget} characters")
     rc = 0
     for i, mk in enumerate(todo):
         if a.limit and C.n >= a.limit:
@@ -670,19 +824,29 @@ def run(a):
             log_to(a.log, f"permark: deadline reached — {len(todo) - i} mark(s) left OPEN for the next night")
             break
         tp = time.time()
-        packet, shown, _labs = build_packet(mk, root, R, doc, T)
+        ps = {}
+        packet, shown, _labs = build_packet(mk, root, R, doc, T, k=k, budget=budget, stats=ps)
         prefetch_s = time.time() - tp
+        C.sizes.append(len(packet))
+        C.trimmed += 1 if ps.get("trimmed") else 0
+        if R.tonight_dense_err and not C.dense_err_logged:
+            log_to(a.log, f"permark: the dense channel for tonight's candidates FAILED ({R.tonight_dense_err}) "
+                          "— lexical only for the rest of the run")
+            C.dense_err_logged = True
         if a.packets:
             with open(os.path.join(a.packets, mk["id"] + ".txt"), "w", encoding="utf-8") as fh:
                 fh.write(packet)
         if a.dry:
             C.n += 1
+            log_to(a.log, f"permark-{mk['id']} dry: packet_chars={len(packet)}"
+                          + (f", trimmed {len(ps['trimmed'])}" if ps.get("trimmed") else ""))
             continue
         res = None
         for attempt in (1, 2):
             res = call(agent, a.model, rules, packet, a.timeout)
             extra = [f"${res['cost']:.4f}" if res["cost"] is not None else "", f"{res['turns']} turns"
-                     if res["turns"] is not None else "", res["err"] if res["err"] else ""]
+                     if res["turns"] is not None else "", res["err"] if res["err"] else "",
+                     f"packet_chars={len(packet)}"]
             log_to(a.log, f"permark-{mk['id']} served-by: {','.join(res['models']) or 'UNKNOWN'} "
                           f"(attempt {attempt}/2, rc={'0' if res['ok'] else '1'}"
                           + "".join(", " + e for e in extra if e) + ")")
@@ -696,7 +860,8 @@ def run(a):
         C.n += 1
         row = {"id": mk["id"], "kind": mk["kind"], "loc": mk["loc"], "wall_s": round(res["wall"], 2),
                "prefetch_s": round(prefetch_s, 2), "usage": res["usage"], "total_cost_usd": res["cost"],
-               "turns": res["turns"], "models": res["models"], "shown": shown}
+               "turns": res["turns"], "models": res["models"], "shown": shown, "packet_chars": len(packet),
+               "trimmed": ps.get("trimmed") or []}
         if res["limit"]:
             row["decision"] = "usage-limit"
             C.n -= 1
@@ -746,11 +911,13 @@ def run(a):
         if C.n % 60 == 0:
             log_to(a.log, C.stage_line())
             log_to(a.log, C.decisions_line())
+            log_to(a.log, C.packet_line(budget))
     if not a.dry:
         if not os.path.exists(a.out):
             write_atomic(a.out, doc.render())
     log_to(a.log, C.stage_line())
     log_to(a.log, C.decisions_line())
+    log_to(a.log, C.packet_line(budget))
     return rc
 
 
@@ -779,6 +946,10 @@ def main(argv=None):
     ap.add_argument("--packets", default=None)
     ap.add_argument("--dry", action="store_true")
     ap.add_argument("--no-dense", action="store_true")
+    ap.add_argument("--tonight-k", type=int, default=None,
+                    help=f"tonight's candidates shown per mark (KHMS_PERMARK_TONIGHT_K, default {TONIGHT_K})")
+    ap.add_argument("--packet-chars", type=int, default=None,
+                    help=f"the packet budget in characters (KHMS_PERMARK_PACKET_CHARS, default {PACKET_CHARS})")
     a = ap.parse_args(argv)
     return run(a)
 

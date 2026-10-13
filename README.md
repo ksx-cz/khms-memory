@@ -181,8 +181,11 @@ The night's sources reach the base through one evaluator:
 2. **The per-mark evaluator** (`permark.py`, `prompts/nightly-marks.md`) takes the ledger's queue — the OPEN
    journal MARKs (`M-`) and generated lines (`G-`) on one time axis — and handles them one after another
    until `MARK_BUDGET_MIN` (150 min) from its own start. For each it assembles a packet with 0 tokens (the
-   journal context, the cards the mark names, the lexical and hybrid top 8, tonight's candidates, a
-   transcript excerpt or `git show --stat` when the mark names a session or a commit) and makes ONE call
+   journal context, the cards the mark names, the lexical and hybrid top 8, the k nearest of tonight's
+   candidates (`KHMS_PERMARK_TONIGHT_K`, default 5, ranked by the same lexical + dense retrieval), a
+   transcript excerpt or `git show --stat` when the mark names a session or a commit; at most
+   `KHMS_PERMARK_PACKET_CHARS` characters, default 32,000, trimmed lowest rank first and never the mark or
+   its journal line; every call logs `packet_chars=`) and makes ONE call
    without tools; the answer is one decision (not carded, new, belongs to tonight's candidate X, already
    carded K-x with a verbatim quote, supersede / contradict / erratum K-x). Marks are sequential on purpose:
    each one sees every decision made before it, so a second mark on the same matter joins the first one's

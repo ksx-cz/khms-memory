@@ -103,6 +103,8 @@ DEFAULTS = [
     ("KHMS_SWEEP_MODEL", "sonnet"),
     ("KHMS_MARK_MODEL", "sonnet"),
     ("KHMS_CONS_MODEL", "sonnet"),
+    ("KHMS_PERMARK_TONIGHT_K", "5"),        # tonight's candidates shown per mark in the per-mark packet (#237)
+    ("KHMS_PERMARK_PACKET_CHARS", "32000"),  # the per-mark packet budget in characters (#237)
     ("KHMS_WEEK_PART_MODEL", "sonnet"),
     ("KHMS_WEEK_MODEL", "opus"),
     ("KHMS_PROJECT_SLUG", ""),             # only transcript paths containing this text ("" = every transcript)
