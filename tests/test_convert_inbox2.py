@@ -209,3 +209,56 @@ def test_the_cli_writes_approve_file_and_report_through_approve_inboxs_parser(tm
                        capture_output=True, text=True, env=env, timeout=60)
     assert r.returncode == 1 and "schema problem" in r.stderr
     assert "not in the registry" in (tmp_path / "2099-01-01.approve.report.txt").read_text(encoding="utf-8")
+
+
+# --- #237: a field the unit DECLARES is never flagged as guessed ----------------------------------------
+# On 2026-10-13-2, 24 of 31 candidates carried t/e/g flags for type/evidence/tags written on their own
+# per-key lines: the flags were computed from the prose before those lines were merged.
+DECLARED = """## Cards
+
+### C1: the knowledge base forgets the probe swap
+type: fact
+level: observation
+tags: [khms, gotcha]
+evidence: observed
+scope: universal
+source: journal 2099-01-01
+date: 2099-01-01
+The note about the probe swap never reached the base.
+**QUOTES:**
+- src=journal :: the probe swap note never reached the base
+"""
+
+
+def _flags(ci, text):
+    _cards, rows = ci.convert(text, "2099-01-01", ci.load_tags())
+    (row,) = rows
+    return row[6], _cards[0][0]
+
+
+def test_declared_fields_are_not_flagged_as_guessed(tmp_path, monkeypatch):
+    ci, _b, _p = load(tmp_path, monkeypatch)
+    flags, meta = _flags(ci, DECLARED)
+    assert not set(flags) & set("tegs"), flags
+    assert (meta["type"], meta["evidence"], meta["tags"], meta["scope"]) == (
+        "fact", "observed", ["khms", "gotcha"], "universal")
+
+
+def test_scope_left_undeclared_is_derived_from_the_declared_tags_and_flagged(tmp_path, monkeypatch):
+    ci, _b, _p = load(tmp_path, monkeypatch)
+    flags, meta = _flags(ci, DECLARED.replace("scope: universal\n", ""))
+    assert set(flags) & set("teg") == set(), flags
+    # khms is the base's agent tag: the scope rule names the agent scope and calls it ambiguous
+    assert meta["scope"] == "agent:helper" and "s" in flags, (meta["scope"], flags)
+
+
+def test_a_candidate_missing_the_fields_is_still_flagged(tmp_path, monkeypatch):
+    ci, _b, _p = load(tmp_path, monkeypatch)
+    bare = "\n".join(ln for ln in DECLARED.split("\n")
+                     if not ln.startswith(("type:", "level:", "tags:", "evidence:", "scope:")))
+    flags, _m = _flags(ci, bare)
+    assert {"t", "e", "g"} <= set(flags), flags
+    # a written type whose type half is prose is resolved from the body template: still a guess
+    prose_type = DECLARED.replace("type: fact\n", "type: observation (design finding)\n")
+    flags, _m = _flags(ci, prose_type)
+    assert "t" in flags, flags

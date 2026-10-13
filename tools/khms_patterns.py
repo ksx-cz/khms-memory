@@ -8,10 +8,13 @@ are NOT expanded). Absent file = English only. Keys:
 
   TRIAGE_<NAME>=<alternation>     appended as `|<alternation>` inside the named classifier's group
                                   (NAME: ATTEMPT, APPROACH_REJECT, APPROACH_TOPIC, HEDGE, RESOLVED, FALSIFIER)
-  LINT_RECORD_CTX=<alternation>   more words that mean "this line talks about the record"
+  LINT_RECORD_REF=<alternation>   more forms of a DEFINITE card reference ("this card"), normalised
   LINT_BLOCK_<n>=<label>::<regex> an extra unambiguous correction marker (case-sensitive), in file order
-  LINT_CONTEXT_<n>=<label>::<regex> an extra correction phrase, matched on normalised (lower-case,
-                                  diacritics stripped) lines that also talk about the record, in file order
+  LINT_CONTEXT_<n>=<label>::<regex> an extra phrase stating a claim is false, matched on normalised (lower-case,
+                                  diacritics stripped) lines that also name a card (K-id or definite reference)
+  LINT_WEAK_<n>=<label>::<regex>  an extra word that names correcting/repairing as an activity as often as it
+                                  performs one; counts only on a line with a DEFINITE card reference
+  (LINT_RECORD_CTX — generic record words — is retired since #237: khms_lint.py says so on stderr.)
   HOOK_<NAME>=<value>             a matcher of khms_hook.py that REPLACES its English default
                                   (regex(), value()) or extends it (words()); khms_hook.py names each key:
                                   HOOK_CLAIM_KEYWORD, HOOK_CLAIM_HONEST, HOOK_DOMAIN, HOOK_PROPOSAL_MARKER,
