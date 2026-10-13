@@ -191,13 +191,22 @@ for d in $DATES; do
     fi
   fi
   # --- contradiction triage (DATE-triage.md); weekly units have none
+  # A date holds one triage file per NIGHT (#237): DATE-triage.md for its first night, DATE-<n>-triage.md
+  # for a later night of the same date (nightly_triage.sh names them by the night key). Each is its own
+  # review; the first keeps its historic label `triage:`, a later one is named `triage <file>:`.
   case "$d" in
     *-weekly) ;;
     *)
-      if [ -f "$INBOX/$d-triage.md" ] && ! is_wip "$d-triage.md"; then
+      tfiles="$(ls "$INBOX" 2>/dev/null | grep -E "^${d}(-[0-9]+)?-triage\.md\$" | sort -V || true)"
+      st=""; shown=0
+      for tf in $tfiles; do
+        is_wip "$tf" && continue
+        shown=$((shown + 1))
+        lbl="triage"
+        [ "$tf" = "$d-triage.md" ] || lbl="triage $tf"
         rev=0
-        if python3 "$CODE/khms_review_state.py" --triage-reviewed "$INBOX/$d-triage.md"; then rev=1; fi
-        cen="$(triage_census "$INBOX/$d-triage.md")"
+        if python3 "$CODE/khms_review_state.py" --triage-reviewed "$INBOX/$tf"; then rev=1; fi
+        cen="$(triage_census "$INBOX/$tf")"
         judged="${cen%% *}"; planned="${cen##* }"
         ratio=""
         [ -n "$cen" ] && ratio=" (judged $judged of $planned planned pairs)"
@@ -210,13 +219,18 @@ for d in $DATES; do
         # the alarm that rings every morning forever and is therefore ignored.
         if [ -n "$cen" ] && [ "$judged" -eq 0 ] 2>/dev/null \
            && { [ "$d" = "$TODAY" ] || [ "$rev" = 0 ]; }; then
-          t="triage: JUDGED NOTHING (0 of $planned planned pairs came back judged — the file \
+          t="$lbl: JUDGED NOTHING (0 of $planned planned pairs came back judged — the file \
 exists and decided nothing; re-run the sweep, this is not a result to review)"
         elif [ "$rev" = 1 ]; then
-          t="triage: reviewed$ratio"
+          t="$lbl: reviewed$ratio"
         else
-          t="triage: PENDING$ratio"
+          t="$lbl: PENDING$ratio"
         fi
+        st="${st:+$st, }$t"
+      done
+      t="$st"
+      if [ "$shown" -gt 0 ]; then
+        :
       elif [ "$TRIAGE_ON" = 1 ] && [ "$d" = "$TODAY" ] && [ ! -f "$MARKERS/.reviewed-$d-triage" ]; then
         # NOT the same thing as "the triage found nothing": the file is either still being
         # written by a live sweep or the sweep died. Say which — on 2026-09-02 this script

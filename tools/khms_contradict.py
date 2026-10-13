@@ -857,22 +857,30 @@ def select_for_adjudication(pairs, limit):
 # reaches rank 251+. A pair JUDGED (outcome OK — the one definition, `judged_count`) in one of the
 # last N nights' sweep JSONs is skipped, UNLESS one of its two cards changed after that night's
 # run started (then the old verdict is about other text and the pair is eligible again). Pairs
-# that were planned and never judged (DEADLINE, BUDGET, LLM-ERROR …) are NOT skipped. Today's own
-# files are ignored, so a same-day rerun or the qwen fallback plans the same pairs again.
-_SWEEP_FILE = re.compile(r"^triage-(\d{4}-\d{2}-\d{2})-sweep(?:\.[\w-]+)?\.json$")
+# that were planned and never judged (DEADLINE, BUDGET, LLM-ERROR …) are NOT skipped. This
+# night's own files are ignored, so a rerun of the same night or the qwen fallback plans the same
+# pairs again.
+# NAMED BY NIGHT KEY (#237): a sweep JSON is `triage-<night key>-sweep[.<judge>].json`, the key being
+# DATE for the first night of a date and DATE-<n> for a later one (nightly_distill.sh claims it). Until
+# then the skip read only the files of EARLIER DATES, so a second night of one date re-judged the
+# pairs the date's first night had judged, and a DATE-<n> file matched no pattern at all.
+# Now every OTHER night of tonight's date counts like an earlier date; only `night_key`'s own are ignored.
+_SWEEP_FILE = re.compile(r"^triage-((\d{4}-\d{2}-\d{2})(?:-\d+)?)-sweep(?:\.[\w-]+)?\.json$")
 
 
-def recently_judged(staging, nights, today, mtime_of):
+def recently_judged(staging, nights, today, mtime_of, night_key=None):
     """{(a, b) sorted: judged-at epoch} for pairs judged OK in the sweep JSONs of the `nights`
-    nights before `today` (ISO date) in `staging`; `mtime_of(card_id)` -> epoch or None.
+    nights before `today` (ISO date) and of every night of `today` other than `night_key` (default:
+    `today`, the date's first night) in `staging`; `mtime_of(card_id)` -> epoch or None.
     Returns (skip, accounting)."""
     import datetime
     t = datetime.date.fromisoformat(today)
     lo = (t - datetime.timedelta(days=nights)).isoformat()
+    own = night_key or today
     files, judged, unreadable = [], {}, []
     for name in sorted(os.listdir(staging)) if os.path.isdir(staging) else []:
         m = _SWEEP_FILE.match(name)
-        if not m or not (lo <= m.group(1) < today):
+        if not m or m.group(1) == own or not (lo <= m.group(2) <= today):
             continue
         path = os.path.join(staging, name)
         try:
@@ -1925,14 +1933,16 @@ def main():
                     help="JSONL of every paid attempt of the night; earlier runs of the same "
                          "night count against --max-usd")
     ap.add_argument("--skip-judged-dir", metavar="STAGING",
-                    help="skip pairs judged (outcome OK) in the triage-<date>-sweep*.json files "
+                    help="skip pairs judged (outcome OK) in the triage-<night key>-sweep*.json files "
                          "of the last --skip-nights nights in this directory, unless a card of "
                          "the pair changed since that run started (#208: full nights must not "
                          "re-judge the same top pairs)")
     ap.add_argument("--skip-nights", type=int, default=0,
                     help="how many nights before --today the skip looks back (0 = off)")
-    ap.add_argument("--today", help="ISO date of this night (default: today); files of this "
-                                    "date are never read by the skip")
+    ap.add_argument("--today", help="ISO date of this night (default: today)")
+    ap.add_argument("--night-key", help="this night's key, DATE or DATE-<n> (default: --today); "
+                                        "its own sweep files are never read by the skip, the "
+                                        "other nights of the same date are (#237)")
     ap.add_argument("--provenance", action="store_true",
                     help="report cards asserting machine-checkable numbers on doc evidence")
     args = ap.parse_args()
@@ -1994,7 +2004,7 @@ def main():
         mtimes = {c["id"]: os.path.getmtime(c["path"]) for c in cards}
         skip, skip_acc = recently_judged(args.skip_judged_dir, args.skip_nights,
                                          args.today or datetime.date.today().isoformat(),
-                                         mtimes.get)
+                                         mtimes.get, night_key=args.night_key)
         pairs, skip_acc["skipped"] = skip_recently_judged(pairs, skip)
         print(f"  judged in the last {args.skip_nights} nights and unchanged since: skipped "
               f"{skip_acc['skipped']} candidate pairs ({skip_acc['judged_in_window']} judged in "

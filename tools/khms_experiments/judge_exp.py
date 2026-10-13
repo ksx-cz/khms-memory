@@ -228,7 +228,7 @@ def cited_rows(docs=CITED_DOCS):
         t = open(d, encoding="utf-8").read()
         for m in re.finditer(r"(K-\d{5})\s*(?:<-|\u21c4|\u2190|vs\.?|against)\s*(K-\d{5})", t):
             pairs.add(frozenset((m.group(1), m.group(2))))
-        for m in re.finditer(r"(20\d\d-\d\d-\d\d(?:-coordinator)?)(?:-triage(?:\.md)?)?\s+ROW\s+(\d+)", t):
+        for m in re.finditer(r"(20\d\d-\d\d-\d\d(?:-\d+|-coordinator)?)(?:-triage(?:\.md)?)?\s+ROW\s+(\d+)", t):
             rows.add((f"{m.group(1)}-triage.md", int(m.group(2))))
     return pairs, rows
 

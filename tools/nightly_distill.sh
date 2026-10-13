@@ -317,7 +317,7 @@ knowhow_line() {   # knowhow_line <stage tag> <output file> -> one log line
   local ids cands
   ids=$(grep -cE '^- M-[0-9a-f]{8} :: not know-how' "$2" 2>/dev/null || true)
   cands=$(grep -oiE 'not know-how: *[0-9]+' "$2" 2>/dev/null | grep -oE '[0-9]+' | awk '{s+=$1} END {print s+0}' || true)   # pipefail: no match is not an error
-  echo "$(date -Is) know-how ($1): ${ids:-0} MARK id(s) and ${cands:-0} candidate(s) dropped as not know-how (K-93929)" >> "$LOG"
+  echo "$(date -Is) know-how ($1): ${ids:-0} MARK id(s) and ${cands:-0} candidate(s) dropped as not know-how" >> "$LOG"
 }
 # The ledger tool, never fatal: a ledger bug must not cost the night's cards (K-90490), but
 # it must say so — a silent ledger failure would read as "nothing OPEN".
@@ -331,9 +331,12 @@ ledger() {
 SINCE=$(cat "$STAMP" 2>/dev/null || echo "1970-01-01")
 # run_triage_stage: the optional standing-base triage (KHMS_NIGHT_TRIAGE), non-fatal, said in the log
 # either way. Called on EVERY real night that reaches its end -- the quiet one included (see 4b below).
+# It gets this run's NIGHT KEY (NIGHTLY_NK, #237): its morning file and sweep JSON are named by it like
+# every other artefact of the night, so a second night of a date neither overwrites the first one's
+# triage nor re-judges the pairs it judged.
 run_triage_stage() {
   if [ ${#TRIAGE_CMD[@]} -gt 0 ]; then
-    "${TRIAGE_CMD[@]}" >> "$LOG" 2>&1 \
+    NIGHTLY_NK="$NK" "${TRIAGE_CMD[@]}" >> "$LOG" 2>&1 \
       || echo "$(date -Is) triage stage FAILED (non-fatal) — cards proposal is unaffected; the pairs it did not judge stay eligible for the next night's full sweep" >> "$LOG"
   else
     echo "$(date -Is) triage stage: OFF (KHMS_NIGHT_TRIAGE not configured)" >> "$LOG"
@@ -881,7 +884,7 @@ if [ "$DRYRUN" = "1" ]; then
   echo "  MARK stage: the per-mark evaluator (permark.py, #237) AFTER the generator: one packet and ONE call without tools per queued id (journal M- and generated G-, one time axis), timeout ${PERMARK_TIMEOUT_S}s per call, no new mark later than ${MARK_BUDGET_MIN} min after the stage starts"
   echo "  its output is committed once as $CARRY/<night key>-m01/ with every batch's durable output (split-run --ready): published without a consolidate call"
   echo "  grounding journal source (window + every journal from $LFLOOR): $JVERIFY ($(stat -c%s "$JVERIFY") B)"
-  echo "  know-how test (K-93929): consolidate prompt $(grep -c 'not know-how' "$CODE/prompts/nightly-consolidate.md" || true) line(s), MARK prompt $(grep -c 'not know-how' "$CODE/prompts/nightly-marks.md" || true) line(s) name the drop reason; each output's drops are logged as 'know-how (<stage>): …'"
+  echo "  know-how test: consolidate prompt $(grep -c 'not know-how' "$CODE/prompts/nightly-consolidate.md" || true) line(s), MARK prompt $(grep -c 'not know-how' "$CODE/prompts/nightly-marks.md" || true) line(s) name the drop reason; each output's drops are logged as 'know-how (<stage>): …'"
   echo
   echo "--- verify_quotes sources (must match the src= labels the stages may use) ---"
   echo "  digest=$DIGEST"
@@ -1342,7 +1345,7 @@ ledger sync >> "$LOG" 2>&1 || echo "$(date -Is) mark ledger sync (post) FAILED (
 # ALWAYS ATTEMPTED when configured, even when sweep or consolidate exhausted their retries above:
 # it compares the STANDING base against itself, not against tonight's candidates, so a failure
 # upstream must not stop it. It runs BEFORE the final verdict so a triage failure cannot cost the
-# night: it writes its own file (memory/inbox/DATE-triage.md), takes no night lock (it holds the
+# night: it writes its own file (memory/inbox/<night key>-triage.md), takes no night lock (it holds the
 # clone's code-use lock, nested in this run's), and run_triage_stage keeps it non-fatal under
 # `set -euo pipefail`. Unconfigured, the log says so. A quiet night runs it too (above).
 run_triage_stage

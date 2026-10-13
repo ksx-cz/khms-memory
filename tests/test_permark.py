@@ -138,7 +138,7 @@ CAND = ("### M1: widget bus sags to 46.0 V at 40 A\ntype: fact\nlevel: observati
 
 
 @pytest.mark.parametrize("answer,kind,arg", [
-    ("DECISION: not-carded\n- M-0000aaaa :: not know-how (K-93929): a status line", "notcarded", ""),
+    ("DECISION: not-carded\n- M-0000aaaa :: not know-how: a status line", "notcarded", ""),
     ("DECISION: new\n" + CAND, "new", ""),
     ("DECISION: belongs M1", "belongs", "M1"),
     (f"DECISION: carded {CA}\n- M-0000aaaa :: already carded {CA}: \"the widget bus voltage sags under load\"",
@@ -226,7 +226,7 @@ mid = re.search(r"^- ([MG]-[0-9a-f]{8}) \|", packet, re.M).group(1)
 if mid in os.environ.get("STUB_GARBLE", ""):
     ans = "no decision at all"
 else:
-    ans = f"DECISION: not-carded\n- {mid} :: not know-how (K-93929): fixture"
+    ans = f"DECISION: not-carded\n- {mid} :: not know-how: fixture"
 if os.environ.get("STUB_SLEEP"):
     import time; time.sleep(float(os.environ["STUB_SLEEP"]))
 print(json.dumps({"type": "result", "result": ans, "is_error": False, "total_cost_usd": 0.002, "num_turns": 1,
@@ -312,7 +312,7 @@ def test_an_unparsable_answer_leaves_the_mark_out_and_counts_it(tmp_path):
 def test_split_run_ready_commits_each_batch_with_its_durable_output(tmp_path):
     src = tmp_path / "out.md"
     src.write_text("# x\n\n### M1: a\nWHAT: a\nMARKS: M-00000001\n\n### M2: b\nWHAT: b\nMARKS: M-00000002\n\n"
-                   "## MARKS NOT CARDED\n- M-00000003 :: not know-how (K-93929): x\n")
+                   "## MARKS NOT CARDED\n- M-00000003 :: not know-how: x\n")
     carry = tmp_path / "carry"
     carry.mkdir()
     r = subprocess.run([sys.executable, os.path.join(TOOLS, "nightly_batch.py"), "split-run", str(src),

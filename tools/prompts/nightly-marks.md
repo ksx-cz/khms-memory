@@ -48,13 +48,13 @@ The card schema (spec sections 4 and 5) and the tag registry follow these instru
      the owner's words), there is no sentence to quote — write a candidate instead (it may name
      K-xxxxx in its body);
    - `- <id> :: duplicate of <id>` — the same content as another mark of this chunk;
-   - `- <id> :: not know-how (K-93929): <one sentence why>` — pure status/progress (dispatched X,
+   - `- <id> :: not know-how: <one sentence why>` — pure status/progress (dispatched X,
      merged Y, PASS / rc=0, moved #N to Testing) with nothing a future reader could reuse. The test
      (owner 2026-10-06: "Store know-how, not a status dump."): would a future agent act
      differently knowing this? If not, no card.
      A mark whose only content is a VALUE with its own source in the repo (dimension, tunable, rate floor,
-     address — robot_physical.yaml, a config yaml, a launch file) is `not know-how (K-93929): value lives in
-     <file>` (owner 2026-10-08, K-91076: a card holding the value goes stale against its source).
+     address — robot_physical.yaml, a config yaml, a launch file) is `not know-how: value lives in
+     <file>` (owner 2026-10-08: a card holding the value goes stale against its source).
    These are PROPOSALS to the morning review, which records them with a tool; nothing here dismisses
    anything by itself, so say the real reason.
 
@@ -105,7 +105,7 @@ names the decision; what follows it is the existing format. Write nothing before
 1. **not carded** — not know-how, a value that lives in a file, or a duplicate of another queued mark:
 
        DECISION: not-carded
-       - <id> :: not know-how (K-93929): <one sentence why>
+       - <id> :: not know-how: <one sentence why>
 
 2. **new candidate** — the base and tonight's candidates do not hold this mark's content:
 

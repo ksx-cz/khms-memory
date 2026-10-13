@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # KHMS nightly TRIAGE stage: sweep the standing base for contradictions, triage the losing
-# side at CLAIM level, and write ONE proposal file to memory/inbox/DATE-triage.md.
+# side at CLAIM level, and write ONE proposal file to memory/inbox/<night key>-triage.md
+# (DATE-triage.md for the first night of a date, DATE-2-triage.md for a second one -- see NK below).
 #
 # WHY IT IS A SEPARATE STAGE AND A SEPARATE FILE:
 #  - the consolidate stage already "flags contradictions" (spec §9.2), but only inside the
@@ -27,8 +28,8 @@ done
 # WHERE THINGS ARE (khms_paths.sh): data under KHMS_ROOT (memory/know read, memory/inbox written),
 # the staging directory (memory/inbox/.staging: the night's sweep JSON, and the earlier nights' sweep JSONs
 # the skip below reads), log NIGHTLY_LOG / TRIAGE_LOG else KHMS_NIGHT_LOG, the tools beside this
-# script. TRIAGE_OUT / NIGHTLY_STAGING / NIGHTLY_DATE stay overridable so a test can run the stage for
-# real against a throwaway base.
+# script. TRIAGE_OUT / NIGHTLY_STAGING / NIGHTLY_DATE / NIGHTLY_NK stay overridable so a test can run the
+# stage for real against a throwaway base.
 . "$(dirname "$(readlink -f "$0")")/khms_paths.sh"
 khms_load || exit 3
 DRYRUN=${NIGHTLY_DRYRUN:-0}
@@ -46,17 +47,30 @@ fi
 CODE=$KHMS_CODE
 BRAIN=$(khms_get KHMS_ROOT)
 DATE=${NIGHTLY_DATE:-$(date +%F)}
+# THE NIGHT KEY (#237). Every per-night artefact of this stage -- the morning file, the sweep JSON the skip of
+# later nights reads, its report, the provenance list, the judge's spend ledger -- is named by the night key the
+# night driver claimed (nightly_distill.sh: DATE for the first run of a date, DATE-2, DATE-3 ... for later ones;
+# the same key its card units carry). Until then the stage named them by DATE: a second night of one date
+# wrote memory/inbox/DATE-triage.md over the morning's reviewed file, and its skip, which read only EARLIER
+# dates, re-judged every pair the morning night had judged. Run alone (no NIGHTLY_NK) it is the date's first
+# night, NK = DATE, the historic names. A key that is not DATE[-N] is refused before any work: it becomes a
+# file name.
+NK=${NIGHTLY_NK:-$DATE}
+if ! [[ "$NK" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}(-[0-9]+)?$ ]]; then
+  echo "refused: night key '$NK' (NIGHTLY_NK) is not DATE or DATE-<n>" >&2; exit 2
+fi
+DATE=${NK:0:10}
 LOG=${TRIAGE_LOG:-${NIGHTLY_LOG:-$(khms_get KHMS_NIGHT_LOG)}}
 STAGING=${NIGHTLY_STAGING:-$BRAIN/memory/inbox/.staging}
-OUT=${TRIAGE_OUT:-$BRAIN/memory/inbox/$DATE-triage.md}
+OUT=${TRIAGE_OUT:-$BRAIN/memory/inbox/$NK-triage.md}
 # FULL SWEEP EVERY NIGHT (#208, owner 2026-10-05: "full-base nights every night, drop the incremental
 # window"). There is no `--since` window and no triage watermark any more: in the reference deployment the
 # incremental window held no card on most nights (its stamp was tonight's own start) and the tool silently
 # widened an empty window to a full sweep, while full-population nights measured 39 % applied rows against
 # 3 % on incremental ones. The budget stays LIMIT pairs a night. What keeps consecutive full nights from
 # re-judging the same top pairs (220 and 215 of 250 repeated night to night, measured) is SKIP_NIGHTS: a pair
-# JUDGED in the sweep JSONs of the last SKIP_NIGHTS nights (STAGING) is skipped unless one of its cards
-# changed since. A pair planned and NOT judged (deadline, budget, judge errors, a failed night) is not
+# JUDGED in the sweep JSONs of the last SKIP_NIGHTS dates (STAGING) -- and of every OTHER night of tonight's
+# date (#237) -- is skipped unless one of its cards changed since. A pair planned and NOT judged (deadline, budget, judge errors, a failed night) is not
 # skipped, so the next night offers it again -- that is the retry the old watermark provided. 0 = no skip.
 LIMIT=${TRIAGE_LIMIT:-250}
 SKIP_NIGHTS=${TRIAGE_SKIP_NIGHTS:-28}
@@ -69,7 +83,8 @@ export KHMS_JUDGE=${KHMS_JUDGE:-$(khms_get KHMS_JUDGE)}
 # THE PAID JUDGE'S BOUND: an ESTIMATED per-night bound, not a guaranteed hard cap (khms_contradict.py
 # JudgeBudget: every attempt reserves its estimated worst case first; a known cost replaces the
 # reservation, an unknown one keeps it; a cost above its estimate is a BREACH and stops every later
-# paid call of the night). All runs of the date share one ledger. KHMS_JUDGE_MAX_USD; empty = the
+# paid call of the night). All runs of the night key share one ledger (a rerun of the same night, the local
+# fallback); a second night of the date is a night of its own (#237). KHMS_JUDGE_MAX_USD; empty = the
 # stage default $15 (~3.4x the measured cost of a 250-pair night in the reference deployment). Pairs
 # the bound refuses are BUDGET in the morning file -- never sent, never "no contradiction".
 TRIAGE_JUDGE_MAX_USD=${TRIAGE_JUDGE_MAX_USD:-$(khms_get KHMS_JUDGE_MAX_USD)}
@@ -97,18 +112,18 @@ fi
 # The shadow judge of the reference deployment (a second judge evaluated on the same pairs) is an
 # evaluation pilot, not part of KHMS: it ran only while the judge of record was the local model.
 # The whole base every night, minus the pairs judged in the last SKIP_NIGHTS nights (see LIMIT above).
-MODE=(--skip-judged-dir "$STAGING" --skip-nights "$SKIP_NIGHTS" --today "$DATE")
+MODE=(--skip-judged-dir "$STAGING" --skip-nights "$SKIP_NIGHTS" --today "$DATE" --night-key "$NK")
 
-SWEEP_JSON=$STAGING/triage-$DATE-sweep.json
-JUDGE_LEDGER=$STAGING/triage-$DATE-judge-spend.jsonl
-SWEEP_MD=$STAGING/triage-$DATE-sweep.md
-PROV_MD=$STAGING/triage-$DATE-provenance.md
+SWEEP_JSON=$STAGING/triage-$NK-sweep.json
+JUDGE_LEDGER=$STAGING/triage-$NK-judge-spend.jsonl
+SWEEP_MD=$STAGING/triage-$NK-sweep.md
+PROV_MD=$STAGING/triage-$NK-provenance.md
 
 if [ "$DRYRUN" = "1" ]; then
   echo "=== DRY RUN — triage stage inputs, no model call, no inbox write ==="
   echo "  brain          : $BRAIN"
-  echo "  date           : $DATE"
-  echo "  mode           : full (all cards, every night); skip pairs judged in the last $SKIP_NIGHTS nights and unchanged since ($STAGING)"
+  echo "  date           : $DATE (night key $NK)"
+  echo "  mode           : full (all cards, every night); skip pairs judged in the last $SKIP_NIGHTS nights and in the other nights of $DATE, unchanged since ($STAGING)"
   echo "  cards in know/ : $(python3 "$KHMS_CODE/khms_files.py" "$BRAIN/memory/know" | wc -l)"
   _embed="$(khms_get KHMS_EMBED_DIR)/${KHMS_EMBED_SLUG:-bge}.npz"
   echo "  embed index    : $_embed $(ls -la "$_embed" 2>/dev/null | awk '{print $5" B, "$6" "$7" "$8}' || true)$([ -f "$_embed" ] || echo 'ABSENT — the dense channel will be unavailable')"
@@ -147,7 +162,7 @@ except Exception as e:
 fi
 
 mkdir -p "$(dirname "$LOG")" "$STAGING"
-echo "$(date -Is) triage start (mode=full, skip judged last $SKIP_NIGHTS nights, limit=$LIMIT, judge=$KHMS_JUDGE$([ "$KHMS_JUDGE" = local ] || echo ", bound \$$TRIAGE_JUDGE_MAX_USD/night estimated, ledger $JUDGE_LEDGER"))" >> "$LOG"
+echo "$(date -Is) triage start (mode=full, skip judged last $SKIP_NIGHTS nights, night key $NK, limit=$LIMIT, judge=$KHMS_JUDGE$([ "$KHMS_JUDGE" = local ] || echo ", bound \$$TRIAGE_JUDGE_MAX_USD/night estimated, ledger $JUDGE_LEDGER"))" >> "$LOG"
 
 python3 "$CODE/khms_contradict.py" --provenance --limit 60 > "$PROV_MD" 2>>"$LOG" || true
 

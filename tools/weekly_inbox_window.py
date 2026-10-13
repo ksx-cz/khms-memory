@@ -41,7 +41,7 @@ import sys
 DATED = re.compile(r"^(\d{4}-\d{2}-\d{2})")
 OWN = re.compile(r"^\d{4}-\d{2}-\d{2}-weekly")
 TRIAGE_ARTIFACT = re.compile(
-    r"^\d{4}-\d{2}-\d{2}-triage(?:\.md)?\."
+    r"^\d{4}-\d{2}-\d{2}(?:-\d+)?-triage(?:\.md)?\."
     r"(preview|verdict-draft|verdict-final|applied|doubtful-resolved)\.md$")
 DEFAULT_SPAN = 7   # days before DATE when there is no previous weekly
 

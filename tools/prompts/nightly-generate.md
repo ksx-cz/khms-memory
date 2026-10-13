@@ -14,7 +14,7 @@ them. A short, grounded line is cheaper to write, and the evaluator sees the bas
 2. Read the tag registry `{{KHMS_ROOT}}/memory/views/tags.md` only if you need a word for a kind; you
    do not write tags.
 
-## What is worth a line — KNOW-HOW only (K-93929)
+## What is worth a line — KNOW-HOW only
 Would a future agent act differently knowing this? Write a line for: a finding that holds beyond today
 (a cause, a gotcha, how something really behaves), a refutation, a measured fact about the system with
 its number, a decision WITH its reason, a mistake WITH the measure that stops it, a requirement the

@@ -145,14 +145,14 @@ nor that section stays OPEN and costs another night.
 ## Then
 
 - Deduplicate candidates; drop noise (unsupported claims) and apply the KNOW-HOW TEST below. Count drops.
-- **KNOW-HOW TEST** (owner 2026-10-06, K-93929: "Store know-how, not a status dump."). Ask of every
+- **KNOW-HOW TEST** (owner 2026-10-06: "Store know-how, not a status dump."). Ask of every
   candidate: would a future agent act differently knowing this? A candidate that ONLY records status or
   progress — something was launched, finished or killed, passed (GREEN, rc=0, "N passed"), committed,
   pushed, tagged, merged or deployed, a board move, a file kept or deleted, the next step — is DROPPED
   with the reason `not know-how`: count it under `## Dropped` as `not know-how: <N>`, and every MARKS id
-  it carried goes to `## MARKS NOT CARDED` as `- <id> :: not know-how (K-93929): <one sentence why>`.
+  it carried goes to `## MARKS NOT CARDED` as `- <id> :: not know-how: <one sentence why>`.
   A VALUE THAT HAS ITS OWN SOURCE IN THE REPO is not know-how either (owner 2026-10-08: rear tyre track in a card
-  went stale against `robot_physical.yaml`; K-91076): a dimension, a tunable, a rate floor, an address — the card
+  went stale against `robot_physical.yaml`): a dimension, a tunable, a rate floor, an address — the card
   never states the number as the fact; it states the know-how around it (how it was measured, why it is so, what
   breaks) and POINTS to the file:key that holds it. A candidate whose only content is such a value is DROPPED as
   `not know-how: value lives in <file>`.

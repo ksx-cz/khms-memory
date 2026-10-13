@@ -120,7 +120,7 @@ def test_a_generated_line_is_carded_and_dismissed_like_a_mark_but_under_its_own_
         "the relay drops out at 11.4 V\n")
     (root / "memory/inbox").mkdir(parents=True, exist_ok=True)
     unit = root / "memory/inbox/2099-05-07-m01-b00.md"
-    unit.write_text(f"## MARKS NOT CARDED\n- {g2} :: not know-how (K-93929): a tunable that lives in its file\n")
+    unit.write_text(f"## MARKS NOT CARDED\n- {g2} :: not know-how: a tunable that lives in its file\n")
     d = ledger(root, "dismiss", "--from-inbox", str(unit))
     assert d.returncode == 0, d.stdout + d.stderr
     assert ledger(root, "sync").returncode == 0

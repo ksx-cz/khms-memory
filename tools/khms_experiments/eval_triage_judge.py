@@ -33,6 +33,7 @@ import argparse
 import glob
 import json
 import os
+import re
 import sys
 import time
 from collections import defaultdict
@@ -64,7 +65,10 @@ def build_jobs(rows):
     for r in rows:
         if not r["loser"] or not r["winner"]:
             continue
-        date = r["file"][:10]
+        # the night key of the file (`DATE-triage.md` -> DATE, `DATE-2-triage.md` -> DATE-2, #237): the
+        # sweep JSON is named by it; a suffixed hand unit (`DATE-coordinator-triage.md`) keeps its date
+        nk = re.match(r"^(\d{4}-\d{2}-\d{2}(?:-\d+)?)-triage\.md$", r["file"])
+        date = nk.group(1) if nk else r["file"][:10]
         if date not in shapes_by_date:
             shapes_by_date[date] = sweep_shapes(date)
         a, b = sorted((r["loser_id"], r["winner_id"]))
