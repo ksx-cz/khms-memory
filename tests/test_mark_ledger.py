@@ -119,3 +119,40 @@ def test_mark_after_timestamped_journal_narrative(time, kind, prefix):
 ])
 def test_narrative_references_and_quoted_examples_stay_excluded(line):
     assert ml.parse_marks(line) == []
+
+
+def test_a_covered_by_verdict_is_a_dismissal_with_its_reason_never_coverage(tmp_path):
+    """#237: `covered by K-x: <why>` is a NOT CARDED reason (the extra detail changes no action): it closes the
+    mark as DISMISSED without a quote, while `already carded K-x` still needs its verbatim quote (#209 A1)."""
+    journal = tmp_path / 'journal'
+    journal.mkdir()
+    (journal / '2099-03-04.md').write_text(
+        'MARK[nalez] the widget bus sags again on the second unit, 11.2 V\n'
+        'MARK[nalez] the widget bus voltage sags under load, measured once more\n'
+        'MARK[nalez] the widget bus sags, a third note without a quote\n')
+    know = tmp_path / 'memory' / 'know'
+    know.mkdir(parents=True)
+    (know / 'K-00042.md').write_text('---\nid: K-00042\ntype: fact\nlevel: observation\nstatus: active\n'
+                                     'tags: [power]\n---\nthe widget bus voltage sags under load\n')
+    paths = ml.Paths(str(tmp_path))
+    ids = list(ml.derive(paths, '2099-03-04'))
+    assert len(ids) == 3
+    unit = (f'## MARKS NOT CARDED\n'
+            f'- {ids[0]} :: covered by K-00042: the second unit and its 11.2 V change no action the card sets\n'
+            f'- {ids[1]} :: already carded K-00042: "the widget bus voltage sags under load"\n'
+            f'- {ids[2]} :: already carded K-00042\n')
+    evs, bad, unproven, carded = ml.record_not_carded(paths, unit, 'reviewer', floor='2099-03-04')
+    assert not bad and not carded
+    assert [u[0] for u in unproven] == [ids[2]], 'a bare "already carded" is still not coverage'
+    cov = next(e for e in evs if e['id'] == ids[0])
+    assert cov['ev'] == 'dismiss' and 'card' not in cov
+    assert cov['reason'] == ('nightly verdict accepted at review: covered by K-00042: the second unit and '
+                             'its 11.2 V change no action the card sets')
+    marks = ml.derive(paths, '2099-03-04')
+    assert marks[ids[0]]['state'] == 'DISMISSED' and 'card' not in marks[ids[0]]
+    assert marks[ids[1]]['state'] == 'CARDED' and marks[ids[1]]['card'] == 'K-00042'
+    assert marks[ids[2]]['state'] == 'OPEN'
+    s = ml.summarize(marks, '2099-03-04')
+    assert (s['dismissed'], s['carded'], s['open']) == (1, 1, 1)
+    again = ml.record_not_carded(paths, unit, 'reviewer', floor='2099-03-04')
+    assert [e for e in again[0] if e['id'] == ids[0]] == [], 'closing the unit twice adds nothing'

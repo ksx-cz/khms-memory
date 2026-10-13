@@ -225,6 +225,8 @@ with open(os.environ["STUB_LOG"], "a") as fh:
 mid = re.search(r"^- ([MG]-[0-9a-f]{8}) \|", packet, re.M).group(1)
 if mid in os.environ.get("STUB_GARBLE", ""):
     ans = "no decision at all"
+elif os.environ.get("STUB_COVERED"):
+    ans = f"DECISION: not-carded\n- {mid} :: covered by {os.environ['STUB_COVERED']}: the extra date changes no action"
 else:
     ans = f"DECISION: not-carded\n- {mid} :: not know-how: fixture"
 if os.environ.get("STUB_SYS"):                      # the rules the run handed the model
@@ -572,3 +574,75 @@ def test_a_short_carded_answer_parses_keeps_its_quote_and_its_reason():
     assert ML.quote_in_card(am.group(2), "x\nthe widget bus voltage sags under load\n")
     short_nc = PM.parse_answer("DECISION: not-carded\n- M-0000aaaa :: not know-how: a status line", "M-0000aaaa")
     assert short_nc["kind"] == "notcarded" and short_nc["reason"] == ""
+
+
+def test_the_effort_is_a_config_key_and_a_flag(tmp_path):
+    root, q, stub = run_base(tmp_path, n=1)
+    got = []
+    for args, env in (((), {}), ((), {"KHMS_PERMARK_EFFORT": "medium"}), (("--effort", "low"), {}),
+                      (("--effort", "high"), {"KHMS_PERMARK_EFFORT": "medium"})):
+        (tmp_path / "out.md").unlink(missing_ok=True)
+        r = run_pm(tmp_path, root, q, stub, *args, **env)
+        assert r.returncode == 0, r.stdout + r.stderr
+        a = stub_calls(tmp_path)[-1]["args"]
+        got.append(a[a.index("--effort") + 1])
+        assert f"effort {got[-1]}" in r.stdout, "the run's first line names the effort"
+    assert got == ["high", "medium", "low", "high"], got
+    (tmp_path / "out.md").unlink(missing_ok=True)
+    bad = run_pm(tmp_path, root, q, stub, KHMS_PERMARK_EFFORT="hgih")
+    assert bad.returncode == 2 and "KHMS_PERMARK_EFFORT" in bad.stderr
+    assert len(stub_calls(tmp_path)) == 4, "a mistyped effort makes no call"
+
+
+def test_the_covered_rule_variant_is_rendered_only_when_on(tmp_path):
+    root, q, stub = run_base(tmp_path, n=1)
+    sysf = tmp_path / "sys.txt"
+    seen = []
+    for args, env in (((), {}), (("--covered-rule", "1"), {}), ((), {"KHMS_PERMARK_COVERED_RULE": "1"}),
+                      (("--covered-rule", "0"), {"KHMS_PERMARK_COVERED_RULE": "1"}),
+                      (("--covered-rule", "1", "--short-answers", "0"), {})):
+        (tmp_path / "out.md").unlink(missing_ok=True)
+        r = run_pm(tmp_path, root, q, stub, *args, STUB_SYS=sysf, **env)
+        assert r.returncode == 0, r.stdout + r.stderr
+        rules = sysf.read_text()
+        assert "<!--" not in rules and "rule:covered" not in rules, "no marker line reaches the model"
+        on = ":: covered by K-xxxxx:" in rules
+        seen.append(on)
+        assert ("no sentence to quote — write a candidate instead" in rules) is not on, "exactly one variant of the topic rule"
+        if on:
+            assert "would the mark's extra content make a future agent act" in rules
+            assert ("SHORT ANSWERS" in rules) is ("--short-answers" not in args)
+            if "SHORT ANSWERS" in rules:
+                short = rules[rules.index("SHORT ANSWERS"):]
+                assert ":: covered by K-xxxxx:" in short, "the short shape names the covered verdict too"
+    assert seen == [False, True, True, False, True], seen
+    assert PM.COVERED_RULE == 0, "off by default"
+
+
+def test_pick_rule_refuses_a_prompt_without_the_block():
+    text = "a\n<!-- rule:covered=0 -->\nold\n<!-- rule:covered=1 -->\nnew\n<!-- /rule:covered -->\nz\n"
+    assert PM.pick_rule(text, "covered", 0) == "a\nold\nz\n"
+    assert PM.pick_rule(text, "covered", 1) == "a\nnew\nz\n"
+    with pytest.raises(ValueError):
+        PM.pick_rule("a\nb\n", "covered", 1)
+
+
+def test_a_covered_verdict_is_not_carded_with_its_card_as_the_target(tmp_path):
+    ans = f"DECISION: not-carded\n- M-0000aaaa :: covered by {CA}: the second unit's 11.2 V changes no action"
+    dec = PM.parse_answer(ans, "M-0000aaaa")
+    assert dec["kind"] == "notcarded" and dec["arg"] == CA, dec
+    doc = PM.Doc()
+    kind, target, lab = PM.apply(doc, "M-0000aaaa", dec, [CA])
+    assert (kind, target, lab) == ("notcarded", CA, None)
+    nc = doc.render().split("## MARKS NOT CARDED")[1]
+    assert f"- M-0000aaaa :: covered by {CA}: the second unit's 11.2 V changes no action" in nc
+    plain = PM.parse_answer("DECISION: not-carded\n- M-0000aaaa :: not know-how: a status line", "M-0000aaaa")
+    assert plain["arg"] == ""
+    # the run: the row names the card, the decisions line counts it apart, the night file keeps the line
+    root, q, stub = run_base(tmp_path, n=2)
+    r = run_pm(tmp_path, root, q, stub, STUB_COVERED=CA)
+    assert r.returncode == 0, r.stdout + r.stderr
+    rows = [json.loads(ln) for ln in (tmp_path / "rows.jsonl").read_text().splitlines()]
+    assert [(x["decision"], x["target"]) for x in rows] == [("notcarded", CA)] * 2
+    assert "notcarded=2" in r.stdout and "covered=2" in r.stdout
+    assert (tmp_path / "out.md").read_text().count(f":: covered by {CA}:") == 2

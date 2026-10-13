@@ -14,5 +14,14 @@ heading, no candidate draft, no explanation before or after:
     - <id> :: already carded K-xxxxx: "<one sentence copied VERBATIM from K-xxxxx as shown in the packet>"
     REASON: <one sentence: which of this mark's specific content that sentence holds>
 
+<!-- rule:covered=0 -->
 The quote rules above still hold: the sentence must be in the card text the packet shows, and a card that
 has the topic but not this mark's specific content is not "already carded".
+<!-- rule:covered=1 -->
+The quote rules above still hold: the sentence must be in the card text the packet shows, and a card that
+has the topic but not this mark's specific content is not "already carded". When that card already makes
+a future agent do what this mark would, the not-carded answer is these two lines, nothing else:
+
+    DECISION: not-carded
+    - <id> :: covered by K-xxxxx: <one sentence: why the extra detail changes no action>
+<!-- /rule:covered -->

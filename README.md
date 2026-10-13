@@ -191,7 +191,11 @@ The night's sources reach the base through one evaluator:
    without tools; the answer is one decision (not carded, new, belongs to tonight's candidate X, already
    carded K-x with a verbatim quote, supersede / contradict / erratum K-x). With
    `KHMS_PERMARK_SHORT_ANSWERS=1` (the default) a not-carded or carded answer is two or three lines
-   (`prompts/nightly-marks-short.md`). Marks are sequential on purpose:
+   (`prompts/nightly-marks-short.md`). With `KHMS_PERMARK_COVERED_RULE=1` (default off) a card with the
+   mark's topic but not its specific content gets a candidate only when that extra content would change what
+   a future agent does; otherwise the verdict is `covered by K-x: <why>`, a NOT CARDED reason that
+   `mark_ledger.py` records as a dismissal, never as coverage. `KHMS_PERMARK_EFFORT` (default `high`) is
+   the call's `--effort`. Marks are sequential on purpose:
    each one sees every decision made before it, so a second mark on the same matter joins the first one's
    candidate instead of becoming a duplicate.
 3. Its output is post-checked (attribute, quote check, NEAREST, RELATION gate) and committed once, by one

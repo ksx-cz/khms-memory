@@ -71,6 +71,16 @@ prompts/nightly-marks-short.md — a carded answer is its DECISION line, the ver
 same; a `REASON:` line goes to the JSONL row (`reason`), never into OUT, so the verdict line stays what the
 morning's quote check greps.
 
+COVERED RULE (KHMS_PERMARK_COVERED_RULE / --covered-rule 0|1, default 0): picks the variant of the
+`<!-- rule:covered=N -->` blocks of prompts/nightly-marks.md and nightly-marks-short.md.  0 = a card with the
+topic but not the mark's specific content means a candidate; 1 = a candidate only when the extra content
+would change what a future agent does, otherwise the not-carded verdict `covered by K-x: <why>`.  That
+verdict is a NOT CARDED reason: mark_ledger records it as a dismissal (no quote, never coverage); the row
+logs its K-x as `target` and the decisions line counts it as `covered=`.
+
+EFFORT (KHMS_PERMARK_EFFORT / --effort low|medium|high|xhigh|max, default high): the `--effort` of the
+per-mark call.
+
 LOGGED, NEVER GATED: `quotes-unproven` (an "already carded" quote mark_ledger.quote_in_card does not find
 in the card) and `unseen-nearest` (a new candidate whose own nearest top 3 hold an id the packet lacked).
 """
@@ -115,6 +125,11 @@ NAMED_MAX = 3
 WHOLE_TOP = 3                 # the top N of each channel shown whole (KHMS_PERMARK_WHOLE_TOP, --whole-top)
 LINKS_LINE = 0                # 1 = a type + link-ids line under every shown card (KHMS_PERMARK_LINKS_LINE)
 SHORT_ANSWERS = 1             # 1 = three-line carded / not-carded answers (KHMS_PERMARK_SHORT_ANSWERS)
+COVERED_RULE = 0              # 1 = the `covered by K-x` not-carded verdict (KHMS_PERMARK_COVERED_RULE)
+EFFORT = "high"               # the per-mark call's --effort (KHMS_PERMARK_EFFORT, --effort)
+EFFORTS = ("low", "medium", "high", "xhigh", "max")
+RULE_MARK_RE = re.compile(r"^[ \t]*<!-- (?P<end>/?)rule:(?P<name>[a-z-]+)(?:=(?P<val>\d))? -->[ \t]*$")
+COVERED_RE = re.compile(r"::\s*covered by\s+(K-\d{5})\b")
 LINK_LINE_KEYS = ("supersedes", "superseded_by", "contradicts", "refuted_by", "derived_from")
 REASON_RE = re.compile(r"^\s*\**REASON:\**\s*(?P<why>.+?)\s*$", re.M)
 SUMMARY_CHARS = 500
@@ -606,13 +621,33 @@ def spec_sections(path):
     return m.group(0).strip() if m else ""
 
 
-def render_rules(root, short=None):
-    """The system prompt; `short` (default SHORT_ANSWERS) appends prompts/nightly-marks-short.md."""
+def pick_rule(text, name, value):
+    """Keep the `<!-- rule:<name>=<value> -->` variant of every such block of `text`, drop the others and
+    the marker lines.  A text with no block of that name is an error: the switch would silently do nothing."""
+    out, cur, seen = [], None, False
+    for ln in text.splitlines(keepends=True):
+        m = RULE_MARK_RE.match(ln.rstrip("\n"))
+        if m and m.group("name") == name:
+            seen = True
+            cur = None if m.group("end") else m.group("val")
+            continue
+        if cur is None or cur == str(int(value)):
+            out.append(ln)
+    if not seen:
+        raise ValueError(f"no `rule:{name}` block in the prompt")
+    return "".join(out)
+
+
+def render_rules(root, short=None, covered=None):
+    """The system prompt; `short` (default SHORT_ANSWERS) appends prompts/nightly-marks-short.md, `covered`
+    (default COVERED_RULE) picks the `rule:covered` variant of both."""
     import khms_prompt
     short = SHORT_ANSWERS if short is None else short
-    rules = khms_prompt.render("nightly-marks")
+    covered = COVERED_RULE if covered is None else covered
+    rules = pick_rule(khms_prompt.render("nightly-marks"), "covered", covered)
     if short:
-        rules = rules.rstrip("\n") + "\n\n" + khms_prompt.render("nightly-marks-short")
+        rules = (rules.rstrip("\n") + "\n\n"
+                 + pick_rule(khms_prompt.render("nightly-marks-short"), "covered", covered))
     spec = P.get("KHMS_SPEC") or os.path.join(P.REPO, "spec", "khms-spec.md")
     sec = spec_sections(spec)
     try:
@@ -624,19 +659,19 @@ def render_rules(root, short=None):
 
 
 # --- the call -------------------------------------------------------------------------------------------
-def claude_cmd(agent, model, rules):
+def claude_cmd(agent, model, rules, effort=None):
     return [agent, "-p", "--model", model, "--output-format", "json", "--tools", "",
             "--system-prompt", rules, "--setting-sources", "", "--strict-mcp-config",
-            "--no-session-persistence", "--effort", "high"]
+            "--no-session-persistence", "--effort", effort or EFFORT]
 
 
-def call(agent, model, rules, packet, timeout):
+def call(agent, model, rules, packet, timeout, effort=None):
     """-> dict(ok, text, usage, cost, turns, models, limit, err, wall)."""
     t0 = time.time()
     res = {"ok": False, "text": "", "usage": {}, "cost": None, "turns": None, "models": [], "limit": False,
            "err": "", "wall": 0.0}
     try:
-        cp = RUNNER(claude_cmd(agent, model, rules), input=packet, capture_output=True, text=True,
+        cp = RUNNER(claude_cmd(agent, model, rules, effort), input=packet, capture_output=True, text=True,
                     timeout=timeout, cwd=tempfile.gettempdir())
     except subprocess.TimeoutExpired:
         res.update(err=f"no answer within {timeout:.0f}s", wall=time.time() - t0)
@@ -728,6 +763,8 @@ def parse_answer(text, mid):
     elif kind == "notcarded":
         if not verdict:
             return {"kind": "unparsed", "why": "not-carded without its verdict line"}
+        cm = COVERED_RE.search(verdict)
+        arg = cm.group(1) if cm else ""         # `covered by K-x`: the row's target, never coverage
     rm = REASON_RE.search(rest) if kind in ("carded", "notcarded") else None
     return {"kind": kind, "arg": arg, "block": block, "verdict": verdict, "reason": rm.group("why") if rm else ""}
 
@@ -794,7 +831,7 @@ class Counters:
         self.n = self.turns = self.cands = 0
         self.cost = 0.0
         self.dec = {k: 0 for k in DECISIONS}
-        self.unparsed = self.failed = self.unproven = self.unseen = 0
+        self.unparsed = self.failed = self.unproven = self.unseen = self.covered = 0
         self.sizes, self.trimmed = [], 0
         self.dense_err_logged = False
         self.t0 = time.time()
@@ -805,7 +842,7 @@ class Counters:
 
     def decisions_line(self):
         return ("permark: decisions " + " ".join(f"{k}={v}" for k, v in self.dec.items())
-                + f" unparsed={self.unparsed} failed={self.failed} quotes-unproven={self.unproven}"
+                + f" covered={self.covered} unparsed={self.unparsed} failed={self.failed} quotes-unproven={self.unproven}"
                 f" unseen-nearest={self.unseen}")
 
     def packet_line(self, budget):
@@ -849,6 +886,16 @@ def config_int(cli, key, default):
         raise SystemExit(f"permark: {key}={v!r} is not an integer")
 
 
+def config_str(cli, key, default):
+    if cli is not None:
+        return cli
+    try:
+        v = P.get(key)
+    except Exception:
+        v = os.environ.get(key)
+    return v.strip() if v not in (None, "") and v.strip() else default
+
+
 def run(a):
     root = a.root or P.get("KHMS_ROOT")
     k = config_int(a.tonight_k, "KHMS_PERMARK_TONIGHT_K", TONIGHT_K)
@@ -856,6 +903,11 @@ def run(a):
     whole_top = config_int(a.whole_top, "KHMS_PERMARK_WHOLE_TOP", WHOLE_TOP)
     links = config_int(a.links_line, "KHMS_PERMARK_LINKS_LINE", LINKS_LINE)
     short = config_int(a.short_answers, "KHMS_PERMARK_SHORT_ANSWERS", SHORT_ANSWERS)
+    covered = config_int(a.covered_rule, "KHMS_PERMARK_COVERED_RULE", COVERED_RULE)
+    effort = config_str(a.effort, "KHMS_PERMARK_EFFORT", EFFORT)
+    if effort not in EFFORTS:
+        print(f"permark: KHMS_PERMARK_EFFORT={effort!r} is not one of {', '.join(EFFORTS)}", file=sys.stderr)
+        return 2
     try:
         queue = parse_queue(open(a.queue, encoding="utf-8").read())
     except OSError as exc:
@@ -866,7 +918,7 @@ def run(a):
         print(f"permark: no executable agent CLI ({agent!r}); pass --agent <absolute path>", file=sys.stderr)
         return 2
     try:
-        rules = render_rules(root, short=short)
+        rules = render_rules(root, short=short, covered=covered)
     except Exception as exc:
         print(f"permark: the rules (nightly-marks prompt) cannot be rendered: {exc}", file=sys.stderr)
         return 2
@@ -881,7 +933,8 @@ def run(a):
     log_to(a.log, f"permark: {len(queue)} queued mark(s), {len(queue) - len(todo)} already decided in {a.out}; "
                   f"{len(R.cards)} active cards, dense channel {'on' if R.hy is not None else 'OFF'}; model {a.model}; "
                   f"tonight's candidates k={k}, packet budget {budget} characters; whole top {whole_top}, "
-                  f"links line {'on' if links else 'off'}, short answers {'on' if short else 'off'}")
+                  f"links line {'on' if links else 'off'}, short answers {'on' if short else 'off'}, "
+                  f"covered rule {'on' if covered else 'off'}, effort {effort}")
     rc = 0
     for i, mk in enumerate(todo):
         if a.limit and C.n >= a.limit:
@@ -911,7 +964,7 @@ def run(a):
             continue
         res = None
         for attempt in (1, 2):
-            res = call(agent, a.model, rules, packet, a.timeout)
+            res = call(agent, a.model, rules, packet, a.timeout, effort)
             extra = [f"${res['cost']:.4f}" if res["cost"] is not None else "", f"{res['turns']} turns"
                      if res["turns"] is not None else "", res["err"] if res["err"] else "",
                      f"packet_chars={len(packet)}"]
@@ -958,6 +1011,7 @@ def run(a):
             _jsonl(a.jsonl, row)
             continue
         C.dec[kind] += 1
+        C.covered += 1 if kind == "notcarded" and target else 0
         if kind in ("new", "supersede", "contradict"):
             C.cands += 1
             block = doc.find(lab)[1]
@@ -1028,6 +1082,11 @@ def main(argv=None):
     ap.add_argument("--short-answers", type=int, choices=(0, 1), default=None,
                     help=f"1 = three-line carded / not-carded answers (KHMS_PERMARK_SHORT_ANSWERS, "
                          f"default {SHORT_ANSWERS})")
+    ap.add_argument("--covered-rule", type=int, choices=(0, 1), default=None,
+                    help=f"1 = a card with the topic makes the mark `covered by K-x` (not carded) unless its extra "
+                         f"content changes an action (KHMS_PERMARK_COVERED_RULE, default {COVERED_RULE})")
+    ap.add_argument("--effort", choices=EFFORTS, default=None,
+                    help=f"the per-mark call's --effort (KHMS_PERMARK_EFFORT, default {EFFORT})")
     a = ap.parse_args(argv)
     return run(a)
 

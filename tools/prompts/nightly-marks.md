@@ -44,9 +44,23 @@ The card schema (spec sections 4 and 5) and the tag registry follow these instru
      with no quote, or with a quote the card does not contain, is NOT coverage — the mark stays OPEN
      and comes back tomorrow. (Measured 2026-10-08: 27 % of all CARDED marks rested on a bare "already
      carded K-x", e.g. a memory-bandwidth refutation "EMC 0 %" closed onto a card holding neither.)
+<!-- rule:covered=0 -->
      When K-xxxxx has the TOPIC but not this mark's specific content (its number, refutation, gotcha,
      the owner's words), there is no sentence to quote — write a candidate instead (it may name
      K-xxxxx in its body);
+<!-- rule:covered=1 -->
+     When K-xxxxx has the TOPIC but not this mark's specific content (its number, refutation, gotcha,
+     the owner's words), there is no sentence to quote, so it is not "already carded". Then put the
+     know-how test to the DIFFERENCE: would the mark's extra content make a future agent act
+     differently from what K-xxxxx already makes it do? Yes — write a candidate (it may name K-xxxxx
+     in its RELATION). No — the extra is a status, a date, the constant of one incident, one more
+     instance of the mechanism K-xxxxx already states — write the `covered by` verdict below. When
+     unsure, write the candidate;
+   - `- <id> :: covered by K-xxxxx: <one sentence: why the extra detail changes no action>` —
+     K-xxxxx is a card shown in the packet that already makes a future agent do what this mark would.
+     It is NOT coverage: it needs no quote because the morning records it as a dismissal with this
+     reason, never as carded, so the sentence must name the extra detail and why it changes nothing;
+<!-- /rule:covered -->
    - `- <id> :: duplicate of <id>` — the same content as another mark of this chunk;
    - `- <id> :: not know-how: <one sentence why>` — pure status/progress (dispatched X,
      merged Y, PASS / rc=0, moved #N to Testing) with nothing a future reader could reuse. The test
@@ -102,10 +116,23 @@ refutations are the highest-value marks: they are rarely `not know-how`.
 In this per-mark stage "the chunk" above is the ONE mark of the packet. The first line of your answer
 names the decision; what follows it is the existing format. Write nothing before or after the block.
 
+<!-- rule:covered=0 -->
 1. **not carded** — not know-how, a value that lives in a file, or a duplicate of another queued mark:
 
        DECISION: not-carded
        - <id> :: not know-how: <one sentence why>
+<!-- rule:covered=1 -->
+1. **not carded** — not know-how, a value that lives in a file, a duplicate of another queued mark, or
+   covered by a shown card whose action this mark's extra detail does not change:
+
+       DECISION: not-carded
+       - <id> :: not know-how: <one sentence why>
+
+   or
+
+       DECISION: not-carded
+       - <id> :: covered by K-xxxxx: <one sentence: why the extra detail changes no action>
+<!-- /rule:covered -->
 
 2. **new candidate** — the base and tonight's candidates do not hold this mark's content:
 
