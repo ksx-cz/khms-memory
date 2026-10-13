@@ -226,7 +226,8 @@ mid = re.search(r"^- ([MG]-[0-9a-f]{8}) \|", packet, re.M).group(1)
 if mid in os.environ.get("STUB_GARBLE", ""):
     ans = "no decision at all"
 elif os.environ.get("STUB_COVERED"):
-    ans = f"DECISION: not-carded\n- {mid} :: covered by {os.environ['STUB_COVERED']}: the extra date changes no action"
+    q = f'"{os.environ["STUB_QUOTE"]}" — ' if os.environ.get("STUB_QUOTE") else ""
+    ans = f"DECISION: not-carded\n- {mid} :: covered by {os.environ['STUB_COVERED']}: {q}the extra date changes no action"
 else:
     ans = f"DECISION: not-carded\n- {mid} :: not know-how: fixture"
 if os.environ.get("STUB_SYS"):                      # the rules the run handed the model
@@ -646,3 +647,42 @@ def test_a_covered_verdict_is_not_carded_with_its_card_as_the_target(tmp_path):
     assert [(x["decision"], x["target"]) for x in rows] == [("notcarded", CA)] * 2
     assert "notcarded=2" in r.stdout and "covered=2" in r.stdout
     assert (tmp_path / "out.md").read_text().count(f":: covered by {CA}:") == 2
+
+
+def test_the_covered_verdict_asks_for_a_verbatim_quote_in_both_variants(tmp_path):
+    """#237 (owner 2026-10-13 16:37): with the covered rule on, the normal and the short answer shape both ask the
+    `covered by K-x` verdict for one sentence copied verbatim from K-x — the shape the carded answer uses."""
+    root, q, stub = run_base(tmp_path, n=1)
+    sysf = tmp_path / "sys.txt"
+    shape = ':: covered by K-xxxxx: "<one sentence copied VERBATIM from K-xxxxx'
+    rules = {}
+    for short, covered in (("0", "1"), ("1", "1"), ("1", "0")):
+        (tmp_path / "out.md").unlink(missing_ok=True)
+        r = run_pm(tmp_path, root, q, stub, "--covered-rule", covered, "--short-answers", short, STUB_SYS=sysf)
+        assert r.returncode == 0, r.stdout + r.stderr
+        rules[short, covered] = sysf.read_text()
+    normal = rules["0", "1"]
+    assert shape in normal and "needs no quote" not in normal
+    short = rules["1", "1"]
+    assert shape in short[short.index("SHORT ANSWERS"):], "the short shape asks for the quote too"
+    assert "covered by K-xxxxx" not in rules["1", "0"]
+
+
+def test_a_covered_verdict_without_a_verifiable_quote_is_counted_unproven(tmp_path):
+    """The run logs (never gates) a covered verdict whose quote the card does not hold, like `already carded`."""
+    root, q, stub = run_base(tmp_path, n=2)
+    r = run_pm(tmp_path, root, q, stub, STUB_COVERED=CA)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "covered=2" in r.stdout and "quotes-unproven=2" in r.stdout, r.stdout
+    rows = [json.loads(ln) for ln in (tmp_path / "rows.jsonl").read_text().splitlines()]
+    assert all(x.get("quote_unproven") for x in rows)
+    for f in ("out.md", "rows.jsonl"):
+        (tmp_path / f).unlink()
+    r = run_pm(tmp_path, root, q, stub, STUB_COVERED=CA, STUB_QUOTE="the widget bus voltage sags under load")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "covered=2" in r.stdout and "quotes-unproven=0" in r.stdout, r.stdout
+    rows = [json.loads(ln) for ln in (tmp_path / "rows.jsonl").read_text().splitlines()]
+    assert [(x["decision"], x["target"], x.get("quote_unproven")) for x in rows] == [("notcarded", CA, None)] * 2
+    dec = PM.parse_answer(f'DECISION: not-carded\n- M-0000aaaa :: covered by {CA}: "the widget bus voltage sags '
+                          f'under load" — the extra date changes no action', "M-0000aaaa")
+    assert dec["kind"] == "notcarded" and dec["arg"] == CA

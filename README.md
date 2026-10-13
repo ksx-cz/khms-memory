@@ -193,8 +193,9 @@ The night's sources reach the base through one evaluator:
    `KHMS_PERMARK_SHORT_ANSWERS=1` (the default) a not-carded or carded answer is two or three lines
    (`prompts/nightly-marks-short.md`). With `KHMS_PERMARK_COVERED_RULE=1` (default off) a card with the
    mark's topic but not its specific content gets a candidate only when that extra content would change what
-   a future agent does; otherwise the verdict is `covered by K-x: <why>`, a NOT CARDED reason that
-   `mark_ledger.py` records as a dismissal, never as coverage. `KHMS_PERMARK_EFFORT` (default `high`) is
+   a future agent does; otherwise the verdict is `covered by K-x: "<verbatim sentence of K-x>" — <why>`, a
+   NOT CARDED reason that `mark_ledger.py` records as a dismissal, never as coverage, and only when the
+   quote is in K-x (the `already carded` check); without one the mark stays OPEN. `KHMS_PERMARK_EFFORT` (default `high`) is
    the call's `--effort`. Marks are sequential on purpose:
    each one sees every decision made before it, so a second mark on the same matter joins the first one's
    candidate instead of becoming a duplicate.

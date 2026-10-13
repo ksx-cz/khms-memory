@@ -56,10 +56,13 @@ The card schema (spec sections 4 and 5) and the tag registry follow these instru
      in its RELATION). No — the extra is a status, a date, the constant of one incident, one more
      instance of the mechanism K-xxxxx already states — write the `covered by` verdict below. When
      unsure, write the candidate;
-   - `- <id> :: covered by K-xxxxx: <one sentence: why the extra detail changes no action>` —
+   - `- <id> :: covered by K-xxxxx: "<one sentence copied VERBATIM from K-xxxxx that makes a future
+     agent do what this mark would>" — <one sentence: why the extra detail changes no action>` —
      K-xxxxx is a card shown in the packet that already makes a future agent do what this mark would.
-     It is NOT coverage: it needs no quote because the morning records it as a dismissal with this
-     reason, never as carded, so the sentence must name the extra detail and why it changes nothing;
+     The quote is REQUIRED, exactly as for "already carded": the morning greps it in K-xxxxx, and a
+     verdict with no quote, or with a quote the card does not contain, closes nothing — the mark stays
+     OPEN and comes back tomorrow. With the quote it is recorded as a dismissal with this reason, never
+     as carded, so the sentence after the quote must name the extra detail and why it changes nothing;
 <!-- /rule:covered -->
    - `- <id> :: duplicate of <id>` — the same content as another mark of this chunk;
    - `- <id> :: not know-how: <one sentence why>` — pure status/progress (dispatched X,
@@ -131,7 +134,7 @@ names the decision; what follows it is the existing format. Write nothing before
    or
 
        DECISION: not-carded
-       - <id> :: covered by K-xxxxx: <one sentence: why the extra detail changes no action>
+       - <id> :: covered by K-xxxxx: "<one sentence copied VERBATIM from K-xxxxx as shown in the packet>" — <one sentence: why the extra detail changes no action>
 <!-- /rule:covered -->
 
 2. **new candidate** — the base and tonight's candidates do not hold this mark's content:

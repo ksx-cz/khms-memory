@@ -1177,6 +1177,39 @@ def _known_ids(paths, floor):
 # stays OPEN and the next night writes a candidate (or a verdict with a real quote).
 ALREADY_RE = re.compile(r"(?i)^already carded\s+(K-\d{5})\b\s*[:—–-]?\s*(?P<q>.*)$")
 MIN_CARD_QUOTE = 25
+# `covered by K-x` (#237) closes a mark as DISMISSED (the extra detail changes no action), never CARDED —
+# and with the same proof as `already carded` (owner 2026-10-13 16:37): `covered by K-x: "<verbatim
+# sentence of K-x>" — <why>`.  Without a quote of K-x the verdict was the unproven closure K-05400 shut
+# for `already carded`: in one replay a mark got three different covering cards in three runs.
+COVERED_RE = re.compile(r"(?i)^covered by\s+(K-\d{5})\b\s*[:—–-]?\s*(?P<rest>.*)$")
+COVERED_QUOTE_RE = re.compile(r'^"(?P<q>.*?)"(?:\s*[—–-]+\s*.*)?$')
+
+
+def verdict_quote(verdict):
+    """-> (kind, K-x, quote) for a verdict that must be proven by a quote of K-x — `already carded K-x:
+    "<quote>"` or `covered by K-x: "<quote>" — <why>` — else None.  The quote is '' when there is none."""
+    am = ALREADY_RE.match(verdict)
+    if am:
+        return "already carded", am.group(1), am.group("q")
+    cm = COVERED_RE.match(verdict)
+    if cm:
+        qm = COVERED_QUOTE_RE.match(norm(cm.group("rest")))
+        return "covered by", cm.group(1), qm.group("q") if qm else ""
+    return None
+
+
+def quote_problem(quote, card_text):
+    """None when `quote` proves the verdict (quote_in_card), else why not."""
+    if card_text is None:
+        return "no such card"
+    if quote_in_card(quote, card_text):
+        return None
+    if not norm(quote).strip(" \"'"):
+        return "no quote"
+    segs = [g.strip(" \"'") for g in ELISION_RE.split(_match_norm(quote).strip(" \"'"))]
+    if sum(len(g) for g in segs) < MIN_CARD_QUOTE:
+        return f"quote shorter than {MIN_CARD_QUOTE} characters"
+    return "quote not in the card"
 
 
 def _match_norm(s):
@@ -1211,8 +1244,9 @@ NOT_CARDED_SEC_RE = re.compile(rf"^{re.escape(NOT_CARDED_HEAD)}.*?$(.*?)(?=^## |
 def not_carded_events(paths, text, known, by):
     """-> (events, unknown ids, unproven) for the `## MARKS NOT CARDED` section of `text`,
     or None when the text has no such section.  `already carded K-x` is coverage only with
-    a quote verifiably in K-x; `duplicate of M-x` follows M-x; anything else is a dismissal
-    with the verdict as its reason."""
+    a quote verifiably in K-x; `covered by K-x` is a dismissal only with such a quote (#237);
+    without one either stays OPEN (unproven); `duplicate of M-x` follows M-x; anything else is
+    a dismissal with the verdict as its reason."""
     sec = NOT_CARDED_SEC_RE.search(text)
     if not sec:
         return None
@@ -1225,23 +1259,26 @@ def not_carded_events(paths, text, known, by):
         if mid not in known:
             bad.append(mid)
             continue
-        am = ALREADY_RE.match(verdict)
+        vq = verdict_quote(verdict)
         dm = DUP_RE.match(verdict)
-        if am:
-            cid = am.group(1)
+        if vq:
+            kind, cid, quote = vq
             try:
                 ctext = open(os.path.join(paths.know, cid + ".md"),
                              encoding="utf-8", errors="replace").read()
             except OSError:
                 ctext = None
-            if ctext is not None and quote_in_card(am.group("q"), ctext):
+            why = quote_problem(quote, ctext)
+            if why:
+                unproven.append((mid, cid, why if kind == "already carded" else f"{kind}: {why}"))
+            elif kind == "already carded":
                 evs.append({"ts": _now(), "ev": "card", "id": mid, "card": cid,
                             "by": by, "quote_verified": True,
                             "reason": f"nightly verdict accepted: {verdict}"})
-            else:
-                unproven.append((mid, cid, "no such card" if ctext is None else
-                                 "no quote" if not am.group("q").strip() else
-                                 "quote not in the card"))
+            else:                               # covered by: a proven dismissal, never coverage
+                evs.append({"ts": _now(), "ev": "dismiss", "id": mid, "by": by,
+                            "covered_by": cid, "quote_verified": True,
+                            "reason": f"nightly verdict accepted at review: {verdict}"})
         elif dm:
             evs.append({"ts": _now(), "ev": "dup", "id": mid, "dup_of": dm.group(1),
                         "by": by, "reason": f"nightly verdict accepted at review: {verdict}"})
@@ -1283,7 +1320,7 @@ def report_not_carded(prog, bad, unproven, carded=()):
     if bad:
         print(f"{prog}: unknown id(s), not recorded: {' '.join(bad)}")
     if unproven:
-        print(f"{prog}: {len(unproven)} 'already carded' verdict(s) with no verifiable quote "
+        print(f"{prog}: {len(unproven)} 'already carded' / 'covered by' verdict(s) with no verifiable quote "
               f"of the card — NOT coverage, they stay OPEN for the next night:")
         for mid, cid, why in unproven:
             print(f"  {mid} -> {cid}: {why}")

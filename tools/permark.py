@@ -74,14 +74,15 @@ morning's quote check greps.
 COVERED RULE (KHMS_PERMARK_COVERED_RULE / --covered-rule 0|1, default 0): picks the variant of the
 `<!-- rule:covered=N -->` blocks of prompts/nightly-marks.md and nightly-marks-short.md.  0 = a card with the
 topic but not the mark's specific content means a candidate; 1 = a candidate only when the extra content
-would change what a future agent does, otherwise the not-carded verdict `covered by K-x: <why>`.  That
-verdict is a NOT CARDED reason: mark_ledger records it as a dismissal (no quote, never coverage); the row
-logs its K-x as `target` and the decisions line counts it as `covered=`.
+would change what a future agent does, otherwise the not-carded verdict `covered by K-x: "<verbatim
+sentence of K-x>" — <why>`.  That verdict is a NOT CARDED reason: mark_ledger records it as a dismissal
+(never coverage) only when its quote is in K-x, like `already carded` (K-05400); without one the mark
+stays OPEN.  The row logs its K-x as `target` and the decisions line counts it as `covered=`.
 
 EFFORT (KHMS_PERMARK_EFFORT / --effort low|medium|high|xhigh|max, default high): the `--effort` of the
 per-mark call.
 
-LOGGED, NEVER GATED: `quotes-unproven` (an "already carded" quote mark_ledger.quote_in_card does not find
+LOGGED, NEVER GATED: `quotes-unproven` (an "already carded" or "covered by" quote mark_ledger.quote_in_card does not find
 in the card) and `unseen-nearest` (a new candidate whose own nearest top 3 hold an id the packet lacked).
 """
 import argparse
@@ -1021,10 +1022,10 @@ def run(a):
             if miss:
                 C.unseen += 1
                 row["unseen_nearest"] = miss
-        if kind == "carded":
-            am = re.search(r"already carded\s+(K-\d{5})\b\s*[:—–-]?\s*(.*)$", dec["verdict"])
-            ct = card_text(root, dec["arg"])
-            if not (am and ct and ML.quote_in_card(am.group(2), ct)):
+        if kind == "carded" or (kind == "notcarded" and target):
+            vq = ML.verdict_quote(re.sub(r"^\s*-\s*[MG]-[0-9a-f]{8}\s*::\s*", "", dec["verdict"]))
+            ct = card_text(root, vq[1]) if vq else None
+            if not (vq and ct and ML.quote_in_card(vq[2], ct)):
                 C.unproven += 1
                 row["quote_unproven"] = True
         row.update(decision=kind, target=target, label=lab)

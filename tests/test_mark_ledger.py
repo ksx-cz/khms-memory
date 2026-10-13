@@ -122,8 +122,9 @@ def test_narrative_references_and_quoted_examples_stay_excluded(line):
 
 
 def test_a_covered_by_verdict_is_a_dismissal_with_its_reason_never_coverage(tmp_path):
-    """#237: `covered by K-x: <why>` is a NOT CARDED reason (the extra detail changes no action): it closes the
-    mark as DISMISSED without a quote, while `already carded K-x` still needs its verbatim quote (#209 A1)."""
+    """#237: `covered by K-x: "<quote>" — <why>` is a NOT CARDED reason (the extra detail changes no action): with
+    a verbatim quote of K-x it closes the mark as DISMISSED (never CARDED); `already carded K-x` still needs its
+    verbatim quote too (#209 A1)."""
     journal = tmp_path / 'journal'
     journal.mkdir()
     (journal / '2099-03-04.md').write_text(
@@ -138,7 +139,8 @@ def test_a_covered_by_verdict_is_a_dismissal_with_its_reason_never_coverage(tmp_
     ids = list(ml.derive(paths, '2099-03-04'))
     assert len(ids) == 3
     unit = (f'## MARKS NOT CARDED\n'
-            f'- {ids[0]} :: covered by K-00042: the second unit and its 11.2 V change no action the card sets\n'
+            f'- {ids[0]} :: covered by K-00042: "the widget bus voltage sags under load" — the second unit and '
+            f'its 11.2 V change no action the card sets\n'
             f'- {ids[1]} :: already carded K-00042: "the widget bus voltage sags under load"\n'
             f'- {ids[2]} :: already carded K-00042\n')
     evs, bad, unproven, carded = ml.record_not_carded(paths, unit, 'reviewer', floor='2099-03-04')
@@ -146,8 +148,9 @@ def test_a_covered_by_verdict_is_a_dismissal_with_its_reason_never_coverage(tmp_
     assert [u[0] for u in unproven] == [ids[2]], 'a bare "already carded" is still not coverage'
     cov = next(e for e in evs if e['id'] == ids[0])
     assert cov['ev'] == 'dismiss' and 'card' not in cov
-    assert cov['reason'] == ('nightly verdict accepted at review: covered by K-00042: the second unit and '
-                             'its 11.2 V change no action the card sets')
+    assert cov['reason'] == ('nightly verdict accepted at review: covered by K-00042: "the widget bus voltage '
+                             'sags under load" — the second unit and its 11.2 V change no action the card sets')
+    assert cov['covered_by'] == 'K-00042' and cov['quote_verified'] is True
     marks = ml.derive(paths, '2099-03-04')
     assert marks[ids[0]]['state'] == 'DISMISSED' and 'card' not in marks[ids[0]]
     assert marks[ids[1]]['state'] == 'CARDED' and marks[ids[1]]['card'] == 'K-00042'
@@ -156,3 +159,58 @@ def test_a_covered_by_verdict_is_a_dismissal_with_its_reason_never_coverage(tmp_
     assert (s['dismissed'], s['carded'], s['open']) == (1, 1, 1)
     again = ml.record_not_carded(paths, unit, 'reviewer', floor='2099-03-04')
     assert [e for e in again[0] if e['id'] == ids[0]] == [], 'closing the unit twice adds nothing'
+
+
+def _covered_fixture(tmp_path):
+    journal = tmp_path / 'journal'
+    journal.mkdir()
+    (journal / '2099-03-04.md').write_text('MARK[nalez] the widget bus sags again on the second unit, 11.2 V\n')
+    know = tmp_path / 'memory' / 'know'
+    know.mkdir(parents=True)
+    (know / 'K-00042.md').write_text('---\nid: K-00042\ntype: fact\nlevel: observation\nstatus: active\n'
+                                     'tags: [power]\n---\nthe widget bus voltage sags under load, measured '
+                                     'on the bench at 30 A\n')
+    paths = ml.Paths(str(tmp_path))
+    (mid,) = list(ml.derive(paths, '2099-03-04'))
+    return paths, mid
+
+
+@pytest.mark.parametrize('verdict', [
+    'covered by K-00042: "the widget bus voltage sags under load" — the second unit changes no action',
+    'covered by K-00042: \u201cthe widget bus voltage sags under load, measured on the bench\u201d - same mechanism',
+    'covered by K-00042: "the widget bus voltage sags ... at 30 A"',
+])
+def test_a_covered_verdict_with_a_quote_in_its_card_closes_as_dismissed(tmp_path, verdict):
+    """#237 (owner 2026-10-13 16:37): `covered by K-x` needs the same verbatim quote of K-x as `already carded`
+    (K-05400); a passing one is a DISMISSAL with its reason, never coverage."""
+    paths, mid = _covered_fixture(tmp_path)
+    evs, bad, unproven, carded = ml.record_not_carded(paths, f'## MARKS NOT CARDED\n- {mid} :: {verdict}\n',
+                                                      'reviewer', floor='2099-03-04')
+    assert not bad and not carded and not unproven
+    assert [(e['ev'], e.get('covered_by')) for e in evs] == [('dismiss', 'K-00042')]
+    assert evs[0]['reason'] == f'nightly verdict accepted at review: {verdict}'
+    m = ml.derive(paths, '2099-03-04')[mid]
+    assert m['state'] == 'DISMISSED' and 'card' not in m
+
+
+@pytest.mark.parametrize('verdict,why', [
+    ('covered by K-00042: the second unit and its 11.2 V change no action the card sets', 'no quote'),
+    ('covered by K-00042', 'no quote'),
+    ('covered by K-00042: "bus voltage sags" — the second unit changes no action', 'shorter than 25'),
+    ('covered by K-00042: "the widget bus voltage sags under every load" — no action', 'quote not in the card'),
+    ('covered by K-00099: "the widget bus voltage sags under load" — no action', 'no such card'),
+])
+def test_a_covered_verdict_without_a_verifiable_quote_stays_open(tmp_path, capsys, verdict, why):
+    """No quote, a quote under 25 characters or a quote K-x does not hold: nothing is recorded, the mark stays
+    OPEN for the next night, and the report names it on the line the unproven `already carded` uses."""
+    paths, mid = _covered_fixture(tmp_path)
+    unit = tmp_path / 'unit.md'
+    unit.write_text(f'## MARKS NOT CARDED\n- {mid} :: {verdict}\n')
+    evs, bad, unproven, carded = ml.record_not_carded(paths, unit.read_text(), 'reviewer', floor='2099-03-04')
+    assert evs == [] and not bad and not carded
+    assert [(u[0], u[1]) for u in unproven] == [(mid, verdict.split()[2].rstrip(':'))]
+    assert why in unproven[0][2] and 'covered by' in unproven[0][2]
+    assert ml.derive(paths, '2099-03-04')[mid]['state'] == 'OPEN'
+    ml.report_not_carded('dismiss', bad, unproven, carded)
+    out = capsys.readouterr().out
+    assert 'no verifiable quote' in out and mid in out and why in out
