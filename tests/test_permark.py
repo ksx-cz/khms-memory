@@ -816,3 +816,61 @@ def test_a_check_that_cannot_run_costs_no_call(tmp_path, monkeypatch):
     got, limit = PM.format_gate(Boom(), PM.Doc(), mark("x"), dec, [CA], {"text": GOOD}, "packet",
                                 lambda *a: pytest.fail("no call may be made"), row, C, None)
     assert got is dec and limit is None and row["format"]["checked"] is False and C.fretry == 0
+
+
+# --- the MARKS line's place: before **QUOTES:**, once (#237, trial night 2026-10-13-3: 6 of 39 after the quotes) --
+MARKS_AFTER = GOOD + "MARKS: {mid}\n"                     # the model wrote its own MARKS line after the quote bullets
+LINKS_AFTER = GOOD + f"**LINKS:** derived_from: [{CA}]\n"  # a pipeline line the driver does not move
+
+
+def marks_lines(block):
+    q = block.index("**QUOTES:**")
+    return [(m.start() < q, m.group(0)) for m in re.finditer(r"(?m)^MARKS:.*$", block)]
+
+
+def test_ensure_marks_moves_a_marks_line_after_the_quotes_before_them_and_keeps_one():
+    after = "### M1: t\nWHAT: x\n**QUOTES:**\n- src=journal :: x\nMARKS: M-0000bbbb\n"
+    assert marks_lines(PM.ensure_marks(after, ["M-0000aaaa"])) == [(True, "MARKS: M-0000bbbb M-0000aaaa")]
+    both = "### M1: t\nWHAT: x\nMARKS: M-0000bbbb\n**QUOTES:**\n- src=journal :: x\nMARKS: M-0000cccc M-0000bbbb\n"
+    got = PM.ensure_marks(both, ["M-0000aaaa"])
+    assert marks_lines(got) == [(True, "MARKS: M-0000bbbb M-0000cccc M-0000aaaa")], got
+    assert got.endswith("- src=journal :: x\n"), "the quotes keep their lines, the moved line leaves no gap"
+    before = "### M1: t\nWHAT: x\nMARKS: M-0000bbbb\n**QUOTES:**\n- src=journal :: x\n"
+    assert PM.ensure_marks(before, ["M-0000aaaa"]) == before.replace("M-0000bbbb", "M-0000bbbb M-0000aaaa")
+
+
+def test_a_model_marks_line_after_the_quotes_is_written_before_them_and_the_converter_reads_it(tmp_path):
+    root, q, stub, seq = fmt_base(tmp_path, [MARKS_AFTER])
+    r = run_pm(tmp_path, root, q, stub, STUB_ANSWERS=seq)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert len(stub_calls(tmp_path)) == 1, "nothing for a retry to fix"
+    out = (tmp_path / "out.md").read_text()
+    block = out.split("## MARKS NOT CARDED")[0]
+    assert marks_lines(block) == [(True, "MARKS: M-00000001")], block
+    import convert_inbox2 as CI
+    cards, _rows = CI.convert(block, "2099-03-04", CI.load_tags(str(root / "memory/views/tags.md")))
+    assert [c[0].get("marks") for c in cards] == [["M-00000001"]], cards
+    assert CI.relation_audit(block, cards)[0] == []
+
+
+def test_the_format_check_reports_a_pipeline_line_the_converter_would_refuse(tmp_path, monkeypatch):
+    """convert_inbox2 refuses a file (rc 1) on its SELF-CHECK, EDGE AUDIT and RELATION AUDIT; the check runs all
+    three on the candidate, so a PLUMBING line in the written body is a problem before the night ends."""
+    root, _q, _stub, _seq = fmt_base(tmp_path, [GOOD])
+    monkeypatch.setenv("KHMS_ROOT", str(root))
+    fc = PM.FormatCheck(str(root))
+    mk = mark("the widget bus voltage sags", mid="M-0000aaaa")
+    probs = fc.problems(PM.Doc(), mk, PM.parse_answer(LINKS_AFTER, mk["id"]), [CA])
+    assert any("PLUMBING" in p for p in probs), probs
+    assert fc.problems(PM.Doc(), mk, PM.parse_answer(GOOD, mk["id"]), [CA]) == []
+
+
+def test_a_pipeline_line_in_the_body_costs_one_retry_and_the_valid_retry_is_kept(tmp_path):
+    root, q, stub, seq = fmt_base(tmp_path, [LINKS_AFTER, GOOD])
+    r = run_pm(tmp_path, root, q, stub, STUB_ANSWERS=seq)
+    assert r.returncode == 0, r.stdout + r.stderr
+    calls = stub_calls(tmp_path)
+    assert len(calls) == 2, "exactly one retry"
+    assert "PLUMBING" in calls[1]["packet"][len(calls[0]["packet"]):]
+    assert "format-retry=1 format-failed=0" in r.stdout, r.stdout
+    assert "**LINKS:**" not in (tmp_path / "out.md").read_text()

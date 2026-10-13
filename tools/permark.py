@@ -125,6 +125,7 @@ SESS_GEN_RE = re.compile(r"src=digest\s+sess\s+(?P<sid>[0-9a-f]{8})[0-9a-f-]*(?:
 GIT_GEN_RE = re.compile(r"src=gitlog\s+(?P<sha>[0-9a-f]{7,40})\b")
 HEAD_RE = re.compile(r"^#{2,3} +([A-Z])(\d+)([a-z]?)\b(.*)$", re.M)
 MARKS_LINE_RE = re.compile(r"^[ \t]*\*{0,2}MARKS:\*{0,2}[ \t]*(.*)$", re.M)
+MARKS_LINE_NL_RE = re.compile(MARKS_LINE_RE.pattern + r"\n?", re.M)   # the line with its newline
 NEAREST_LINE_RE = re.compile(r"^NEAREST:.*$\n?", re.M)
 DECISION_RE = re.compile(r"^\s*\**DECISION:\**\s*(?P<kind>not-carded|new|belongs|carded|supersede|"
                          r"contradict|erratum)\b[ \t]*(?P<arg>[^\s`*]+)?", re.M | re.I)
@@ -790,17 +791,31 @@ def set_label(block, label):
 
 
 def ensure_marks(block, ids):
-    """`MARKS:` line = its own ids plus `ids` (order kept); added before **QUOTES:** when absent."""
-    m = MARKS_LINE_RE.search(block)
-    if m:
-        cur = ML.ID_RE.findall(m.group(1))
-        new = cur + [i for i in ids if i not in cur]
-        return block[:m.start()] + "MARKS: " + " ".join(new) + block[m.end():]
+    """-> the block with exactly ONE `MARKS:` line, before **QUOTES:**: the ids of every MARKS line the block
+    carries, then `ids` (order kept, each once).
+
+    convert_inbox2 reads MARKS only from the prose before **QUOTES:** (`split_prose`), so a line the model wrote
+    after the quote bullets gave the card no `marks:` (its marks stayed OPEN in the ledger) and a PLUMBING line in
+    its body — 6 of 39 candidates on the trial night 2026-10-13-3 (#237).  A line already before the quotes stays
+    where it is; one after them, or a second one, is moved there."""
+    found = list(MARKS_LINE_NL_RE.finditer(block))
+    cur = []
+    for m in found:
+        cur += [i for i in ML.ID_RE.findall(m.group(1)) if i not in cur]
+    line = "MARKS: " + " ".join(cur + [i for i in ids if i not in cur]) + "\n"
     q = block.find("**QUOTES:**")
-    line = "MARKS: " + " ".join(ids) + "\n"
+    keep = found[0] if found and (q < 0 or found[0].start() < q) else None
+    parts, pos = [], 0
+    for m in found:
+        parts += [block[pos:m.start()], line if m is keep else ""]
+        pos = m.end()
+    rest = "".join(parts) + block[pos:]
+    if keep is not None:
+        return rest
+    q = rest.find("**QUOTES:**")
     if q >= 0:
-        return block[:q] + line + block[q:]
-    return block.rstrip("\n") + "\n" + line
+        return rest[:q] + line + rest[q:]
+    return rest.rstrip("\n") + "\n" + line
 
 
 def marks_of(block):
@@ -841,10 +856,12 @@ class FormatCheck:
       relation  verify_relations.judge                   (postprocess: a DROP moves the candidate under ## DROPPED);
       schema    convert_inbox2.convert + render + selfcheck, i.e. approve_inbox.parse_cards and
                 build_views.card_problems, the one per-card gate  (morning: convert_inbox2's SELF-CHECK);
+      audit     convert_inbox2.edge_audit + relation_audit + census_lines' absorbed headings — with the SELF-CHECK
+                the whole set that makes the converter refuse its file (a PLUMBING line in the written body, #237);
       lint      khms_lint.lint_batch with known_card_ids + load_retracted  (morning: approve_inbox refuses).
     The block checked is the one apply() writes (label, MARKS and NEAREST lines included), after the header
     normalisation the night applies before publishing.  Non-blocking flags (a verify_relations FLAG,
-    khms_lint.flag_batch, the converter's t/e/g/s columns) are not problems.
+    khms_lint.flag_batch, the converter's t/e/g/s columns, a heading withheld under a trailer) are not problems.
     """
 
     def __init__(self, root):
@@ -885,6 +902,12 @@ class FormatCheck:
         finally:
             os.unlink(path)
         out += [f"card schema: {p}" for p in schema]
+        # the rest of what makes convert_inbox2 refuse its file (main(): rc 1, "NOT approve-ready"): the EDGE
+        # AUDIT, the RELATION AUDIT (PLUMBING, LOST, LEAKED …) and a heading absorbed into the card before it
+        lost, _n = self.CI.edge_audit(block, cards)
+        split, _n = self.CI.relation_audit(block, cards)
+        census, _a, _w = self.CI.census_lines(block, len(cards))
+        out += [f"converter audit: {p}" for p in lost + split + [ln for ln in census[1:] if "absorbed" in ln]]
         batch = [(str(m.get("id")), m, b) for m, b in parsed]
         out += [f"approve lint: {p}" for p in
                 self.KL.lint_batch(batch, self.known | {i for i, _m, _b in batch}, self.retracted, self.ledger_ids)]

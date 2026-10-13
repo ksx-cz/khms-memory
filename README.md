@@ -200,7 +200,9 @@ The night's sources reach the base through one evaluator:
    proposes (new, supersede, contradict, a belongs revision) goes, right after parsing and with 0 tokens,
    through the checks the later stages would run on it — the card header gate, the RELATION gate
    (`verify_relations.py`), the converter's self-check with the per-card schema gate
-   (`build_views.card_problems`) and the approve lint (`khms_lint.py`); a failure costs ONE retry of the
+   (`build_views.card_problems`), the converter's edge and RELATION audits (a `MARKS:` or `LINKS:`
+   line left in the written body is PLUMBING) and the approve lint (`khms_lint.py`); the driver writes the
+   candidate's one `MARKS:` line before `**QUOTES:**`, moving a line the model put after them. A failure costs ONE retry of the
    same call with the checks' messages appended, a passing retry replaces the answer, and a second failure
    keeps the first answer, which the later stage then drops or flags as before (`format-retry=` and
    `format-failed=` in the decisions line, `format` in the JSONL row). Marks are sequential on purpose:
