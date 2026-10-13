@@ -104,9 +104,13 @@ def load_cards():
             "id": fm("id", path),
             "status": fm("status", "?"),
             "level": fm("level", "observation"),
+            "type": fm("type", ""),
             "tags": [t.strip() for t in (tg.group(1) if tg else "").split(",") if t.strip()],
             "ntags": norm(tg.group(1)) if tg else "",
             "links": _parse_links(front),
+            # the reverse edge some cards carry in their own frontmatter (`  superseded_by: K-x`)
+            "superseded_by": re.findall(r"K-\d{5}", (re.search(r"^\s+superseded_by:\s*(.+)$", front, re.M)
+                                                     or [None, ""])[1]),
             # errata: [{ts: TS-nnnnn, …}] entries (khms_erratum.py) — a count, so the
             # renderers can flag a card whose text was corrected in place
             "errata": len(re.findall(r"^\s+-\s*\{?\s*ts:\s*TS-\d{5}", front, re.M)),

@@ -105,6 +105,9 @@ DEFAULTS = [
     ("KHMS_CONS_MODEL", "sonnet"),
     ("KHMS_PERMARK_TONIGHT_K", "5"),        # tonight's candidates shown per mark in the per-mark packet (#237)
     ("KHMS_PERMARK_PACKET_CHARS", "32000"),  # the per-mark packet budget in characters (#237)
+    ("KHMS_PERMARK_WHOLE_TOP", "3"),         # the top N of each retrieval channel shown whole (#237)
+    ("KHMS_PERMARK_LINKS_LINE", "0"),        # 1 = a type + link-ids line under every shown card (#237)
+    ("KHMS_PERMARK_SHORT_ANSWERS", "1"),     # 1 = three-line carded / not-carded answers (#237)
     ("KHMS_WEEK_PART_MODEL", "sonnet"),
     ("KHMS_WEEK_MODEL", "opus"),
     ("KHMS_PROJECT_SLUG", ""),             # only transcript paths containing this text ("" = every transcript)

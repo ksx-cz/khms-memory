@@ -4,7 +4,8 @@
 Usage:
   permark.py --queue Q --out OUT [--deadline EPOCH] [--limit N] [--agent BIN] [--model sonnet]
              [--log LOG] [--jsonl J] [--served-file F] [--limit-flag F] [--timeout 180]
-             [--packets DIR] [--dry] [--tonight-k 5] [--packet-chars 32000]
+             [--packets DIR] [--dry] [--tonight-k 5] [--packet-chars 32000] [--whole-top 3]
+             [--links-line 0|1] [--short-answers 0|1]
 
   Q     the ledger's queue file (`mark_ledger.py queue --out Q`): `- <id> | <date time> | <kind> | <where> | <text>`,
         journal MARKs (`M-`) and generated lines (`G-`, #237 step 2) on one time axis.
@@ -31,8 +32,12 @@ THE PACKET (build_packet):
      line whole (journal marks only);
   3. NEAREST CARDS — active, non-fog cards from three sources, de-duplicated: every K- id the mark names
      (at most 3 shown whole), the lexical top 8 (khms_search, glossary-expanded) and the hybrid top 8
-     (khms_recall_hybrid, when the dense daemon answers).  The named cards and the top-1 of each channel
-     are shown WHOLE (4,000 characters at most), the rest by id, status, title and 3 body lines;
+     (khms_recall_hybrid, when the dense daemon answers).  The named cards and the top N of each channel
+     (KHMS_PERMARK_WHOLE_TOP / --whole-top, default 3) are shown WHOLE (4,000 characters at most), the rest
+     by id, status, title and 3 body lines.  With KHMS_PERMARK_LINKS_LINE=1 / --links-line 1 (default 0)
+     every shown card carries one more line right under its heading line: its type and the ids of its
+     supersedes, superseded_by, contradicts, refuted_by and derived_from links (ids only, nothing followed) —
+     card bodies carry no frontmatter, so without it the model sees neither type nor edges;
   4. TONIGHT'S CANDIDATES — the k (default 5, KHMS_PERMARK_TONIGHT_K / --tonight-k) of OUT's candidates
      nearest to the mark by the same retrieval as the cards: the lexical channel (glossary-expanded) fused by
      RRF with the dense channel (the warm daemon embeds each candidate once, op=embed) when it answers.  The
@@ -59,6 +64,12 @@ stays OPEN for the next night and is counted `unparsed`.  `belongs` with a revis
 only when the revision keeps every id it had; otherwise the id is appended to the old one.  Every
 candidate gets a `NEAREST:` line with the ids the packet showed, so verify_relations judges a
 `RELATION: new` against exactly what the model saw.
+
+SHORT ANSWERS (KHMS_PERMARK_SHORT_ANSWERS / --short-answers 0|1, default 1): the rules gain the section of
+prompts/nightly-marks-short.md — a carded answer is its DECISION line, the verbatim quote line and one
+`REASON:` line, a not-carded answer its DECISION line and its verdict line, nothing else.  The parser is the
+same; a `REASON:` line goes to the JSONL row (`reason`), never into OUT, so the verdict line stays what the
+morning's quote check greps.
 
 LOGGED, NEVER GATED: `quotes-unproven` (an "already carded" quote mark_ledger.quote_in_card does not find
 in the card) and `unseen-nearest` (a new candidate whose own nearest top 3 hold an id the packet lacked).
@@ -101,6 +112,11 @@ DIGEST_REC_RE = re.compile(r"^\[(\d{4}-\d{2}-\d{2}T\d{2}:\d{2})\] ([A-Z-]+):")
 CTX_BEFORE, CTX_AFTER, CTX_CLIP = 6, 3, 600
 TOPK = 8
 NAMED_MAX = 3
+WHOLE_TOP = 3                 # the top N of each channel shown whole (KHMS_PERMARK_WHOLE_TOP, --whole-top)
+LINKS_LINE = 0                # 1 = a type + link-ids line under every shown card (KHMS_PERMARK_LINKS_LINE)
+SHORT_ANSWERS = 1             # 1 = three-line carded / not-carded answers (KHMS_PERMARK_SHORT_ANSWERS)
+LINK_LINE_KEYS = ("supersedes", "superseded_by", "contradicts", "refuted_by", "derived_from")
+REASON_RE = re.compile(r"^\s*\**REASON:\**\s*(?P<why>.+?)\s*$", re.M)
 SUMMARY_CHARS = 500
 WHOLE_CHARS = 4000
 TONIGHT_K = 5                 # tonight's candidates shown per mark (KHMS_PERMARK_TONIGHT_K, --tonight-k)
@@ -234,6 +250,34 @@ def card_whole(c):
     return f"{c['id']} [{c.get('status', '?')}] (shown whole)\n{clip(c.get('body', ''), WHOLE_CHARS)}"
 
 
+def _ids(v):
+    if not v:
+        return []
+    return [x for x in (v if isinstance(v, list) else [v]) if CARD_ID_RE.fullmatch(str(x))]
+
+
+def card_links_line(c, superseded_by=()):
+    """`type: <type> · <key>: <ids> · …` — the card's type and the ids of its LINK_LINE_KEYS links, empty keys
+    left out; `superseded_by` merges the card's own field with the reverse of other cards' `supersedes`."""
+    links = c.get("links") or {}
+    parts = [f"type: {c.get('type') or '?'}"]
+    for key in LINK_LINE_KEYS:
+        if key == "superseded_by":
+            ids = list(dict.fromkeys(_ids(c.get("superseded_by")) + _ids(links.get("superseded_by"))
+                                     + list(superseded_by)))
+        else:
+            ids = _ids(links.get(key))
+        if ids:
+            parts.append(f"{key}: {', '.join(ids)}")
+    return " · ".join(parts) + ("" if len(parts) > 1 else " · no links")
+
+
+def with_links_line(rendered, line):
+    """The links line right under the card's heading line (whole and summary alike)."""
+    head, _sep, rest = rendered.partition("\n")
+    return f"{head}\n{line}" + (f"\n{rest}" if rest else "")
+
+
 class Retrieval:
     """The base, loaded once per run: active non-fog cards, the glossary, the dense channel if it answers."""
 
@@ -253,6 +297,16 @@ class Retrieval:
         self.embed = self._daemon_embed if self.hy is not None else None
         self.vectors = {}
         self.tonight_dense_err = None
+        self._rev_sup = None
+
+    def superseded_by(self, cid):
+        """Ids of the cards whose `supersedes` names `cid` (one index over every loaded card, built once)."""
+        if self._rev_sup is None:
+            self._rev_sup = {}
+            for c in self.any_by_id.values():
+                for tgt in _ids((c.get("links") or {}).get("supersedes")):
+                    self._rev_sup.setdefault(tgt, []).append(c["id"])
+        return self._rev_sup.get(cid, [])
 
     def lexical(self, q, topn=TOPK):
         if not q:
@@ -311,17 +365,16 @@ class Retrieval:
         return sorted(fused, key=lambda key: (-fused[key], order[key]))[:topn]
 
 
-def nearest(text, R):
-    """-> (named cards, lexical, hybrid, ordered shown ids, ids shown whole)."""
+def nearest(text, R, whole_top=None):
+    """-> (named cards, lexical, hybrid, ordered shown ids, ids shown whole): the named cards (at most
+    NAMED_MAX) and the top `whole_top` (default WHOLE_TOP) of each channel are shown whole."""
+    n = WHOLE_TOP if whole_top is None else whole_top
     named = [R.any_by_id[cid] for cid in dict.fromkeys(CARD_ID_RE.findall(text)) if cid in R.any_by_id]
     q = query_of(text)
     lex, hyb = R.lexical(q), R.hybrid(q)
     shown = list(dict.fromkeys([c["id"] for c in named] + [c["id"] for c in lex] + [c["id"] for c in hyb]))
     whole = set(c["id"] for c in named[:NAMED_MAX])
-    if lex:
-        whole.add(lex[0]["id"])
-    if hyb:
-        whole.add(hyb[0]["id"])
+    whole |= {c["id"] for c in lex[:max(0, n)]} | {c["id"] for c in hyb[:max(0, n)]}
     return named, lex, hyb, shown, whole
 
 
@@ -464,12 +517,14 @@ def source_excerpt(mk, T, repos=None):
     return "", ""
 
 
-def build_packet(mk, root, R, doc, T, repos=None, k=None, budget=None, stats=None):
+def build_packet(mk, root, R, doc, T, repos=None, k=None, budget=None, stats=None, whole_top=None, links=None):
     """-> (packet text, shown card ids, tonight's labels shown).  `stats` (a dict) receives `chars` and
-    `trimmed` (the items left out for the budget, lowest rank first)."""
+    `trimmed` (the items left out for the budget, lowest rank first).  `whole_top` and `links` default to
+    WHOLE_TOP and LINKS_LINE."""
     budget = PACKET_CHARS if budget is None else budget
+    links = LINKS_LINE if links is None else links
     ctx = journal_context_lines(root, mk["loc"])
-    named, lex, hyb, shown, whole = nearest(mk["text"], R)
+    named, lex, hyb, shown, whole = nearest(mk["text"], R, whole_top)
     hyb_ids = "unavailable tonight" if R.hy is None else (", ".join(c["id"] for c in hyb) or "none")
     cards_head = (f"named by the mark: {', '.join(c['id'] for c in named) or 'none'}; "
                   f"lexical top {TOPK}: {', '.join(c['id'] for c in lex) or 'none'}; "
@@ -477,7 +532,10 @@ def build_packet(mk, root, R, doc, T, repos=None, k=None, budget=None, stats=Non
     cards = []
     for cid in shown:
         c = R.any_by_id.get(cid) or R.by_id[cid]
-        cards.append((cid, card_whole(c) if cid in whole else card_summary(c)))
+        t = card_whole(c) if cid in whole else card_summary(c)
+        if links:
+            t = with_links_line(t, card_links_line(c, R.superseded_by(cid)))
+        cards.append((cid, t))
     tonight = tonight_items(doc, mk["text"], R, k)
     head, ex = source_excerpt(mk, T, repos)
     # the trim order, lowest rank first: rank i of the cards before rank i of tonight's candidates
@@ -548,9 +606,13 @@ def spec_sections(path):
     return m.group(0).strip() if m else ""
 
 
-def render_rules(root):
+def render_rules(root, short=None):
+    """The system prompt; `short` (default SHORT_ANSWERS) appends prompts/nightly-marks-short.md."""
     import khms_prompt
+    short = SHORT_ANSWERS if short is None else short
     rules = khms_prompt.render("nightly-marks")
+    if short:
+        rules = rules.rstrip("\n") + "\n\n" + khms_prompt.render("nightly-marks-short")
     spec = P.get("KHMS_SPEC") or os.path.join(P.REPO, "spec", "khms-spec.md")
     sec = spec_sections(spec)
     try:
@@ -666,7 +728,8 @@ def parse_answer(text, mid):
     elif kind == "notcarded":
         if not verdict:
             return {"kind": "unparsed", "why": "not-carded without its verdict line"}
-    return {"kind": kind, "arg": arg, "block": block, "verdict": verdict}
+    rm = REASON_RE.search(rest) if kind in ("carded", "notcarded") else None
+    return {"kind": kind, "arg": arg, "block": block, "verdict": verdict, "reason": rm.group("why") if rm else ""}
 
 
 def set_label(block, label):
@@ -790,6 +853,9 @@ def run(a):
     root = a.root or P.get("KHMS_ROOT")
     k = config_int(a.tonight_k, "KHMS_PERMARK_TONIGHT_K", TONIGHT_K)
     budget = config_int(a.packet_chars, "KHMS_PERMARK_PACKET_CHARS", PACKET_CHARS)
+    whole_top = config_int(a.whole_top, "KHMS_PERMARK_WHOLE_TOP", WHOLE_TOP)
+    links = config_int(a.links_line, "KHMS_PERMARK_LINKS_LINE", LINKS_LINE)
+    short = config_int(a.short_answers, "KHMS_PERMARK_SHORT_ANSWERS", SHORT_ANSWERS)
     try:
         queue = parse_queue(open(a.queue, encoding="utf-8").read())
     except OSError as exc:
@@ -800,7 +866,7 @@ def run(a):
         print(f"permark: no executable agent CLI ({agent!r}); pass --agent <absolute path>", file=sys.stderr)
         return 2
     try:
-        rules = render_rules(root)
+        rules = render_rules(root, short=short)
     except Exception as exc:
         print(f"permark: the rules (nightly-marks prompt) cannot be rendered: {exc}", file=sys.stderr)
         return 2
@@ -814,7 +880,8 @@ def run(a):
         os.makedirs(a.packets, exist_ok=True)
     log_to(a.log, f"permark: {len(queue)} queued mark(s), {len(queue) - len(todo)} already decided in {a.out}; "
                   f"{len(R.cards)} active cards, dense channel {'on' if R.hy is not None else 'OFF'}; model {a.model}; "
-                  f"tonight's candidates k={k}, packet budget {budget} characters")
+                  f"tonight's candidates k={k}, packet budget {budget} characters; whole top {whole_top}, "
+                  f"links line {'on' if links else 'off'}, short answers {'on' if short else 'off'}")
     rc = 0
     for i, mk in enumerate(todo):
         if a.limit and C.n >= a.limit:
@@ -825,7 +892,8 @@ def run(a):
             break
         tp = time.time()
         ps = {}
-        packet, shown, _labs = build_packet(mk, root, R, doc, T, k=k, budget=budget, stats=ps)
+        packet, shown, _labs = build_packet(mk, root, R, doc, T, k=k, budget=budget, stats=ps,
+                                            whole_top=whole_top, links=links)
         prefetch_s = time.time() - tp
         C.sizes.append(len(packet))
         C.trimmed += 1 if ps.get("trimmed") else 0
@@ -906,6 +974,8 @@ def run(a):
                 C.unproven += 1
                 row["quote_unproven"] = True
         row.update(decision=kind, target=target, label=lab)
+        if dec.get("reason"):
+            row["reason"] = dec["reason"]
         write_atomic(a.out, doc.render())
         _jsonl(a.jsonl, row)
         if C.n % 60 == 0:
@@ -950,6 +1020,14 @@ def main(argv=None):
                     help=f"tonight's candidates shown per mark (KHMS_PERMARK_TONIGHT_K, default {TONIGHT_K})")
     ap.add_argument("--packet-chars", type=int, default=None,
                     help=f"the packet budget in characters (KHMS_PERMARK_PACKET_CHARS, default {PACKET_CHARS})")
+    ap.add_argument("--whole-top", type=int, default=None,
+                    help=f"the top N of each channel shown whole (KHMS_PERMARK_WHOLE_TOP, default {WHOLE_TOP})")
+    ap.add_argument("--links-line", type=int, choices=(0, 1), default=None,
+                    help=f"1 = a type + link-ids line under every shown card (KHMS_PERMARK_LINKS_LINE, "
+                         f"default {LINKS_LINE})")
+    ap.add_argument("--short-answers", type=int, choices=(0, 1), default=None,
+                    help=f"1 = three-line carded / not-carded answers (KHMS_PERMARK_SHORT_ANSWERS, "
+                         f"default {SHORT_ANSWERS})")
     a = ap.parse_args(argv)
     return run(a)
 

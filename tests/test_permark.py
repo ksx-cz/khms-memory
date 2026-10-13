@@ -227,6 +227,9 @@ if mid in os.environ.get("STUB_GARBLE", ""):
     ans = "no decision at all"
 else:
     ans = f"DECISION: not-carded\n- {mid} :: not know-how: fixture"
+if os.environ.get("STUB_SYS"):                      # the rules the run handed the model
+    with open(os.environ["STUB_SYS"], "w") as fh:
+        fh.write(args[args.index("--system-prompt") + 1])
 if os.environ.get("STUB_SLEEP"):
     import time; time.sleep(float(os.environ["STUB_SLEEP"]))
 print(json.dumps({"type": "result", "result": ans, "is_error": False, "total_cost_usd": 0.002, "num_turns": 1,
@@ -444,3 +447,128 @@ def test_packet_chars_is_logged_per_call_and_summarised(tmp_path):
     assert [row["packet_chars"] for row in rows] == sizes
     assert re.search(r"permark: packet_chars n=3 min=\d+ median=\d+ max=\d+ budget=2500 trimmed=\d+",
                      log.read_text())
+
+
+# --- #237 PWHOLE: more whole cards (A), a type + links line per card (B), short carded/notcarded answers (C) ----
+LEX = ["K-%05d" % n for n in range(201, 206)]          # five cards the lexical channel ranks for one query
+
+
+def lex_retrieval():
+    cards = [card(cid, f"orchid{i} the pump seal leaks under pressure\n" + "\n".join(
+        f"detail line {j} of card {cid}" for j in range(12)) + "\n" + "body " * (60 - 10 * i))
+             for i, cid in enumerate(LEX)]
+    return PM.Retrieval(cards=cards, hy=None, glossary={}, all_cards=cards)
+
+
+def whole_ids(packet):
+    return re.findall(r"(?m)^(K-\d{5}) \[[a-z]+\] \(shown whole\)$", packet)
+
+
+def test_whole_top_shows_the_top_n_of_each_channel_whole(tmp_path):
+    T = PM.Transcripts(dirs=[], slug="")
+    mk = mark("the pump seal leaks under pressure", mid="M-0000eeee")
+    root = str(journal_root(tmp_path))
+    packet, shown, _l = PM.build_packet(mk, root, lex_retrieval(), PM.Doc(), T)
+    assert PM.WHOLE_TOP == 3, "the default N"
+    assert len(shown) == 5
+    assert whole_ids(packet) == shown[:3], "the lexical top 3 whole, ranks 4 and 5 summarised"
+    for cid in shown[3:]:
+        assert re.search(rf"(?m)^{cid} \[active\] orchid", packet), "a summary keeps its title line"
+    one, _s, _l = PM.build_packet(mk, root, lex_retrieval(), PM.Doc(), T, whole_top=1)
+    assert whole_ids(one) == shown[:1], "N=1 is the old top-1 rule"
+
+
+def test_whole_top_is_a_config_key_and_a_flag(tmp_path):
+    root, q, stub = run_base(tmp_path, n=1)
+    for i, cid in enumerate(LEX):
+        (root / "memory/know" / f"{cid}.md").write_text(
+            f"---\nid: {cid}\ntype: fact\nlevel: observation\nstatus: active\ntags: [power]\n---\n"
+            f"widget fact {i} card body\nline two\n")
+    for args, env, n in (((), {}, 3), (("--whole-top", "2"), {}, 2), ((), {"KHMS_PERMARK_WHOLE_TOP": "4"}, 4),
+                         (("--whole-top", "1"), {"KHMS_PERMARK_WHOLE_TOP": "4"}, 1)):
+        pk = tmp_path / f"pk{n}"
+        r = run_pm(tmp_path, root, q, stub, "--dry", "--packets", pk, *args, **env)
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert len(whole_ids((pk / "M-00000001.txt").read_text())) == n, (args, env)
+
+
+def linked_retrieval():
+    base = card("K-00301", "the pump seal leaks under pressure\nmeasured at 6 bar\n")
+    base.update(type="fact", links={"derived_from": ["K-00302"], "supports": ["K-00309"],
+                                    "contradicts": ["K-00303", "K-00304"], "refuted_by": [],
+                                    "supersedes": "K-00305"})
+    newer = card("K-00306", "an unrelated newer card\n")
+    newer.update(type="policy", links={"supersedes": ["K-00301"]})
+    bare = card("K-00307", "the pump seal again, under pressure, no links\n")
+    bare.update(type="problem→solution")
+    cards = [base, newer, bare]
+    return PM.Retrieval(cards=cards, hy=None, glossary={}, all_cards=cards)
+
+
+def test_the_links_line_names_type_and_link_ids_only_when_on(tmp_path):
+    T = PM.Transcripts(dirs=[], slug="")
+    mk = mark("the pump seal leaks under pressure", mid="M-0000eeee")
+    root = str(journal_root(tmp_path))
+    assert PM.LINKS_LINE == 0, "off by default"
+    off, _s, _l = PM.build_packet(mk, root, linked_retrieval(), PM.Doc(), T)
+    assert "type: fact" not in off and "superseded_by" not in off
+    on, shown, _l = PM.build_packet(mk, root, linked_retrieval(), PM.Doc(), T, links=1)
+    assert shown[:2] == ["K-00301", "K-00307"]
+    # under the card's heading line, whole or summary alike; supports is not one of the five keys
+    assert ("K-00301 [active] (shown whole)\ntype: fact · supersedes: K-00305 · superseded_by: K-00306 · "
+            "contradicts: K-00303, K-00304 · derived_from: K-00302\n") in on
+    assert "K-00309" not in on
+    assert "\ntype: problem→solution · no links\n" in on
+
+
+def test_the_links_line_is_a_config_key_and_a_flag(tmp_path):
+    root, q, stub = run_base(tmp_path, n=1)
+    (root / "memory/know" / "K-00308.md").write_text(
+        "---\nid: K-00308\ntype: policy\nlevel: derived\nstatus: active\ntags: [power]\nlinks:\n"
+        "  derived_from: []\n  supports: []\n  contradicts: [K-00101]\n  refuted_by: []\n  supersedes: null\n"
+        "---\nwidget fact policy card\n")
+    for args, env, on in (((), {}, False), (("--links-line", "1"), {}, True),
+                          ((), {"KHMS_PERMARK_LINKS_LINE": "1"}, True),
+                          (("--links-line", "0"), {"KHMS_PERMARK_LINKS_LINE": "1"}, False)):
+        pk = tmp_path / f"pk{len(args)}{len(env)}"
+        r = run_pm(tmp_path, root, q, stub, "--dry", "--packets", pk, *args, **env)
+        assert r.returncode == 0, r.stdout + r.stderr
+        text = (pk / "M-00000001.txt").read_text()
+        assert ("\ntype: policy · contradicts: K-00101\n" in text) is on, (args, env)
+        assert ("\ntype: fact · no links\n" in text) is on
+
+
+def test_the_short_answer_rules_are_rendered_only_when_on(tmp_path):
+    root, q, stub = run_base(tmp_path, n=1)
+    sysf = tmp_path / "sys.txt"
+    seen = {}
+    for args, env in (((), {}), (("--short-answers", "0"), {}), ((), {"KHMS_PERMARK_SHORT_ANSWERS": "0"}),
+                      (("--short-answers", "1"), {"KHMS_PERMARK_SHORT_ANSWERS": "0"})):
+        (tmp_path / "out.md").unlink(missing_ok=True)
+        r = run_pm(tmp_path, root, q, stub, *args, STUB_SYS=sysf, **env)
+        assert r.returncode == 0, r.stdout + r.stderr
+        rules = sysf.read_text()
+        seen[(args, tuple(env.items()))] = "SHORT ANSWERS" in rules
+        if "SHORT ANSWERS" in rules:
+            assert "REASON: <one sentence" in rules and "DECISION: carded K-xxxxx" in rules
+            assert rules.index("SHORT ANSWERS") < rules.index("# THE CARD SCHEMA"), "right after the rules"
+    assert list(seen.values()) == [True, False, False, True], "on by default (owner 2026-10-13 14:03)"
+    assert PM.SHORT_ANSWERS == 1
+
+
+def test_a_short_carded_answer_parses_keeps_its_quote_and_its_reason():
+    ans = (f"DECISION: carded {CA}\n- M-0000aaaa :: already carded {CA}: \"the widget bus voltage sags under load\"\n"
+           "REASON: the card holds the sag this mark reports")
+    dec = PM.parse_answer(ans, "M-0000aaaa")
+    assert dec["kind"] == "carded" and dec["arg"] == CA, dec
+    assert dec["verdict"] == f"- M-0000aaaa :: already carded {CA}: \"the widget bus voltage sags under load\""
+    assert dec["reason"] == "the card holds the sag this mark reports"
+    doc = PM.Doc()
+    PM.apply(doc, "M-0000aaaa", dec, [CA])
+    nc = doc.render().split("## MARKS NOT CARDED")[1]
+    assert "REASON" not in nc, "the reason goes to the JSONL row, the verdict line stays greppable"
+    import mark_ledger as ML
+    am = re.search(r"already carded\s+(K-\d{5})\b\s*[:—–-]?\s*(.*)$", dec["verdict"])
+    assert ML.quote_in_card(am.group(2), "x\nthe widget bus voltage sags under load\n")
+    short_nc = PM.parse_answer("DECISION: not-carded\n- M-0000aaaa :: not know-how: a status line", "M-0000aaaa")
+    assert short_nc["kind"] == "notcarded" and short_nc["reason"] == ""
