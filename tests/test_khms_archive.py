@@ -85,7 +85,7 @@ def card_text(cid, status, level, links, extra, body):
     typ = "principle" if level == "derived" else "fact"
     return (f"---\nid: {cid}\ntype: {typ}\nlevel: {level}\nstatus: {status}\ntags: [testing]\n"
             f"scope: universal\nevidence: measured\nsource: synthetic\ndate: '2099-01-01'\n{links}\n{extra}---\n"
-            f"{body}\n\nCZ: syntetická karta {cid}.\n")
+            f"{body}\n\nSummary: synthetic card {cid}.\n")
 
 
 @pytest.fixture
