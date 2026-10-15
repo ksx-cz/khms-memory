@@ -24,6 +24,25 @@ this tool never writes it), `derived_from`, `supports`. There is no `challenged_
   challenge   loser: status challenged, contradicts += winner · winner: contradicts += loser
   contradicts both: contradicts += the other, no status change
   retire      refute + move the loser to memory/archive/know/ (only with --archive)
+  unlink      card: links.<field> -= target · target: contradicts -= card (contradicts only)
+
+UNLINK (#242, 2026-10-15) IS THE ONE WAY A LINK LEAVES A CARD. Until it existed this tool could only
+add links, so a link written by hand against the spec (13 `challenged` cards carried a `refuted_by`,
+which the spec fills only when status→refuted) could not be taken back by any sanctioned tool. The
+verdict names the field and the target, and the row's card (its first id) is the card it edits:
+
+  ### K-00001 — action **UNLINK** (refuted_by K-00002)
+  ROW 7: APPLY unlink refuted_by K-00002 — challenged is not refuted (spec 4.10)
+
+It removes exactly that link — and, for the symmetric `contradicts`, the mirror half on the target —
+and nothing else: status is never touched (a status is lowered by a superseding card, not here), the
+reason goes into the run's report next to the triage file. `refuted_by` has no inverse field in the
+spec, so the target's own `contradicts` edge (which a refute also wrote) stays; unlink it by its own
+row if it is wrong too. Fields: contradicts, refuted_by, supports, derived_from — never `supersedes`,
+which is bound to a body line. REFUSED (exit 2, nothing written, not even the report) when the link is
+not there, when the verdict names a field or target other than the UNLINK row's own, when it would
+leave a `refuted` card with an empty `refuted_by` or a `derived` card with an empty `derived_from`, or
+when the edit would move anything but that one list — a missing link is never a silent no-op.
 
 Usage:
   apply_triage.py memory/inbox/2026-09-03-triage.md --dry-run
@@ -54,6 +73,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import khms_contradict as kc        # noqa: E402  (quote_coverage — one definition, not two)
 import khms_triage_report as R      # noqa: E402  (role coherence — likewise)
 
+import khms_lint as KL  # noqa: E402  (#241: the one link-list splitter and id grammar)
 import khms_lock as L
 import khms_paths as P  # noqa: E402
 import khms_review_state as RS  # noqa: E402  (the triage marker's one name)
@@ -66,8 +86,13 @@ DEFAULT_BRAIN = P.soft("ROOT")
 
 STATUS_RANK = {"active": 0, "challenged": 1, "refuted": 2, "superseded": 3, "condensed": 3}
 CLASS_FROM_ACTION = {"MARK_DEAD_END": "refute", "MARK_CONJECTURE": "challenge",
-                     "RETIRE_WHOLE": "retire", "AMEND": None}
-CLASSES = ("refute", "challenge", "contradicts", "retire")
+                     "RETIRE_WHOLE": "retire", "AMEND": None, "UNLINK": "unlink"}
+CLASSES = ("refute", "challenge", "contradicts", "retire", "unlink")
+UNLINK_FIELDS = ("contradicts", "refuted_by", "supports", "derived_from")
+
+
+class Refusal(Exception):
+    """An unlink row that cannot be applied as written: the whole run stops before its first write."""
 # AMEND maps to None ON PURPOSE: "one false claim in an otherwise true card" is not a status or a
 # link, it is an erratum — tools/khms_erratum.py corrects the claim in place and keeps the retracted
 # wording in the card and in the tombstone ledger (KBFIX, issue #136, 2026-09-20). Until that tool
@@ -85,6 +110,12 @@ ERRATUM_HINT = (
 ROW_RE = re.compile(
     r"^### (K-\d+) — action \*\*(\w+)\*\* \(contradicted by (K-\d+), severity ([\d?]+)\)$",
     re.M)
+# The target is any link element the #241 grammar admits: a card id, or a temp label that never became
+# a card (`C22`) — exactly the links an unlink exists to take back.
+UNLINK_ROW_RE = re.compile(rf"^### (K-\d+) — action \*\*UNLINK\*\* \((\w+) ({KL.LINK_ID_RE.pattern})\)\s*$",
+                           re.M)
+UNLINK_VERDICT_RE = re.compile(
+    rf"^ROW\s+(\d+)\s*:\s*APPLY\s+unlink\s+(\w+)\s+({KL.LINK_ID_RE.pattern})\s*(?:[—:-]\s*)?(.*)$", re.M)
 VERDICT_RE = re.compile(
     r"^ROW\s+(\d+)\s*:\s*(APPLY|REJECT)\b\s*(refute|challenge|contradicts|retire)?\s*"
     r"(?:[—:-]\s*)?(.*)$", re.M)
@@ -97,8 +128,15 @@ WIN_QUOTE_RE = re.compile(r'^- winning quote \((K-\d+)\): "(.*)"\s*$', re.M)
 def parse_rows(text):
     """Every `### K-xxxxx — action **ACTION** (contradicted by K-yyyyy, severity N)` block,
     numbered from 1 in file order. The number is the row's identity in the verdict section."""
-    rows, marks = [], list(ROW_RE.finditer(text))
+    rows = []
+    marks = sorted(list(ROW_RE.finditer(text)) + list(UNLINK_ROW_RE.finditer(text)),
+                   key=lambda m: m.start())
     for i, m in enumerate(marks):
+        if m.re is UNLINK_ROW_RE:        # `### K-x — action **UNLINK** (<field> K-y)`: no quotes, no severity
+            rows.append({"n": i + 1, "loser": m.group(1), "action": "UNLINK", "winner": m.group(3),
+                         "field": m.group(2), "severity": 0, "quote": "", "winner_quote": "",
+                         "score": 0.0, "winner_evidence": "", "winner_date": ""})
+            continue
         chunk = text[m.end(): marks[i + 1].start() if i + 1 < len(marks) else len(text)]
         chunk = chunk.split("\n## ")[0]
         q = QUOTE_RE.search(chunk)
@@ -113,10 +151,13 @@ def parse_rows(text):
 
 
 def parse_verdicts(text):
-    """{row number: (APPLY|REJECT, class or None, reason)} from the REVIEW VERDICT section."""
+    """{row number: (APPLY|REJECT, class or None, reason, (field, target) or None)} from the REVIEW
+    VERDICT section. An `APPLY unlink <field> <K-target>` line carries its field and target."""
     out = {}
     for m in VERDICT_RE.finditer(text):
-        out[int(m.group(1))] = (m.group(2), m.group(3), m.group(4).strip())
+        out[int(m.group(1))] = (m.group(2), m.group(3), m.group(4).strip(), None)
+    for m in UNLINK_VERDICT_RE.finditer(text):
+        out[int(m.group(1))] = ("APPLY", "unlink", m.group(4).strip(), (m.group(2), m.group(3)))
     return out
 
 
@@ -166,6 +207,41 @@ def add_link_id(front, key, cid):
     return front[:bm.end()] + f"\n{ind}{key}: {rendered}" + tail, True
 
 
+def remove_link_id(front, key, cid):
+    """Remove `cid` from links.<key>, in whichever of the two frontmatter styles the card uses.
+    Returns (front, changed); changed is False when the link is not there. Only the one line that
+    holds the list is rewritten, and the result is re-read: if anything but that one list would differ
+    (a multi-line YAML list, an odd layout), it raises instead of writing a guess."""
+    meta = yaml.safe_load(front) or {}
+    cur = KL.split_link_ids((meta.get("links") or {}).get(key))
+    if cid not in cur:
+        return front, False
+    rest = [x for x in cur if x != cid]
+    rendered = "[" + ", ".join(rest) + "]"
+    inline = re.search(r"^links:\s*(\{.*\})\s*$", front, re.M)
+    if inline:
+        inner = inline.group(1)
+        km = re.search(rf"(?<![\w-]){key}:\s*(?:\[[^\]]*\]|[^,}}]*)", inner)
+        new = (front[:inline.start(1)] + inner[:km.start()] + f"{key}: {rendered}" + inner[km.end():]
+               + front[inline.end(1):])
+    else:
+        bm = re.search(r"^links:\s*$", front, re.M)
+        km = re.search(rf"^(\s+){key}:\s*.*$", front[bm.end():], re.M) if bm else None
+        if not km:
+            raise ValueError(f"links.{key} is not a one-line list this tool can edit")
+        tail = front[bm.end():]
+        new = front[:bm.end()] + tail[:km.start()] + f"{km.group(1)}{key}: {rendered}" + tail[km.end():]
+    want = yaml.safe_load(front)
+    want["links"][key] = rest
+    try:
+        got = yaml.safe_load(new)
+    except yaml.YAMLError as e:
+        raise ValueError(f"removing {cid} from links.{key} would break the frontmatter: {e}")
+    if got != want:
+        raise ValueError(f"removing {cid} from links.{key} would change more than that one list")
+    return new, True
+
+
 # ------------------------------------------------------------------------------ planning
 
 def card_path(brain, cid):
@@ -196,27 +272,43 @@ def ops_for(cls, loser, winner):
 
 
 def decide(rows, verdicts, brain, cov_min=kc.QUOTE_COV_MIN, assume_apply=False):
-    """Per-row outcome, before any file is touched. Returns (applied, outcomes).
+    """Per-row outcome, before any file is touched. Returns (applied, outcomes, refusals); a
+    non-empty `refusals` (an unlink row that cannot be applied as written) stops the whole run.
 
     `assume_apply` is a PREVIEW for a triage file that has not been reviewed yet: rows with no
     verdict line are read as "apply what the row proposes", so a reviewer can see which rows
     would survive the guards before writing a verdict. It can never write (main refuses to
     combine it with --apply)."""
-    outcomes, applied = {}, []
+    outcomes, applied, unlinks, refusals = {}, [], [], []
     for row in rows:
         n = row["n"]
         d = verdicts.get(n)
         if not d and assume_apply:
-            d = ("APPLY", None, "assumed from the row's proposed action (preview only)")
+            d = ("APPLY", None, "assumed from the row's proposed action (preview only)", None)
         if not d:
             outcomes[n] = ("REJECT", "no verdict line in the REVIEW VERDICT section — "
                                      "silence is not approval")
             continue
-        decision, cls, reason = d
+        decision, cls, reason, named = d
         if decision == "REJECT":
             outcomes[n] = ("REJECT", reason or "rejected by the review")
             continue
         cls = cls or CLASS_FROM_ACTION.get(row["action"])
+        if cls == "unlink":
+            # Not a contradiction verdict: no quote guard and no winner/loser role. Whether the link is
+            # there is checked by plan(), against the card as earlier rows of this file left it.
+            field, target = named or (row.get("field"), row["winner"])
+            if row["action"] == "UNLINK" and (field, target) != (row.get("field"), row["winner"]):
+                refusals.append(f"ROW {n}: the verdict names links.{field} {target}, which does not match "
+                                f"the row's own links.{row.get('field')} {row['winner']}")
+            elif field not in UNLINK_FIELDS:
+                refusals.append(f"ROW {n}: links.{field} cannot be unlinked (only "
+                                f"{', '.join(UNLINK_FIELDS)}; supersedes is bound to the card's "
+                                f"SUPERSEDES body line and is never edited by this tool)")
+            else:
+                row.update(_class="unlink", _reason=reason, _field=field, _target=target)
+                unlinks.append(row)
+            continue
         if not cls:
             if row["action"] == "AMEND":
                 outcomes[n] = ("SKIP", ERRATUM_HINT.format(
@@ -254,20 +346,32 @@ def decide(rows, verdicts, brain, cov_min=kc.QUOTE_COV_MIN, assume_apply=False):
         outcomes[c["row"]["n"]] = ("REJECT", "winner-loser conflict — " + c["reason"])
     for row in kept:
         outcomes[row["n"]] = ("APPLY", f"{row['_class']}: {row['_reason']}")
-    return kept, outcomes
+    for row in unlinks:
+        outcomes[row["n"]] = ("APPLY", f"unlink {row['_field']} {row['_target']}: {row['_reason']}")
+    return sorted(kept + unlinks, key=lambda r: r["n"]), outcomes, refusals
 
 
 def plan(rows, brain):
     """{card id: {'path','before','after','ops'}} — frontmatter only."""
     edits = {}
+
+    def get(cid):
+        c = edits.get(cid)
+        if not c:
+            card = load(brain, cid)
+            if not card:
+                return None
+            c = edits[cid] = {"path": card["path"], "body": card["body"],
+                              "front0": card["front"], "front": card["front"],
+                              "meta": card["meta"], "ops": [], "archive": False}
+        return c
+
     for row in rows:
+        if row["_class"] == "unlink":
+            unlink(row, get)
+            continue
         for cid, kind, arg in ops_for(row["_class"], row["loser"], row["winner"]):
-            c = edits.get(cid)
-            if not c:
-                card = load(brain, cid)
-                c = edits[cid] = {"path": card["path"], "body": card["body"],
-                                  "front0": card["front"], "front": card["front"],
-                                  "meta": card["meta"], "ops": [], "archive": False}
+            c = get(cid)
             if kind == "status":
                 cur = str(c["meta"].get("status", "active"))
                 if STATUS_RANK.get(arg, 0) > STATUS_RANK.get(cur, 0):
@@ -284,6 +388,48 @@ def plan(rows, brain):
         if row["_class"] == "retire":
             edits[row["loser"]]["archive"] = True
     return edits
+
+
+def unlink(row, get):
+    """Remove the row's one link (and the mirror half of a `contradicts` edge) from the planned
+    frontmatter. Raises Refusal for anything that cannot be applied exactly as the verdict says."""
+    n, cid, field, target = row["n"], row["loser"], row["_field"], row["_target"]
+    c = get(cid)
+    if not c:
+        raise Refusal(f"ROW {n}: no card file for {cid}")
+    try:
+        new, changed = remove_link_id(c["front"], field, target)
+    except ValueError as e:
+        raise Refusal(f"ROW {n}: {cid}: {e}")
+    if not changed:
+        raise Refusal(f"ROW {n}: {cid} links.{field} has no {target} — the link does not exist "
+                      f"(or an earlier row of this file already removed it)")
+    meta = yaml.safe_load(new) or {}
+    rest = (meta.get("links") or {}).get(field) or []
+    status, level = str(meta.get("status", "active")), str(meta.get("level", ""))
+    if field == "refuted_by" and status == "refuted" and not rest:
+        raise Refusal(f"ROW {n}: {cid} is refuted and {target} is its last refuted_by — the spec fills "
+                      f"refuted_by when status→refuted; a status is not lowered by this tool")
+    if field == "derived_from" and level == "derived" and not rest:
+        raise Refusal(f"ROW {n}: {cid} is a derived card and {target} is its last derived_from — the "
+                      f"spec requires it non-empty")
+    c["front"], c["meta"] = new, meta
+    c["ops"].append(f"links.{field} -= {target} (ROW {n}: {row['_reason']})")
+    if field != "contradicts":
+        return
+    m = get(target)
+    if not m:
+        c["ops"].append(f"mirror half: no card file for {target}")
+        return
+    try:
+        new, changed = remove_link_id(m["front"], "contradicts", cid)
+    except ValueError as e:
+        raise Refusal(f"ROW {n}: mirror half on {target}: {e}")
+    if changed:
+        m["front"], m["meta"] = new, yaml.safe_load(new) or {}
+        m["ops"].append(f"links.contradicts -= {cid} (mirror of ROW {n}: {row['_reason']})")
+    else:
+        c["ops"].append(f"mirror half: {target} links.contradicts had no {cid}")
 
 
 def render_diff(cid, before, after):
@@ -345,9 +491,20 @@ def apply_locked(args, write, markers, rp):
     text = open(args.triage_file, encoding="utf-8").read()
     rows = parse_rows(text)
     verdicts = parse_verdicts(text)
-    applied, outcomes = decide(rows, verdicts, args.brain,
-                               assume_apply=args.assume_apply)
-    edits = plan(applied, args.brain)
+    applied, outcomes, refusals = decide(rows, verdicts, args.brain,
+                                         assume_apply=args.assume_apply)
+    edits = None
+    if not refusals:
+        try:
+            edits = plan(applied, args.brain)
+        except Refusal as e:
+            refusals = [str(e)]
+    if refusals:
+        # Before the report, the cards and the marker: a refused unlink writes nothing at all.
+        for r in refusals:
+            print(f"REFUSED {r}", file=sys.stderr)
+        print("REFUSED: nothing was written — fix or REJECT the rows above and run again", file=sys.stderr)
+        sys.exit(2)
 
     stamp = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
     report = [f"# apply_triage — {os.path.basename(args.triage_file)} "
