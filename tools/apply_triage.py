@@ -433,7 +433,8 @@ def unlink(row, get):
 
 
 def render_diff(cid, before, after):
-    return "".join(difflib.unified_diff(before.splitlines(True), after.splitlines(True),
+    # "\n" closes the last frontmatter line, so a change there renders as two lines, not one glued line
+    return "".join(difflib.unified_diff((before + "\n").splitlines(True), (after + "\n").splitlines(True),
                                         fromfile=f"{cid} (frontmatter, before)",
                                         tofile=f"{cid} (frontmatter, after)"))
 
