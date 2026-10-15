@@ -104,7 +104,31 @@ def load_card(cid):
     tags = [t.strip() for t in tags.strip("[] ").split(",") if t.strip()]
     return {"id": cid, "type": fm("type"), "level": fm("level"), "status": fm("status"),
             "evidence": fm("evidence"), "date": fm("date"), "tags": tags,
-            "body": body.strip()}
+            "links": ks._parse_links(front + "\n"), "body": body.strip()}
+
+
+# Why the pair gate refused a pair, one reason per pair (#240). A pair carries the rules of BOTH
+# orientations, so a pair with one superseded card holds `loser-not-active` for one and
+# `winner-not-active` for the other: either way the card the triage would mark is already decided.
+PREFILTER_REASONS = (("loser not active", {"loser-not-active", "winner-not-active"}),
+                     ("edge already exists", {"edge-exists", "winner-supports-loser"}),
+                     ("decision-type winner", {"decision-winner"}))
+
+
+def prefilter_line(pre):
+    """The morning file's count of candidate pairs the pair gate kept from the model, by reason."""
+    if not pre:
+        return "- candidate pairs filtered before the model: unknown — sweep JSON predates the pair gate"
+    by = Counter()
+    for _a, _b, rules in pre.get("refused_pairs") or []:
+        rs = set(rules)
+        by[next((name for name, names in PREFILTER_REASONS if rs & names), "other rule")] += 1
+    parts = " · ".join(f"{name}: {by[name]}" for name, _ in PREFILTER_REASONS)
+    if by["other rule"]:
+        parts += f" · other rule: {by['other rule']}"
+    return (f"- candidate pairs filtered before the model: **{pre.get('refused', 0)}** "
+            f"of {pre.get('of', '?')} ({parts}; each pair with its rules: sweep JSON "
+            f"`meta.selection.gated_before_model.refused_pairs`)")
 
 
 def match_claim(claims, quote):
@@ -890,6 +914,7 @@ def main():
           f"- rows marked subject-unclear by the model pass: {len(rows_unclear)} "
           f"(pass {'ON' if args.subject_model else 'OFF'}; such rows are sorted below the "
           f"list, never dropped)",
+          prefilter_line(sel.get("gated_before_model")),
           f"- candidate pairs never sent to the model: "
           f"{sel.get('not_adjudicated', 'unknown — sweep JSON predates the coverage meta')}",
           f"- deterministic correction-orphan groups: {det.get('total_groups', 0)}"]

@@ -19,6 +19,14 @@ if the union of the enabled rules keeps >= 95 % of the APPLY rows over the whole
 The other rules are kept, measured and OFF — switching one on is a one-line decision with its
 price already on the table.
 
+ALREADY DECIDED PAIRS (issue #240): `loser-not-active` and `edge-exists` refuse a pair the base has
+already settled -- a card that is superseded / refuted / challenged, or two cards already joined by the
+`contradicts` / `refuted_by` edge a triage row would write. With `winner-not-active` they refuse BOTH
+orientations, so the pair gate keeps such a pair from the model. Replayed on the reference deployment's
+2026-10-15 night: 29 of its 250 judged pairs, and every row its review rejected as "already handled".
+`winner-supports-loser` is kept OFF: a follow-up card that `supports` the card it corrects was APPLIED as
+a refutation in the reviewed history (an upper bound of 19 of 165 APPLY rows carry that edge).
+
 A gated row is never silent: khms_triage_report.py lists it under "Withheld" with the rule
 and its evidence. Nothing in memory/know/ is touched.
 
@@ -40,6 +48,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 # Card ids in comments (K-9xxxx) are illustrative stand-ins for the reference deployment's cards
 # the measurements below were made on; they are not ids of any shipped base.
 import khms_contradict as kc  # noqa: E402  (unit families, value disjointness)
+import khms_search as ks  # noqa: E402  (the one links parser)
 
 # A card of one of these types states what we DECIDED or REQUIRE, not what IS. It can make
 # a loser obsolete, never false (K-92816). Measured cost: see the evaluator.
@@ -136,6 +145,44 @@ def r_winner_not_active(loser, winner, quote="", win_quote=""):
     return None
 
 
+def r_loser_not_active(loser, winner, quote="", win_quote=""):
+    """The base has already decided the loser (#240): a superseded, refuted or challenged card is
+    the outcome a contradiction row would propose, so the row can only be rejected."""
+    st = loser.get("status") or "active"
+    if st != "active":
+        return f"loser {loser['id']} is already `{st}` — the base has decided it"
+    return None
+
+
+def _ids(v):
+    if not v:
+        return set()
+    return {v} if isinstance(v, str) else set(v)
+
+
+def r_edge_exists(loser, winner, quote="", win_quote=""):
+    """The pair already carries an edge of the kind the triage writes (#240): `contradicts` or
+    `refuted_by` on either card. Both are decisions about the PAIR, so either direction refuses both
+    orientations, as a settled status does. ONLY these kinds: an arbitrary link between the
+    two cards (`derived_from`, `supports`) is common in real contradictions too (K-93309: dropping every
+    linked pair would have lost 27 of 68 applied rows)."""
+    lw, ll = winner.get("links") or {}, loser.get("links") or {}
+    if loser["id"] in _ids(lw.get("contradicts")) or winner["id"] in _ids(ll.get("contradicts")):
+        return f"{winner['id']} and {loser['id']} are already linked by `contradicts`"
+    if winner["id"] in _ids(ll.get("refuted_by")) or loser["id"] in _ids(lw.get("refuted_by")):
+        return f"{winner['id']} and {loser['id']} are already linked by `refuted_by`"
+    return None
+
+
+def r_winner_supports_loser(loser, winner, quote="", win_quote=""):
+    """The winner's own `supports` names the loser. Measured and OFF (#240): in the reviewed history a
+    follow-up card that `supports` the card it corrects was APPLIED as a real refutation, so this is a
+    reviewer's hint, not a default refusal."""
+    if loser["id"] in _ids((winner.get("links") or {}).get("supports")):
+        return f"winner {winner['id']} already `supports` the loser {loser['id']}"
+    return None
+
+
 def r_winner_older(loser, winner, quote="", win_quote=""):
     dl, dw = _date(loser.get("date")), _date(winner.get("date"))
     if dl and dw and (dl - dw).days > WINNER_OLDER_DAYS:
@@ -195,6 +242,9 @@ def r_different_moments(loser, winner, quote="", win_quote=""):
 RULES = {
     "decision-winner":         (r_decision_winner, False, True),
     "winner-not-active":       (r_winner_not_active, False, True),
+    "loser-not-active":        (r_loser_not_active, False, True),
+    "edge-exists":             (r_edge_exists, False, True),
+    "winner-supports-loser":   (r_winner_supports_loser, False, False),
     "winner-older":            (r_winner_older, False, False),
     "newer-loser-cites-winner": (r_newer_loser_cites_winner, False, False),
     "tags-disjoint":           (r_tags_disjoint, False, False),
@@ -256,7 +306,7 @@ def parse_card_text(cid, text):
     tags = [t.strip() for t in fm("tags", "").strip("[] ").split(",") if t.strip()]
     return {"id": cid, "type": fm("type"), "level": fm("level"), "status": fm("status"),
             "evidence": fm("evidence"), "date": fm("date"), "tags": tags,
-            "body": body.strip()}
+            "links": ks._parse_links(front + "\n"), "body": body.strip()}
 
 
 def load_card_from(mem_dir, cid):
