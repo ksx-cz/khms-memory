@@ -186,6 +186,7 @@ OUTCOME_LLM_ERROR = "LLM-ERROR"     # the endpoint refused, reset, resolved nowh
 OUTCOME_DEADLINE = "DEADLINE"       # the run's own deadline arrived before this pair's turn
 OUTCOME_NO_VERDICT = "NO-VERDICT"   # answered, but said nothing about this pair
 OUTCOME_BUDGET = "BUDGET"           # the judge's spend bound refused the call (#208 SONNETJUDGE)
+OUTCOME_USAGE_LIMIT = "USAGE-LIMIT"  # the account's usage limit answered; never sent (#239: was BUDGET)
 
 
 # ------------------------------------------------------------ what "judged" means, once
@@ -1503,15 +1504,19 @@ def adjudicate(pairs, by_id, batch=6, max_bytes=60000, verbose=True,
                 # recorded as BUDGET and the loop ends — no later call may start.
                 e, attempt, prev = stopped
                 tail = " — it is NOT a finding of 'no contradiction'"
+                # an ACCOUNT limit is not the spend bound: on 2026-10-14 it was labelled BUDGET and
+                # the morning file read "LLM budget" for a limit that resets by itself (#239)
+                stop_outcome = (OUTCOME_USAGE_LIMIT if isinstance(e, JudgeUsageLimit)
+                                else OUTCOME_BUDGET)
                 if attempt > 1:
-                    finish_batch(chunk, OUTCOME_BUDGET,
+                    finish_batch(chunk, stop_outcome,
                                  f"{e}; this pair's first attempt failed ({prev}) and the "
                                  f"bound refused the retry{tail}", n)
                 else:
-                    finish_batch(chunk, OUTCOME_BUDGET,
+                    finish_batch(chunk, stop_outcome,
                                  f"{e}; this pair was never sent to the model{tail}", n)
                 rest = pairs[i + len(chunk):]
-                finish_batch(rest, OUTCOME_BUDGET,
+                finish_batch(rest, stop_outcome,
                              f"{e}; this pair was never sent to the model{tail}", len(rest))
                 print(f"  JUDGE BOUND: {e} — {len(chunk) + len(rest)} pairs left unsent",
                       file=sys.stderr)

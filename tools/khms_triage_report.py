@@ -327,9 +327,9 @@ OUTCOME_JUDGED = "OK"
 # Sweeps written before 2026-09-20 carry no `outcome` key at all, and every result in one of
 # them IS a model verdict: a MISSING key reads as OK, a PRESENT unknown one never does.
 NOT_JUDGED_CLASSES = [
-    ("never sent to the model", ("DEADLINE", "BUDGET"),
-     "the run's own deadline arrived before this pair's turn, or the paid judge's per-night "
-     "spend bound refused the call (#208)"),
+    ("never sent to the model", ("DEADLINE", "BUDGET", "USAGE-LIMIT"),
+     "the run's own deadline arrived before this pair's turn, the paid judge's per-night "
+     "spend bound refused the call (#208), or the account's usage limit answered (#239)"),
     ("sent, but no answer came back", ("UNANSWERED", "LLM-ERROR"),
      "the model did not answer inside its timeout, or the endpoint refused the call"),
     ("answered, but no usable verdict for this pair", ("TRUNCATED", "NO-VERDICT"),

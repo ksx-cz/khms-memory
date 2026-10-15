@@ -97,6 +97,7 @@ DEFAULTS = [
     ("KHMS_WEEK_STAMP", "${KHMS_SHARED_STATE}/last-weekly"),      # completion of the last weekly
     ("KHMS_SWEEP_FAILED", "${KHMS_SHARED_STATE}/sweep-failed"),   # one line per failed sweep, cleared on success
     ("KHMS_NIGHT_LOG", "${KHMS_STATE}/nightly.log"),              # night AND week log
+    ("KHMS_WEEK_PAUSED", ""),              # why the weekly is deliberately paused ("" = not paused; the ping says it)
     ("KHMS_AGENT", "claude"),                                     # headless agent CLI: an ABSOLUTE path (#232)
     ("KHMS_AGENT_FROM_PATH", "0"),         # 1 = a bare KHMS_AGENT may be looked up on PATH (refused otherwise)
     ("KHMS_AGENT_TRANSCRIPTS", "${HOME}/.claude/projects"),       # where that CLI writes session transcripts

@@ -42,6 +42,8 @@ with open(os.environ["FAKE_CALLS"] + ".jsonl", "a") as fh:
                          "id": mk.group(1) if mk else "", "pid": os.getpid()}) + "\n")
 if os.environ.get("FAKE_FAIL") == stage:
     sys.exit(1)
+if os.environ.get("FAKE_LIMIT") == stage:            # the account's usage limit answers instead of the model
+    print("You've hit your monthly spend limit · resets 3am (Europe/Prague)"); sys.exit(1)
 def card(label, text, extra="", src="journal", quote=None):
     return (f"### {label}: {text[:40]}\nWHAT: {text}\n{extra}RELATION: supports CARDID\n"
             f"NEAREST: CARDID (0.0300)\n**QUOTES:**\n- src={src} :: {quote or text}\n\n")
@@ -252,7 +254,26 @@ def test_a_failed_sweep_is_reported_unstamped_and_recorded(tmp_path):
     log = log_of(root)
     assert r.returncode == 1 and "sweep FAILED after retries" in log and "nightly INCOMPLETE" in log, log
     assert not (root / "state/shared/last-nightly").exists()
-    assert "window-since=" in (root / "state/shared/sweep-failed").read_text()
+    rec = (root / "state/shared/sweep-failed").read_text()
+    assert "window-since=" in rec and " reason=failed " in rec, rec
+
+
+def test_a_sweep_stopped_by_the_usage_limit_records_that_reason(tmp_path):
+    """#239: on 2026-10-15 the account's limit answered sweep part 1; the sweep-failed record had no reason and
+    the morning ping announced a failure that "will repeat". The record now says reason=usage-limit (the
+    sibling above, an ordinary failure, says reason=failed)."""
+    root, fake = make_base(tmp_path, n_marks=3)
+    tr = tmp_path / "source"
+    tr.mkdir()
+    f = tr / "s.jsonl"
+    f.write_text(json.dumps({"type": "user", "timestamp": "2099-01-01T10:00:00Z",
+                             "message": {"content": "unmarked fact " * 30}}) + "\n")
+    os.utime(f, (time.time() + 3600,) * 2)
+    r = run_night(tmp_path, root, fake, FAKE_LIMIT="sweep", KHMS_TRANSCRIPTS=tr)
+    log = log_of(root)
+    assert r.returncode == 1 and "USAGE LIMIT" in log, log
+    rec = (root / "state/shared/sweep-failed").read_text()
+    assert " reason=usage-limit " in rec and "hit your monthly spend limit" in rec, rec
 
 
 def test_a_missing_agent_fails_the_model_stages_visibly(tmp_path):

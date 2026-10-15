@@ -266,11 +266,18 @@ python3 "$CODE/khms_triage_report.py" "$SWEEP_JSON" \
 # planned, 0 judged, rc=0. The proposal now says so on its own first screen; this line puts
 # the same fact in nightly.log, because "triage done" next to an empty night is the defect
 # this whole file exists to stop.
+# A NIGHT THAT JUDGED NOTHING FAILS (#239). The comment at the fallback block always promised it ("without a
+# local model ... the night's triage FAILS loudly"), but this branch only warned and the stage ended rc 0:
+# on 2026-10-14 the account's usage limit answered the first call, 0 of 250 pairs were judged and systemd
+# reported the triage as Finished. The morning file is still written (above) -- it is the record of what
+# happened -- and the stage now exits 1, whichever judge ran last.
 read -r N_JUDGED N_PLANNED _ <<< "$(census "$SWEEP_JSON")"
 if [ "$N_JUDGED" = "0" ] && [ "${N_PLANNED:-0}" != "0" ]; then
   echo "$(date -Is) triage WARNING: the sweep judged NOTHING — 0 of $N_PLANNED planned pairs" \
        "came back judged. $OUT is a record of a night that did not happen, not of a base" \
        "without contradictions." >> "$LOG"
+  echo "$(date -Is) triage FAILED: judged nothing (0 of $N_PLANNED planned pairs, judge $JUDGE_USED) -> $OUT" >> "$LOG"
+  exit 1
 fi
 
 echo "$(date -Is) triage done ($N_JUDGED of $N_PLANNED planned pairs judged, judge $JUDGE_USED$([ "$JUDGE_USED" = "$KHMS_JUDGE" ] || echo " = FALLBACK from $KHMS_JUDGE")) -> $OUT" >> "$LOG"

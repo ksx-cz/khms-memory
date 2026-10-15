@@ -10,8 +10,15 @@ file is ignored, and `khms_messages.py --check` lists both directions.
 JOB_MARKERS is a `|`-separated list of prompt prefixes that identify the memory pipeline's own prompts.
 A value may contain `\n` for a line break (the file grammar is one line per key). A value that must keep a
 leading or trailing space is written in quotes. Placeholders are `{name}` (str.format).
+
+A PATH IS NEVER A LITERAL (#239). A placeholder named after a setting -- `{KHMS_NIGHT_LOG}`, `{KHMS_NIGHTLY_LOCK}`,
+any `{KHMS_*}` -- is filled from the resolved configuration when the caller does not pass it. On 2026-10-15 the
+morning ping sent its reader to `logs/nightly.log`, a file nothing had written since the log moved five days
+earlier; the wording had copied the path instead of naming the setting. `--check` fails (rc 1) on a template that
+spells out a file name one of the path settings owns.
 """
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -47,17 +54,23 @@ DEFAULTS = {
                        "it does not mean there are none. FIRST run the sweep again (tools/nightly_triage.sh) and "
                        "check that the judge answers at all; only then review the triage."),
     "PING_NIGHT_RUNNING": ("THE NIGHT IS STILL RUNNING (since {hm}, night {nk}) -- review only finished units; in "
-                           "progress: {wip}; the rest after the 'nightly done' / 'nightly INCOMPLETE' line of the "
-                           "night log"),
+                           "progress: {wip}; the rest after the 'nightly done' / 'nightly INCOMPLETE' line of "
+                           "{KHMS_NIGHT_LOG}"),
     "PING_NONE": "none",
-    "PING_NIGHT_UNKNOWN": ("NIGHT STATE UNKNOWN ({line}) -- before reviewing, check in the night log that the last "
+    "PING_NIGHT_UNKNOWN": ("NIGHT STATE UNKNOWN ({line}) -- before reviewing, check in {KHMS_NIGHT_LOG} that the last "
                            "'nightly start' has its 'nightly done'"),
     "PING_NEVER": "never",
     "PING_NIGHT_MISSED": "THE NIGHT RUN DID NOT FINISH (last: {last})",
     "PING_SWEEP_FAILED": ("THE NIGHT SWEEP FAILED {n} TIMES IN A ROW (since {first}; last: {last}) -- the window "
-                          "grows every night and the same failure will repeat; find the cause in the night log "
+                          "grows every night and the same failure will repeat; find the cause in {KHMS_NIGHT_LOG} "
                           "('sweep part' / 'FAILED' lines)"),
+    # the LAST failed sweep stopped on the account's usage limit (its sweep-failed line says reason=usage-limit)
+    "PING_SWEEP_LIMIT": ("THE NIGHT SWEEP FAILED {n} TIMES IN A ROW (since {first}; last: {last}) -- the last one "
+                         "stopped on the account's usage limit, which is transient: the night needs a re-run after "
+                         "the limit resets, not a fix ('USAGE LIMIT' lines in {KHMS_NIGHT_LOG})"),
     "PING_WEEK_MISSED": "THE WEEKLY RUN DID NOT FINISH (last: {last})",
+    # KHMS_WEEK_PAUSED is set: the weekly is not failing, it is paused on purpose
+    "PING_WEEK_PAUSED": "THE WEEKLY RUN IS PAUSED ({reason}; last: {last})",
     "PING_EXTRA_ONLY": "[AUTO-PING] Project check: {extra}. Then report to {principal}.",
     "PING_EXTRA_FAILED": "PROJECT CHECK DID NOT ANSWER (rc={rc}, {cmd}): {out}",
     "PING_EXTRA_CLEAN": "clean (nothing to report)",
@@ -104,13 +117,13 @@ DEFAULTS = {
     "HOOK_INBOX_UNREVIEWED": ("KHMS: UNREVIEWED INBOX: {files} -- do the review (approve_inbox.py, "
                               "build_views.py, report) BEFORE other work."),
     "HOOK_INBOX_NIGHT_UNKNOWN": (" (Night pipeline state unknown: {exc} -- before you start, check in "
-                                 "logs/nightly.log that the last `nightly start` has its `nightly done`.)"),
+                                 "{KHMS_NIGHT_LOG} that the last `nightly start` has its `nightly done`.)"),
     "HOOK_NIGHT_RUNNING": ("KHMS: THE NIGHT PIPELINE IS RUNNING (since {start}{night}; it holds the night lock)"
                            " -- the inbox is not complete yet."),
     "HOOK_NIGHT_KEY": ", night {nk}",
     "HOOK_NIGHT_READY": " Ready for review now: {files} -- review them BEFORE other work.",
     "HOOK_NIGHT_NOTHING_READY": (" Nothing is ready for review yet; the review waits for the `nightly done` (or "
-                                 "`nightly INCOMPLETE`) line in logs/nightly.log."),
+                                 "`nightly INCOMPLETE`) line in {KHMS_NIGHT_LOG}."),
     "HOOK_NIGHT_WIP": " Written by the running night (review them after it ends): {files}.",
     "HOOK_PRECHECK_HEAD": "KHMS precheck (risky command: {tags}) -- active policies, gotchas and refuted dead ends:",
     "HOOK_PRECHECK_FOOT": "If any of it applies, open the card whole before running the command.",
@@ -191,9 +204,39 @@ def _load():
     return _LOADED
 
 
+_SETTING_FIELD = re.compile(r"\{(KHMS_[A-Z0-9_]+)\}")
+
+
+def _setting(key):
+    try:
+        return P.get(key)
+    except P.KhmsNoBaseError:        # a library import with no base selected: name the setting
+        return os.environ.get(key) or "$" + key
+
+
 def msg(key, **kw):
     text = _load()[key].replace("\\n", "\n")
+    for name in set(_SETTING_FIELD.findall(text)) - set(kw):
+        kw[name] = _setting(name)
     return text.format(**kw) if kw else text
+
+
+def path_file_names():
+    """-> the file names the path settings own (`nightly.log`, `nightly.lock`, `recall.log` ...)."""
+    names = set()
+    for _key, default in P.DEFAULTS:
+        if default and default.startswith("${") and "/" in default:
+            name = default.rsplit("/", 1)[1]
+            if "." in name or "-" in name:
+                names.add(name)
+    return names
+
+
+def literal_paths(text):
+    """-> the owned file names `text` spells out instead of naming their `{KHMS_*}` setting."""
+    plain = re.sub(r"\{[A-Za-z0-9_]+\}", " ", text)
+    return sorted(n for n in path_file_names()
+                  if re.search(r"(?<![\w-])\.?" + re.escape(n) + r"(?![\w-])", plain))
 
 
 def job_markers():
@@ -218,5 +261,12 @@ if __name__ == "__main__":
             print(f"{'override' if k in given else 'default '} {k}")
         for k in sorted(set(given) - set(DEFAULTS)):
             print(f"UNKNOWN  {k}")
-        sys.exit(0)
+        bad = 0
+        for k, v in sorted(dict(DEFAULTS, **{k: v for k, v in given.items() if k in DEFAULTS}).items()):
+            lit = literal_paths(v)
+            if lit:
+                bad += 1
+                print(f"LITERAL-PATH {k}: names {', '.join(lit)} -- write the setting's placeholder "
+                      f"({{KHMS_...}}) instead")
+        sys.exit(1 if bad else 0)
     print(__doc__.strip().split("\n\n")[0])

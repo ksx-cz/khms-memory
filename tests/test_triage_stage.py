@@ -7,6 +7,7 @@
   * the base's own language data enters through the patterns file, not the code;
   * apply_triage writes its review marker where the morning ping reads it, and a reader cannot apply.
 """
+import json
 import os
 import shutil
 import subprocess
@@ -80,6 +81,8 @@ def test_without_a_local_model_there_is_no_fallback_and_nothing_is_hidden(tmp_pa
     r, calls, out, log = stage(tmp_path, "errors", llm=False)
     assert calls == ["sonnet"] and out == "morning file, judge sonnet\n"
     assert "triage FALLBACK" not in log and "the sweep judged NOTHING" in log
+    # #239: the morning file is written AND the stage fails -- 2026-10-14 judged 0 of 250 and exited 0
+    assert r.returncode == 1 and "triage FAILED: judged nothing" in log, (r.returncode, log)
 
 
 def test_without_a_local_model_a_dead_sweep_fails_the_stage(tmp_path):
@@ -91,6 +94,48 @@ def test_without_a_local_model_a_dead_sweep_fails_the_stage(tmp_path):
 def test_a_healthy_claude_night_keeps_its_own_file(tmp_path):
     r, calls, out, log = stage(tmp_path, "ok", llm=True)
     assert r.returncode == 0 and calls == ["sonnet"] and out == "morning file, judge sonnet\n"
+
+
+def test_a_healthy_claude_night_without_a_local_model_exits_zero(tmp_path):
+    """Sibling of the judged-nothing failure: the same configuration with judged pairs is not a failure."""
+    r, calls, out, log = stage(tmp_path, "ok", llm=False)
+    assert r.returncode == 0 and calls == ["sonnet"] and "triage done (3 of 3" in log, log
+
+
+LIMIT_TEXT = "You've hit your monthly spend limit · raise it at https://example.invalid · resets 3am"
+
+
+@pytest.mark.parametrize("answer", ["limit", "error"])
+def test_an_account_usage_limit_is_its_own_outcome_not_budget(tmp_path, monkeypatch, answer):
+    """#239: on 2026-10-14 the account limit answered the first judge call and the morning file said
+    `outcomes {'BUDGET': 250}` -- the spend bound's label for an account limit that resets by itself. The
+    sibling (an ordinary CLI error) must stay an LLM-ERROR, never a limit."""
+    kc = _import(monkeypatch, tmp_path)
+    monkeypatch.setattr(kc, "JUDGE", "sonnet")
+    monkeypatch.setattr(kc, "JUDGE_BUDGET", None)
+    monkeypatch.setattr(kc, "CLAUDE_BIN", "fake-claude")
+    monkeypatch.setattr(kc, "LLM_ATTEMPTS", 1)
+    text = LIMIT_TEXT if answer == "limit" else "Internal server error"
+
+    def runner(cmd, **kw):
+        return subprocess.CompletedProcess(cmd, 1, json.dumps(
+            {"type": "result", "is_error": True, "result": text, "total_cost_usd": 0}), "")
+    monkeypatch.setattr(kc, "CLAUDE_RUNNER", runner)
+    card = {"type": "fact", "status": "active", "level": "observation", "date": "2099-01-01",
+            "body": "The widget is measured in units."}
+    by_id = {f"K-9{n:04d}": dict(card, id=f"K-9{n:04d}") for n in range(20)}
+    pairs = [{"a": f"K-9{2 * n:04d}", "b": f"K-9{2 * n + 1:04d}", "shapes": ""} for n in range(10)]
+    results = kc.adjudicate(pairs, by_id, batch=3, verbose=False)
+    if isinstance(results, tuple):
+        results = results[0]
+    outcomes = dict(kc.outcome_counts(results))
+    if answer == "limit":
+        assert outcomes == {"USAGE-LIMIT": 10}, outcomes
+        import khms_triage_report as R
+        never_sent = [codes for name, codes, _why in R.NOT_JUDGED_CLASSES if name == "never sent to the model"]
+        assert never_sent and "USAGE-LIMIT" in never_sent[0]
+    else:
+        assert "USAGE-LIMIT" not in outcomes and "BUDGET" not in outcomes, outcomes
 
 
 def _import(monkeypatch, tmp_path, **env):

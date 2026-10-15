@@ -277,11 +277,15 @@ if [ -n "$NIGHT_NOTE" ]; then PENDING="${PENDING:+$PENDING + }$NIGHT_NOTE"; fi
 # night, on a window that only grows. nightly_distill.sh appends one line per failed sweep to
 # KHMS_SWEEP_FAILED and removes the file on the next success; here it is said every morning
 # until it is gone.
+# The line carries its REASON (#239): on 2026-10-15 the sweep stopped on the account's usage limit and this
+# text said "the same failure will repeat" -- a limit that resets by itself needs a re-run, not a fix.
 if [ -s "$SFAIL" ]; then
   _sn=$(grep -c . "$SFAIL")
   _sfirst=$(head -1 "$SFAIL" | cut -d' ' -f1)
   _slast=$(tail -1 "$SFAIL" | cut -c1-200)
-  PENDING="${PENDING:+$PENDING + }$(M PING_SWEEP_FAILED n="$_sn" first="$_sfirst" last="$_slast")"
+  _skey=PING_SWEEP_FAILED
+  if tail -1 "$SFAIL" | grep -q ' reason=usage-limit\b'; then _skey=PING_SWEEP_LIMIT; fi
+  PENDING="${PENDING:+$PENDING + }$(M "$_skey" n="$_sn" first="$_sfirst" last="$_slast")"
 fi
 
 # Weekly synthesis is due seven calendar dates after completion in the scheduler
@@ -299,9 +303,16 @@ weekly_missed() {
   today_day=$(TZ=UTC0 date -d "$today" +%s)
   [ "$(((today_day - completed_day) / 86400))" -ge 8 ]
 }
+# A weekly PAUSED on purpose (KHMS_WEEK_PAUSED = the reason) is said as paused (#239): on 2026-10-15 the ping
+# said "did not finish" about a weekly the principal had paused two days earlier -- an alarm nobody can act on.
+WPAUSED="$(khms_get KHMS_WEEK_PAUSED)"
 if weekly_missed; then
   WLAST=$([ -f "$WSTAMP" ] && cat "$WSTAMP" || M PING_NEVER)
-  PENDING="${PENDING:+$PENDING + }$(M PING_WEEK_MISSED last="$WLAST")"
+  if [ -n "$WPAUSED" ]; then
+    PENDING="${PENDING:+$PENDING + }$(M PING_WEEK_PAUSED reason="$WPAUSED" last="$WLAST")"
+  else
+    PENDING="${PENDING:+$PENDING + }$(M PING_WEEK_MISSED last="$WLAST")"
+  fi
 fi
 
 # ---------------------------------------------------------------------------

@@ -262,3 +262,22 @@ def test_a_candidate_missing_the_fields_is_still_flagged(tmp_path, monkeypatch):
     prose_type = DECLARED.replace("type: fact\n", "type: observation (design finding)\n")
     flags, _m = _flags(ci, prose_type)
     assert "t" in flags, flags
+
+
+# --- #239: a `#` inside a declared value is content, not a YAML comment ----------------------------------------
+# The night writes `source: journal/D.md:585 (agent #143)` unquoted; read as YAML the value ended at ` #` and the
+# card was approved with `source: journal/D.md:585 (agent`. The control line has no `#` and must not change.
+def test_a_hash_in_a_declared_source_round_trips_into_the_approve_card(tmp_path, monkeypatch):
+    import yaml
+    _ci, base, pat = load(tmp_path, monkeypatch)
+    wanted = "journal/2099-01-01.md:585 (helper #143)"
+    src = tmp_path / "2099-01-01.md"
+    text = DECLARED.replace("source: journal 2099-01-01", f"source: {wanted}")
+    text += "\n" + DECLARED.replace("### C1:", "### C2:").replace("## Cards\n\n", "")
+    src.write_text(text, encoding="utf-8")
+    env = dict(os.environ, KHMS_ROOT=str(base), KHMS_PATTERNS=str(pat))
+    r = subprocess.run([sys.executable, os.path.join(TOOLS, "convert_inbox2.py"), str(src), "--quiet"],
+                       capture_output=True, text=True, env=env, timeout=60)
+    out = (tmp_path / "2099-01-01.approve.md").read_text(encoding="utf-8")
+    sources = [yaml.safe_load(ln)["source"] for ln in out.splitlines() if ln.startswith("source:")]
+    assert sources == [wanted, "journal 2099-01-01"], (sources, r.stdout + r.stderr)

@@ -7,6 +7,7 @@ watchdogs on the night/week stamps and the failed-sweep file -- each in the reso
 """
 import os
 import subprocess
+import sys
 import time
 import shutil
 from datetime import datetime, timedelta
@@ -241,3 +242,47 @@ def test_repeated_weekly_success_has_no_dst_false_alarm(tmp_path, base, start):
         if day % 7 == 0:
             completed = morning + timedelta(hours=1 + day % 3)
             os.utime(weekly, (completed.timestamp(),) * 2)
+
+
+# --- #239: the ping names the live log, says WHY the sweep failed, and a paused weekly is paused ------------
+def _pending(p):
+    return [ln for ln in p.stdout.splitlines() if ln.startswith("DRY-RUN pending:")][0]
+
+
+@pytest.mark.parametrize("reason,word", [("usage-limit", "usage limit"), ("failed", "will repeat")])
+def test_a_failed_sweep_is_said_with_its_reason_and_the_live_log_path(tmp_path, base, reason, word):
+    shared = base / "state" / "shared"
+    (shared / "sweep-failed").write_text(f"2031-05-06T00:02 reason={reason} night=2031-05-06 parts=4 kept=0\n")
+    p = ping(tmp_path, base, KHMS_PING_DRYRUN="1")
+    pend = _pending(p)
+    assert word in pend, pend
+    assert ("usage limit" in pend) == (reason == "usage-limit"), pend
+    # the log the night really writes (KHMS_NIGHT_LOG = KHMS_STATE/nightly.log), never a copied literal
+    assert str(tmp_path / "agent" / "nightly.log") in pend and "logs/nightly.log" not in pend, pend
+
+
+def test_a_paused_weekly_is_said_as_paused_not_as_failed(tmp_path, base):
+    (base / "state" / "shared" / "last-weekly").unlink()
+    p = ping(tmp_path, base, KHMS_PING_DRYRUN="1", KHMS_WEEK_PAUSED="paused by the principal 2031-05-01")
+    pend = _pending(p)
+    assert "THE WEEKLY RUN IS PAUSED (paused by the principal 2031-05-01; last: never)" in pend, pend
+    assert "DID NOT FINISH" not in pend, pend
+
+
+def test_a_message_that_spells_out_a_configured_path_fails_the_check(tmp_path):
+    """The wording names the SETTING ({KHMS_NIGHT_LOG}); a copied path goes stale when the setting moves."""
+    cfg = tmp_path / "cfg"
+    cfg.mkdir()
+    env = {k: v for k, v in os.environ.items() if not k.startswith("KHMS_")}
+    env.update(KHMS_ROOT=str(tmp_path / "base"), KHMS_CONFIG_DIR=str(cfg))
+    check = [sys.executable, os.path.join(TOOLS, "khms_messages.py"), "--check"]
+    r = subprocess.run(check, env=env, capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0 and "LITERAL-PATH" not in r.stdout, r.stdout + r.stderr   # the shipped defaults
+    (cfg / "messages.env").write_text(
+        "PING_SWEEP_FAILED=failed {n}x ({first}; {last}) -- see logs/nightly.log\n"
+        "HOOK_NIGHT_RUNNING=running since {start}{night}; it holds tools/.nightly.lock\n"
+        "PING_WEEK_MISSED=weekly missed (last: {last}); see {KHMS_NIGHT_LOG}\n", encoding="utf-8")
+    r = subprocess.run(check, env=env, capture_output=True, text=True, timeout=60)
+    lit = [ln for ln in r.stdout.splitlines() if ln.startswith("LITERAL-PATH")]
+    assert r.returncode == 1 and len(lit) == 2, r.stdout
+    assert "PING_SWEEP_FAILED" in lit[0] + lit[1] and "HOOK_NIGHT_RUNNING" in lit[0] + lit[1], lit

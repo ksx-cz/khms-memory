@@ -1029,8 +1029,15 @@ fi
 
 if [ "$SWEEP_OK" -ne 1 ]; then
   FAILED_STAGES="$FAILED_STAGES sweep"
-  # One line per failed sweep; read aloud by a morning review ping, removed on success.
-  echo "$RUN_START night=$NK window-since=$SINCE parts=${#SWEEP_GROUP_FILES[@]}${_kept:+ kept=$_kept} frozen=${PREP_DIR:-none} digest=${SIZE}B${SOURCE_FAILED:+ sources-failed=$SOURCE_FAILED}" >> "$SWEEP_FAILED_FILE"
+  # One line per failed sweep; read aloud by a morning review ping, removed on success. Its second field is
+  # the REASON (#239): usage-limit when the account's limit stopped it (the ping then says "transient, re-run"),
+  # failed otherwise -- on 2026-10-15 a limit night was announced as a failure that "will repeat".
+  _sreason=failed _slimit=""
+  if [ -s "$RETRY_LIMIT_FLAG" ]; then
+    _sreason=usage-limit
+    _slimit=" limit=\"$(head -1 "$RETRY_LIMIT_FLAG" | cut -d' ' -f2- | tr -d '"' | cut -c1-120)\""
+  fi
+  echo "$RUN_START reason=$_sreason night=$NK window-since=$SINCE parts=${#SWEEP_GROUP_FILES[@]}${_kept:+ kept=$_kept} frozen=${PREP_DIR:-none} digest=${SIZE}B${SOURCE_FAILED:+ sources-failed=$SOURCE_FAILED}$_slimit" >> "$SWEEP_FAILED_FILE"
   _nfail=$(grep -c . "$SWEEP_FAILED_FILE" 2>/dev/null || echo 1)
   if [ "$_nfail" -ge 2 ]; then
     echo "$(date -Is) SWEEP FAILED ${_nfail} NIGHTS IN A ROW (first: $(head -1 "$SWEEP_FAILED_FILE" | cut -d' ' -f1)) — the window since $SINCE keeps growing; a part that fails every night needs a human, see $SWEEP_FAILED_FILE" >> "$LOG"

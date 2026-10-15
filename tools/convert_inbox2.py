@@ -760,6 +760,18 @@ def _put(meta, key, val):
         meta[key] = val
 
 
+def _protect_hash(ln):
+    """A top-level `key: value` line whose PLAIN (unquoted, non-flow) value holds a `#`
+    that YAML would read as a comment -> the same line with the value quoted, else `ln`."""
+    m = META_LINE_RE.match(ln)
+    if not m:
+        return ln
+    raw = m.group(2).strip()
+    if not raw or raw[0] in "'\"[{|>&*!" or not (raw.startswith("#") or " #" in raw):
+        return ln
+    return _yaml_line(m.group(1), raw)
+
+
 def merge_legacy_meta(meta_lines, meta):
     """Fold an existing meta block (fenced ```yaml or bare lines) into the dict.
 
@@ -776,7 +788,15 @@ def merge_legacy_meta(meta_lines, meta):
     IS needed as a fallback, because an unquoted colon inside a value makes the
     whole block unparseable — the 2026-08-05 failure that silently dropped 12 of
     69 cards — and one bad line must not cost the other nine.
+
+    A `#` in a value is CONTENT, never a YAML comment: the night writes
+    `source: journal/D.md:585 (agent #143)` unquoted, and a plain YAML scalar
+    ends at ` #` — the card got `source: journal/D.md:585 (agent` (#239,
+    measured on a real unit: 45 rows in one morning). Such a line is re-quoted
+    first (`_protect_hash`), so both the block parse and the per-line fallback
+    read the whole value.
     """
+    meta_lines = [_protect_hash(ln) for ln in meta_lines]
     block = "\n".join(meta_lines)
     try:
         parsed = yaml.safe_load(block)
