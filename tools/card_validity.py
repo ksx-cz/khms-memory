@@ -43,7 +43,7 @@ Subcommands:
   backfill   --know DIR --calib sonnet.jsonl --date D                  ledger lines for a calibration
   sample     --know DIR --seed S [--n 100 --against sample.json]       draw past the ledger, judge nothing
   run        --know DIR --sandbox DIR --out DIR --seed S [--n 100]     draw, mechanical, value flag, judge
-  proposals  --know DIR --out FILE --results LABEL=FILE ...            K-05297 routes + commands
+  proposals  --know DIR --out FILE --results LABEL=FILE ... [--parts N] K-05297 routes + commands
 
 THE CHECKED LEDGER (`run`, `sample`, `backfill`; default <know>/../ledger/validity.jsonl): one append-only
 line per judged card -- id, sha256 of the card file as judged, date, judge, prompt version, verdict,
@@ -1676,10 +1676,18 @@ def cmd_proposals(a):
         lines += [verdict_line(results), ""]
     if a.dry_run_errata:
         dry_run_errata(rows)
-    lines += proposal_table(rows)
     with open(a.out, "w", encoding="utf-8") as fh:
-        fh.write("\n".join(lines) + "\n")
+        fh.write("\n".join(lines + proposal_table(rows)) + "\n")
     print(f"PROPOSALS {len(rows)} row(s) -> {a.out}")
+    if a.parts and rows:
+        # one file per verifier: row i goes to part (i mod N) + 1, the same header, verdict line and per-row
+        # command blocks as the whole file; never an empty part (fewer rows than N = fewer parts)
+        stem, ext = os.path.splitext(a.out)
+        n = min(a.parts, len(rows))
+        for k in range(n):
+            with open(f"{stem}-part{k + 1}{ext}", "w", encoding="utf-8") as fh:
+                fh.write("\n".join(lines + proposal_table(rows[k::n])) + "\n")
+        print(f"PARTS {n} -> {stem}-part1..{n}{ext}")
     if results:
         print(verdict_line(results))
     return 0
@@ -1750,6 +1758,8 @@ def main(argv=None):
     pr.add_argument("--dry-run-errata", action="store_true",
                     help="run each erratum command with --dry-run and show its verdict line")
     pr.add_argument("--summary-of", help="the LABEL whose results the VERDICTS line counts")
+    pr.add_argument("--parts", type=int, default=0, help="also split the rows round-robin into N files "
+                    "<out stem>-part<k>.md (0 = no split)")
     pr.add_argument("--only-verdict", action="append", help="LABEL:VERDICT -- keep only that verdict of that "
                     "file, e.g. calib:no-longer-holds")
     a = ap.parse_args(argv)

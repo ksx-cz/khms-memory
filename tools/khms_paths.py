@@ -134,6 +134,9 @@ DEFAULTS = [
     ("KHMS_JUDGE", "sonnet"),              # pair judge of record: qwen (local KHMS_LLM_URL) | a KHMS_AGENT model
     ("KHMS_JUDGE_MAX_USD", ""),            # estimated per-night bound of a paid judge ("" = no bound)
     ("KHMS_MARK_MAX_USD", ""),             # the MARK stage's dollar cap per night (#243; "" = 100, 0 = no cap)
+    # --- daily card-validity judge (khms_validity_daily.sh, #219) ----------------------------------------
+    ("KHMS_VALIDITY_TREES", ""),           # the trees the judge reads: NAME=git:REPO@REV | NAME=dir:PATH ... ("" = refuse)
+    ("KHMS_VALIDITY_DIR", "${KHMS_ROOT}/plans/card-validity/daily"),  # one <date>/ per batch, APPLIED when applied
     ("KHMS_LLM_URL", ""),                  # local model endpoint (Ollama /api/generate; "" = no local model)
     ("KHMS_LLM_MODEL", "qwen3-coder-next:latest"),               # the local model's name
     ("KHMS_REPORT_TOOL", ""),                               # regex of the report tool ("" = built-in default)

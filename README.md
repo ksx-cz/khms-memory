@@ -253,3 +253,16 @@ parts than one night's `SWEEP_BUDGET_MIN` covers, the finished parts are kept:
   so redoing just its part could not be shown to sweep the window. The ledger
   grounding `nightly-<night key>-journals-ledger.md` is not frozen — a resume
   refreshes it on purpose (journals only grow).
+
+### The daily card-validity judge (#219)
+
+`khms_validity_daily.sh` (run once a day by the deployment's scheduler, after the morning ping) checks
+approved cards against today's trees, N cards a day (`--n`, default 500) that the checked ledger has not
+seen at their current content, until the base is through. It builds a fresh read-only sandbox of the trees
+named by `KHMS_VALIDITY_TREES` (`NAME=git:REPO@REV` or `NAME=dir:PATH`, space-separated; unset = the job
+refuses), runs `card_validity.py run` (seed = the date, `--max-usd` default 30) and `proposals --parts 4`
+into `KHMS_VALIDITY_DIR/<date>/`, and writes one line into the night log: `VALIDITY <date>: sampled=…
+<verdicts> cost=$… parts=… rows=…`, or `WAITING …`, `DONE — no eligible cards left`, `FAILED <reason>`.
+It only judges and proposes: verifying the part files and applying them is the reviewer's work, who then
+writes `<date>/APPLIED`. Until that marker exists no new batch is judged, and the morning ping names every
+waiting batch (`validity batch <date>: 4 parts ready for verification`) and repeats the last status line.

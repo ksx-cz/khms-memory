@@ -73,6 +73,12 @@ DEFAULTS = {
     # the last night's MARK stage stopped at its dollar cap (#243; permark.py's `MARK stage stopped at the $ cap`)
     "PING_MARK_CAP": ("THE MARK STAGE STOPPED AT ITS $ CAP ({spent} of {cap}); {n} mark(s) stay OPEN for the next "
                       "night -- not a failure, the cap is MARK_BUDGET_USD ('MARK stage stopped' in {KHMS_NIGHT_LOG})"),
+    # the daily card-validity judge (#219, khms_validity_daily.sh): a batch whose parts wait for verification
+    # (until {dir}/APPLIED exists), a last run that failed, and the last status line riding on the message
+    "PING_VALIDITY_READY": ("validity batch {date}: {n} parts ready for verification ({dir}/proposals-part*.md; "
+                            "write {dir}/APPLIED once applied -- the next batch waits for it)"),
+    "PING_VALIDITY_FAILED": "THE DAILY CARD-VALIDITY RUN FAILED ({line}; see {KHMS_NIGHT_LOG})",
+    "PING_VALIDITY_LAST": "LAST CARD-VALIDITY RUN: {line}",
     "PING_WEEK_MISSED": "THE WEEKLY RUN DID NOT FINISH (last: {last})",
     # KHMS_WEEK_PAUSED is set: the weekly is not failing, it is paused on purpose
     "PING_WEEK_PAUSED": "THE WEEKLY RUN IS PAUSED ({reason}; last: {last})",

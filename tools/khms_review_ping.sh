@@ -5,7 +5,7 @@
 # the night (it waits for a night that is still running, see below).
 #
 # WHERE THINGS ARE (khms_paths.sh): the base KHMS_ROOT; review markers KHMS_SHARED_STATE/reviewed; stamps
-# KHMS_NIGHT_STAMP / KHMS_WEEK_STAMP; failed sweeps KHMS_SWEEP_FAILED.
+# KHMS_NIGHT_STAMP / KHMS_WEEK_STAMP; failed sweeps KHMS_SWEEP_FAILED; daily validity batches KHMS_VALIDITY_DIR.
 # DELIVERY (optional) -- KHMS_PING_SEND: argv that reads the ping text on stdin and delivers it. rc 0 =
 #   delivered, rc 3 = the recipient is not there (logged, not an error), anything else = a failed delivery.
 #   For a terminal agent in tmux: `khms_ping_tmux.sh <session>`. Empty = the text is only printed.
@@ -300,6 +300,26 @@ if [ -n "$_cap" ]; then
   PENDING="${PENDING:+$PENDING + }$(M PING_MARK_CAP spent="$_cspent" cap="$_ccap" n="$_cn")"
 fi
 
+# THE DAILY CARD-VALIDITY BATCH (#219). khms_validity_daily.sh judges a batch a day into KHMS_VALIDITY_DIR/<date>/
+# and splits its proposal rows into part files for verification; the batch waits until its APPLIED marker
+# exists, and the next one is not judged before that. So every batch with parts and no marker is something to
+# do this morning -- read from the directory, not from a log line that could be stale. The job's last status
+# line (night log) rides on the message; a FAILED one is an alarm by itself.
+VDIR="$(khms_get KHMS_VALIDITY_DIR)"
+for _vd in "$VDIR"/*/; do
+  [ -d "$_vd" ] || continue
+  _vd="${_vd%/}"
+  [ -e "$_vd/APPLIED" ] && continue
+  _vn=0
+  for _vf in "$_vd"/proposals-part*.md; do [ -f "$_vf" ] && _vn=$((_vn + 1)); done
+  [ "$_vn" -gt 0 ] || continue
+  PENDING="${PENDING:+$PENDING + }$(M PING_VALIDITY_READY date="$(basename "$_vd")" n="$_vn" dir="$_vd")"
+done
+VLINE="$(grep -E '^[^ ]+ VALIDITY [0-9-]+: ' "$NIGHT_LOG" 2>/dev/null | tail -1 | cut -d' ' -f2- | cut -c1-300)"
+case "$VLINE" in
+  *": FAILED"*) PENDING="${PENDING:+$PENDING + }$(M PING_VALIDITY_FAILED line="$VLINE")"; VLINE="" ;;
+esac
+
 # Weekly synthesis is due seven calendar dates after completion in the scheduler
 # timezone (inherited TZ, otherwise host timezone). A morning ping can precede
 # that day's completion: alarm only once the whole due date has passed, at +8.
@@ -387,6 +407,9 @@ fi
 MODELS="$(python3 "$CODE/agent_result.py" --night-log "$(khms_get KHMS_NIGHT_LOG)" 2>/dev/null || true)"
 if [ -n "$MSG" ] && [ -n "$MODELS" ]; then
   MSG="$MSG  ||  $(M PING_MODELS models="$MODELS")"
+fi
+if [ -n "$MSG" ] && [ -n "$VLINE" ]; then
+  MSG="$MSG  ||  $(M PING_VALIDITY_LAST line="$VLINE")"
 fi
 # --dry-run: print what would be sent and exit. Use this when testing from inside
 # a session -- a live delivery types into the agent's OWN input box while it is busy,
