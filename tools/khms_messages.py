@@ -27,6 +27,8 @@ import khms_paths as P  # noqa: E402
 DEFAULTS = {
     "GLOSSARY_LABEL": "(glossary: +{terms})",
     "NOT_IN_BASE": "(not in the base)",
+    # card_validity.py proposals: the route of a card the judge found not to be know-how
+    "VALIDITY_RETIRE_CANDIDATE": "retire candidate (a retired status is not designed yet)",
     "SELECT_HEADER": "KHMS (auto-recall -- cards relevant to what is being worked on):",
     "SELECT_FOOTER": "If a card is relevant: open it whole (memory/know/<id>.md) and follow its links.",
     # card-line prefixes of an injection: the principle umbrella served beside a card, the corrector served

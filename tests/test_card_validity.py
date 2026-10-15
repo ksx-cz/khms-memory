@@ -14,6 +14,14 @@ Guarded properties:
       a model that keeps quoting wrong ends as `unverified`, never as its own verdict.
   (5) SAMPLE / PROPOSALS / INTERVAL: the calibration sample is deterministic and stratified by month;
       only a no-longer-holds verdict both legs agree on (or the paid leg alone, flagged) is proposed.
+  (6) CHECKED LEDGER: one append-only line per judged card (id, sha256 of the card file, date, judge,
+      prompt version, verdict, know-how, reason, evidence); a draw skips every card whose CURRENT hash
+      has a ledger line, so a card changed since (an erratum) is eligible again; the calibration backfill
+      is idempotent.
+  (7) V2 PROMPT: the same judge call also answers "is this card know-how?" -- `knowhow` yes|no is part of
+      the schema; a missing or other value goes back as an error.
+  (8) RUN / PROPOSALS: the run stops submitting at the dollar cap; every card that is not "holds" or not
+      know-how gets one proposal row with its K-05297 route and the exact command (or a draft).
 Every tree, card and repository is built in a temporary directory; nothing reads a real base.
 """
 import json
@@ -21,6 +29,7 @@ import os
 import shutil
 import subprocess
 import sys
+import re
 import tempfile
 import unittest
 
@@ -139,6 +148,8 @@ GOOD = {
     "verdict": "holds",
     "false_sentence": "",
     "suggested_path": "none",
+    "knowhow": "yes",
+    "knowhow_reason": "names the one entry point a future agent must use",
 }
 
 
@@ -330,6 +341,171 @@ class SampleAndReport(unittest.TestCase):
         self.assertAlmostEqual(lo, 0.0435, places=3)
         self.assertAlmostEqual(hi, 0.2136, places=3)
         self.assertEqual(CV.wilson(0, 0), (0.0, 0.0))
+
+class Ledger(unittest.TestCase):
+    """The checked ledger: which cards were judged, at which content, so a draw never repeats one."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="khms-validity-ledger-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.know = os.path.join(self.tmp, "memory", "know")
+        os.makedirs(self.know)
+        self.ledger = os.path.join(self.tmp, "memory", "ledger", "validity.jsonl")
+        for i in range(1, 21):
+            status = "challenged" if i % 5 == 0 else ("superseded" if i == 7 else "active")
+            write(self.know, f"K-{i:05d}.md", card_text(f"K-{i:05d}", typ="principle" if i % 3 else "fact",
+                                                        status=status, body=f"claim number {i}\n"))
+
+    def cards(self):
+        return CV.load_cards(self.know)
+
+    def result(self, verdict="holds", knowhow="yes", cost=0.04):
+        return {"verdict": verdict, "attempts": 1, "cost_usd": cost, "wall_s": 9.0,
+                "answer": {"verdict": verdict, "knowhow": knowhow, "knowhow_reason": "why",
+                           "suggested_path": "none", "false_sentence": "",
+                           "subclaims": [{"claim": "c", "verdict": verdict, "reason": "the file says so",
+                                          "evidence": [{"command": "ls a", "exit_code": 0,
+                                                        "output_quote": "a"}]}]}}
+
+    def test_load_cards_carries_the_file_hash(self):
+        import hashlib
+        c = {x["id"]: x for x in self.cards()}["K-00003"]
+        with open(os.path.join(self.know, "K-00003.md"), "rb") as fh:
+            self.assertEqual(c["sha256"], hashlib.sha256(fh.read()).hexdigest())
+
+    def test_ledger_append_writes_one_line_per_judged_card(self):
+        c = {x["id"]: x for x in self.cards()}["K-00003"]
+        line = CV.ledger_line(c, self.result("no-longer-holds", "no"), judge="sonnet", prompt_version="v2",
+                              date="2026-10-15", value_flag="K-00003: states a value", run="seed=5")
+        CV.append_ledger(self.ledger, [line])
+        CV.append_ledger(self.ledger, [CV.ledger_line(c, self.result(), judge="sonnet", prompt_version="v2",
+                                                      date="2026-10-16")])
+        rows = CV.read_ledger(self.ledger)
+        self.assertEqual(len(rows), 2)                      # append-only: the first line is still there
+        r = rows[0]
+        for key, want in (("id", "K-00003"), ("sha256", c["sha256"]), ("date", "2026-10-15"),
+                          ("judge", "sonnet"), ("prompt_version", "v2"), ("verdict", "no-longer-holds"),
+                          ("knowhow", "no"), ("reason", "the file says so"),
+                          ("value_flag", "K-00003: states a value")):
+            self.assertEqual(r[key], want, key)
+        self.assertEqual(r["evidence"][0]["command"], "ls a")
+
+    def test_sampling_skips_every_card_whose_hash_is_in_the_ledger(self):
+        cards = self.cards()
+        pool = CV.eligible_cards(cards, [], statuses=("active", "challenged"))
+        self.assertEqual(len(pool), 19)                     # K-00007 is superseded, every type counts
+        first = CV.select_uniform(pool, 8, seed=11)
+        self.assertEqual(len(first), 8)
+        self.assertEqual([c["id"] for c in first], [c["id"] for c in CV.select_uniform(pool, 8, seed=11)])
+        CV.append_ledger(self.ledger, [CV.ledger_line(c, self.result(), "sonnet", "v2", "2026-10-15")
+                                       for c in first])
+        pool2 = CV.eligible_cards(self.cards(), CV.read_ledger(self.ledger), statuses=("active", "challenged"))
+        self.assertEqual(len(pool2), 11)
+        again = CV.select_uniform(pool2, 8, seed=11)
+        self.assertFalse({c["id"] for c in again} & {c["id"] for c in first})
+
+    def test_a_changed_card_becomes_eligible_again(self):
+        c = {x["id"]: x for x in self.cards()}["K-00004"]
+        CV.append_ledger(self.ledger, [CV.ledger_line(c, self.result(), "sonnet", "v2", "2026-10-15")])
+        ids = lambda: {x["id"] for x in CV.eligible_cards(self.cards(), CV.read_ledger(self.ledger))}
+        self.assertNotIn("K-00004", ids())
+        with open(os.path.join(self.know, "K-00004.md"), "a", encoding="utf-8") as fh:
+            fh.write("[ERRATUM TS-00001] corrected\n")
+        self.assertIn("K-00004", ids())
+
+    def test_backfill_is_idempotent(self):
+        calib = os.path.join(self.tmp, "sonnet.jsonl")
+        with open(calib, "w", encoding="utf-8") as fh:
+            for cid, v in (("K-00001", "holds"), ("K-00002", "no-longer-holds"), ("K-00099", "holds")):
+                r = self.result(v)
+                del r["answer"]["knowhow"]
+                fh.write(json.dumps(dict(r, id=cid)) + "\n")
+        n1 = CV.backfill(self.ledger, calib, self.cards(), date="2026-10-12")
+        n2 = CV.backfill(self.ledger, calib, self.cards(), date="2026-10-12")
+        self.assertEqual((n1, n2), (2, 0))                  # K-00099 is not in the base: no line
+        rows = CV.read_ledger(self.ledger)
+        self.assertEqual([r["id"] for r in rows], ["K-00001", "K-00002"])
+        self.assertTrue(all(r["prompt_version"] == "v1-calib" for r in rows))
+        self.assertEqual(rows[1]["verdict"], "no-longer-holds")
+        self.assertIsNone(rows[0]["knowhow"])
+        self.assertNotIn("K-00001", {x["id"] for x in CV.eligible_cards(self.cards(), rows)})
+
+
+class KnowHowV2(Fixture):
+    def card(self):
+        return CV.parse_card(card_text(body=CARD_BODY.format(sha=self.sha)), "K-00001.md")
+
+    def test_v2_knowhow_field_is_required_and_parsed(self):
+        ans = json.loads(json.dumps(GOOD))
+        del ans["knowhow"]
+        self.assertTrue(any("knowhow" in e for e in CV.check_answer(ans, self.card(), self.root)))
+        ans["knowhow"] = "maybe"
+        self.assertTrue(any("knowhow" in e for e in CV.check_answer(ans, self.card(), self.root)))
+        ans["knowhow"] = "no"
+        self.assertEqual(CV.check_answer(ans, self.card(), self.root), [])
+        res = CV.judge_card(self.card(), FakeModel([ans]), self.root, anchors=[], max_retries=0)
+        self.assertEqual(res["verdict"], "holds")
+        line = CV.ledger_line(dict(self.card(), sha256="0" * 64), res, "sonnet", CV.PROMPT_VERSION, "2026-10-15")
+        self.assertEqual((line["knowhow"], line["prompt_version"]), ("no", "v2"))
+
+    def test_the_prompt_asks_the_knowhow_question_in_the_same_call(self):
+        model = FakeModel([GOOD])
+        CV.judge_card(self.card(), model, self.root, anchors=[], max_retries=0)
+        self.assertEqual(len(model.prompts), 1)
+        for needle in ("knowhow", "act differently", "status"):
+            self.assertIn(needle, model.prompts[0].lower())
+
+
+class RunAndProposals(Fixture):
+    def test_judging_stops_submitting_at_the_dollar_cap(self):
+        cards = [CV.parse_card(card_text(f"K-0000{i}", body=CARD_BODY.format(sha=self.sha)), f"K-0000{i}.md")
+                 for i in range(1, 6)]
+
+        def model(prompt):
+            cid = re.search(r"THE CARD (K-\d+)", prompt).group(1)
+            return json.dumps(dict(GOOD, card_id=cid)), {"cost_usd": 0.6}
+        seen = []
+        done, stopped = CV.judge_many(cards, model, self.root, {}, workers=1, max_usd=1.0,
+                                      on_result=lambda c, r: seen.append(c["id"]))
+        self.assertTrue(stopped)
+        self.assertEqual(seen, ["K-00001", "K-00002"])       # $1.20 > $1.00 after the second: no third call
+        self.assertEqual(len(done), 2)
+
+    def test_proposal_rows_carry_the_route_and_the_exact_command(self):
+        def res(verdict, path="none", knowhow="yes", sentence="", cmd="grep -n key proj/nav/config/params.yaml"):
+            return {"verdict": verdict, "answer": {
+                "verdict": verdict, "knowhow": knowhow, "suggested_path": path, "false_sentence": sentence,
+                "subclaims": [{"claim": "c", "verdict": verdict, "reason": "value is 1.74 now",
+                               "evidence": [{"command": cmd, "exit_code": 0, "output_quote": "1.74"}]}]}}
+        wrong = CV.proposal_row("K-1", res("no-longer-holds", "erratum-wrong-record", sentence="It's 1.47."))
+        self.assertIn("khms_erratum.py declare --card K-1", wrong["command"])
+        self.assertIn("--kind wrong-record", wrong["command"])
+        self.assertIn("--by coordinator", wrong["command"])
+        self.assertIn("'It'\"'\"'s 1.47.'", wrong["command"])    # shell-quoted, runnable as written
+        moved = CV.proposal_row("K-2", res("no-longer-holds", "dated-pointer", sentence="radius 1.47"),
+                                value_flag="K-2: states a value the repo holds: min_turning_radius — card says "
+                                           "1.47, repo says 1.74 (nav/config/params.yaml:1) — stale value?")
+        self.assertIn("--kind dated-pointer", moved["command"])
+        self.assertIn("--source 'min_turning_radius in nav/config/params.yaml'", moved["command"])
+        sup = CV.proposal_row("K-3", res("no-longer-holds", "supersede", sentence="old mechanism"))
+        self.assertIn("SUPERSEDES K-3 BECAUSE", sup["command"])
+        self.assertEqual(sup["route"], "supersede")
+        nk = CV.proposal_row("K-4", res("holds", knowhow="no"))
+        self.assertEqual(nk["route"], "retire-candidate")
+        self.assertIn("retire candidate", nk["command"])
+        self.assertIsNone(CV.proposal_row("K-5", res("holds")))
+        both = CV.proposal_row("K-6", res("no-longer-holds", "supersede", knowhow="no", sentence="x"))
+        self.assertIn("retire candidate", both["command"])  # not know-how outranks rewriting it
+        lines = CV.proposal_table([wrong, moved, sup, nk])
+        self.assertEqual(sum(1 for l in lines if l.startswith("| K-")), 4)
+
+    def test_summary_line_counts_verdicts_knowhow_and_cost(self):
+        rows = [{"verdict": "holds", "cost_usd": 0.05, "answer": {"knowhow": "yes"}},
+                {"verdict": "no-longer-holds", "cost_usd": 0.04, "answer": {"knowhow": "no"}},
+                {"verdict": "cannot-check-offline", "cost_usd": 0.03, "answer": {"knowhow": "yes"}},
+                {"verdict": "unverified", "cost_usd": 0.10, "answer": None}]
+        self.assertEqual(CV.verdict_line(rows), "VERDICTS holds=1 no-longer-holds=1 cannot-check=1 unverified=1 "
+                                                "knowhow-no=1 cost=$0.2200")
 
 
 if __name__ == "__main__":

@@ -40,6 +40,19 @@ Subcommands:
   mechanical --know DIR --sandbox DIR [--out FILE]                     anchors of every active card
   calibrate  --know DIR --sandbox DIR --out DIR [--n 50 --seed 219]    sample, both legs, report
   report     --out DIR                                                 rebuild the report from the legs
+  backfill   --know DIR --calib sonnet.jsonl --date D                  ledger lines for a calibration
+  sample     --know DIR --seed S [--n 100 --against sample.json]       draw past the ledger, judge nothing
+  run        --know DIR --sandbox DIR --out DIR --seed S [--n 100]     draw, mechanical, value flag, judge
+  proposals  --know DIR --out FILE --results LABEL=FILE ...            K-05297 routes + commands
+
+THE CHECKED LEDGER (`run`, `sample`, `backfill`; default <know>/../ledger/validity.jsonl): one append-only
+line per judged card -- id, sha256 of the card file as judged, date, judge, prompt version, verdict,
+knowhow, reason, evidence, the repo-value flag. A draw (uniform, seeded, statuses active+challenged by
+default) skips every card whose CURRENT hash has a line, so a card that changed since is eligible again.
+Prompt v2 asks, in the same call, whether the card is know-how (would a future agent act differently?)
+or only status/progress. `run` judges with the paid leg only, at most 4 calls in flight, and stops
+submitting once its spend passes --max-usd (exit 3). The base itself (cards, inbox, status) is never
+written; only the ledger and --out are.
 
 Outputs of `calibrate` (all in --out): mechanical.jsonl, mechanical-summary.json, sample.json,
 qwen.jsonl, sonnet.jsonl, calibration.md, summary.json and proposals.md -- one line per no-longer-holds
@@ -49,6 +62,7 @@ suggested path (erratum wrong-record / dated-pointer / supersede). Nothing is wr
 import argparse
 import concurrent.futures
 import datetime
+import hashlib
 import json
 import math
 import os
@@ -69,6 +83,9 @@ import yaml
 
 ACTIVE_TYPES = ("fact", "action→outcome", "problem→solution")
 VERDICTS = ("holds", "no-longer-holds", "cannot-check-offline")
+KNOWHOW = ("yes", "no")
+PROMPT_VERSION = "v2"           # v1 = the 2026-10-11 calibration prompt; v2 adds the know-how question
+DRAW_STATUSES = ("active", "challenged")
 PATHS = ("none", "erratum-wrong-record", "dated-pointer", "supersede")
 STATUSES = ("exists", "moved", "gone", "line-gone", "absent", "external", "unchecked")
 
@@ -86,20 +103,24 @@ def parse_card(text, name):
     body = text[end + 4:].lstrip("\n")
     cid = str(meta.get("id") or os.path.splitext(os.path.basename(name))[0])
     return {"id": cid, "type": str(meta.get("type") or ""), "status": str(meta.get("status") or ""),
-            "date": str(meta.get("date") or ""), "body": body, "text": text, "name": name}
+            "date": str(meta.get("date") or ""), "body": body, "text": text, "name": name, "meta": meta}
 
 
 def load_cards(know):
+    """Every parseable card of `know`; each carries `sha256` of the file's bytes as read -- the content the
+    judge sees is the content the ledger names."""
     out = []
     for f in sorted(os.listdir(know)):
         if not re.fullmatch(r"K-\d+\.md", f):
             continue
-        with open(os.path.join(know, f), encoding="utf-8", errors="replace") as fh:
-            text = fh.read()
+        with open(os.path.join(know, f), "rb") as fh:
+            raw = fh.read()
         try:
-            out.append(parse_card(text, f))
+            card = parse_card(raw.decode("utf-8", errors="replace"), f)
         except (ValueError, yaml.YAMLError):
             continue
+        card["sha256"] = hashlib.sha256(raw).hexdigest()
+        out.append(card)
     return out
 
 
@@ -492,6 +513,8 @@ ANSWER_EXAMPLE = {
     "verdict": "no-longer-holds",
     "false_sentence": "copy one sentence of the card here, exactly as written",
     "suggested_path": "dated-pointer",
+    "knowhow": "yes",
+    "knowhow_reason": "it names a value a future agent would otherwise get wrong",
 }
 MAX_SUBCLAIMS = 8
 MAX_EVIDENCE = 16
@@ -591,6 +614,11 @@ def check_answer(ans, card, root):
         if ans["suggested_path"] == "none":
             errs.append("suggested_path is 'none' for a no-longer-holds card: pick dated-pointer, "
                         "erratum-wrong-record or supersede")
+    kh = ans.get("knowhow")
+    if kh not in KNOWHOW:
+        errs.append(f"knowhow must be \"yes\" or \"no\" (step 8), got {kh!r}")
+    if "knowhow_reason" in ans and not isinstance(ans["knowhow_reason"], str):
+        errs.append("knowhow_reason must be a string")
     return errs
 
 
@@ -645,6 +673,12 @@ STEPS
    - "supersede": the sentence describes a mechanism or behaviour that has since been replaced.
    - "erratum-wrong-record": the sentence was already wrong on the day it was written.
    Otherwise write false_sentence "" and suggested_path "none".
+8. KNOW-HOW (a separate question about the whole card, whatever steps 1-7 found): would a future agent
+   ACT DIFFERENTLY knowing this card? "yes" for a finding that holds beyond its day, a refutation, a
+   measured fact with its number, a decision WITH its reason, a mistake WITH the measure that stops it,
+   a rule or a policy. "no" when the card only records status or progress: something was launched,
+   finished, passed, committed, pushed, tagged, merged, deployed or moved on a board, or what the next
+   step is. Write "yes" or "no" into knowhow and one short sentence into knowhow_reason.
 
 ANSWER with ONLY this JSON object (same keys, your values), nothing before or after it:
 {example}
@@ -1042,6 +1076,247 @@ def write_report(out, rows, mech_by_id, summary):
     return props
 
 
+# ------------------------------------------------------------------------------------ checked ledger
+#
+# One append-only JSON line per judged card. A line names the card AND the sha256 of the card file the
+# judge saw, so "already checked" means "checked at this content": a card changed since (an erratum, a
+# repair, a status edge) has no line for its current hash and is eligible again. Lines are never rewritten.
+
+def read_ledger(path):
+    rows = []
+    if path and os.path.exists(path):
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(d, dict) and d.get("id"):
+                    rows.append(d)
+    return rows
+
+
+def append_ledger(path, lines, lock=None):
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+
+    def _write():
+        with open(path, "a", encoding="utf-8") as fh:
+            for d in lines:
+                fh.write(json.dumps(d, ensure_ascii=False) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+    if lock is None:
+        _write()
+    else:
+        with lock:
+            _write()
+
+
+def _decisive(ans, verdict):
+    subs = [s for s in (ans or {}).get("subclaims") or [] if isinstance(s, dict)]
+    for s in subs:
+        if s.get("verdict") == verdict:
+            return s
+    return subs[0] if subs else {}
+
+
+def ledger_line(card, result, judge, prompt_version, date, value_flag=None, run=None):
+    """The ledger line of one judged card (`result` as judge_card returns it)."""
+    ans = result.get("answer") or {}
+    verdict = result.get("verdict")
+    sub = _decisive(ans, verdict)
+    ev = [{"command": e.get("command"), "exit_code": e.get("exit_code"),
+           "output_quote": _norm(e.get("output_quote"))[:200]}
+          for e in (sub.get("evidence") or [])[:3] if isinstance(e, dict)]
+    reason = sub.get("reason") or ""
+    if verdict == "unverified":
+        errs = (result.get("errors") or [{}])[-1].get("errors") or []
+        reason = "no verified answer: " + (errs[0] if errs else "?")
+    return {"id": card["id"], "sha256": card["sha256"], "date": date, "judge": judge,
+            "prompt_version": prompt_version, "verdict": verdict, "knowhow": ans.get("knowhow"),
+            "knowhow_reason": _norm(ans.get("knowhow_reason") or "")[:300] or None,
+            "reason": _norm(reason)[:300], "evidence": ev,
+            "false_sentence": ans.get("false_sentence") or None,
+            "suggested_path": ans.get("suggested_path") or None,
+            "value_flag": value_flag, "cost_usd": result.get("cost_usd"), "run": run}
+
+
+def eligible_cards(cards, ledger_rows, statuses=DRAW_STATUSES):
+    """Cards of `statuses` whose CURRENT file hash has no ledger line."""
+    seen = {(r.get("id"), r.get("sha256")) for r in ledger_rows}
+    return [c for c in cards if c["status"] in statuses and (c["id"], c.get("sha256")) not in seen]
+
+
+def select_uniform(cards, n, seed):
+    """n cards drawn uniformly at random with `seed` (every card the same chance -- no strata)."""
+    pool = sorted(cards, key=lambda c: c["id"])
+    return random.Random(seed).sample(pool, min(n, len(pool)))
+
+
+def backfill(ledger_path, calib_path, cards, date, judge="sonnet", prompt_version="v1-calib"):
+    """Ledger lines for the cards a calibration run already judged, so a draw does not repeat them. The
+    hash is the card's hash NOW (the calibration did not record one). Idempotent: a card that already has
+    a `prompt_version` line is skipped. Returns the number of lines appended."""
+    have = {r["id"] for r in read_ledger(ledger_path) if r.get("prompt_version") == prompt_version}
+    by_id = {c["id"]: c for c in cards}
+    lines = []
+    for cid, row in read_jsonl(calib_path).items():
+        if cid in have or cid not in by_id:
+            continue
+        lines.append(ledger_line(by_id[cid], row, judge, prompt_version, date,
+                                 run=f"backfill from {os.path.basename(calib_path)}; sha256 taken at backfill"))
+        have.add(cid)
+    if lines:
+        append_ledger(ledger_path, lines)
+    return len(lines)
+
+
+def judge_many(cards, model, root, mech, workers, max_usd, on_result, max_retries=2, deadline_s=None,
+               spent=0.0):
+    """Judge `cards` with at most `workers` calls in flight; stop SUBMITTING once the spend passes
+    `max_usd` (calls in flight finish). on_result(card, result) runs in the caller's thread.
+    Returns ({id: result}, stopped_at_cap)."""
+    done, stopped = {}, False
+    todo = list(cards)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
+        futs = {}
+        while todo or futs:
+            while todo and len(futs) < max(1, workers) and not stopped:
+                if spent > max_usd:
+                    stopped = True
+                    break
+                c = todo.pop(0)
+                futs[ex.submit(judge_card, c, model, root, mech.get(c["id"], []), max_retries,
+                               deadline_s)] = c
+            if stopped and todo:
+                todo = []
+            if not futs:
+                break
+            fin, _ = concurrent.futures.wait(futs, return_when=concurrent.futures.FIRST_COMPLETED)
+            for f in fin:
+                c = futs.pop(f)
+                r = f.result()
+                spent += float(r.get("cost_usd") or 0)
+                done[c["id"]] = r
+                on_result(c, r)
+        if spent > max_usd and todo:
+            stopped = True
+    return done, stopped
+
+
+def verdict_line(results):
+    v = Counter(r.get("verdict") for r in results)
+    kn = sum(1 for r in results if (r.get("answer") or {}).get("knowhow") == "no")
+    cost = sum(float(r.get("cost_usd") or 0) for r in results)
+    return (f"VERDICTS holds={v['holds']} no-longer-holds={v['no-longer-holds']} "
+            f"cannot-check={v['cannot-check-offline']} unverified={v['unverified']} knowhow-no={kn} "
+            f"cost=${cost:.4f}")
+
+
+# ---------------------------------------------------------------------------- proposals (K-05297)
+
+_FLAG_SOURCE = re.compile(r"([A-Za-z_][\w.]*) — (?:card says .*?, repo says .*?\(([^():\s]+):\d+\)|"
+                          r"value lives in ([^():\s]+):\d+)")
+
+
+def _retire_label():
+    try:
+        import khms_messages
+        return khms_messages.msg("VALIDITY_RETIRE_CANDIDATE")
+    except Exception:  # noqa: BLE001 -- wording is optional, the route is not
+        return "retire candidate (a retired status is not designed yet)"
+
+
+def _pointer_source(value_flag, evidence):
+    """'<key> in <file>' for a dated-pointer erratum: the repo-value flag's hit first, else the pattern and
+    the file of the first grep evidence."""
+    m = _FLAG_SOURCE.search(value_flag or "")
+    if m:
+        return f"{m.group(1)} in {m.group(2) or m.group(3)}"
+    for e in evidence:
+        try:
+            argv = evidence_argv(e.get("command") or "")
+        except ValueError:
+            continue
+        if argv[0] == "grep":
+            rest = [t for t in argv[1:] if not t.startswith("-")]
+            if len(rest) >= 2:
+                return f"{rest[0]} in {rest[-1]}"
+    return None
+
+
+def proposal_row(card_id, result, value_flag=None, origin=None):
+    """One proposal for a card whose verdict is not "holds" or whose knowhow is "no"; None otherwise.
+    {id, verdict, knowhow, route, sentence, evidence, command, origin, value_flag}. Nothing is run."""
+    ans = result.get("answer") or {}
+    verdict, knowhow = result.get("verdict"), ans.get("knowhow")
+    if verdict == "holds" and knowhow != "no":
+        return None
+    sub = _decisive(ans, verdict)
+    evs = [e for e in sub.get("evidence") or [] if isinstance(e, dict)]
+    ev_text = "; ".join(f"`{e.get('command')}` -> rc={e.get('exit_code')} {_norm(e.get('output_quote'))[:160]!r}"
+                        for e in evs[:3])
+    sentence = _norm(ans.get("false_sentence") or "")
+    path = ans.get("suggested_path") or "none"
+    q = shlex.quote
+    evidence_arg = f"{ev_text} ({origin or 'card-validity'})"
+    row = {"id": card_id, "verdict": verdict, "knowhow": knowhow, "sentence": sentence, "evidence": ev_text,
+           "origin": origin, "value_flag": value_flag, "reason": _norm(sub.get("reason") or "")}
+    if knowhow == "no":
+        row["route"] = "retire-candidate"
+        note = f" -- validity: {verdict}" + (f", would be {path}" if verdict == "no-longer-holds" else "")
+        row["command"] = f"{_retire_label()}{note}; reason: {_norm(ans.get('knowhow_reason') or '')[:200]}"
+    elif verdict == "no-longer-holds" and path == "erratum-wrong-record":
+        row["route"] = "erratum wrong-record"
+        row["command"] = (f"tools/khms_erratum.py declare --card {card_id} --was {q(sentence)} "
+                          f"--evidence {q(evidence_arg)} --by coordinator --kind wrong-record")
+    elif verdict == "no-longer-holds" and path == "dated-pointer":
+        src = _pointer_source(value_flag, evs) or "<key> in <repo file>"
+        row["route"] = "erratum dated-pointer"
+        row["command"] = (f"tools/khms_erratum.py declare --card {card_id} --was {q(sentence)} "
+                          f"--evidence {q(evidence_arg)} --by coordinator --kind dated-pointer --source {q(src)}")
+    elif verdict == "no-longer-holds":
+        row["route"] = "supersede"
+        today = "; ".join(f"`{e.get('command')}` -> {_norm(e.get('output_quote'))[:160]!r}" for e in evs[:2])
+        row["command"] = (f"DRAFT new card (through approve_inbox.py): <what holds today, from: {today}> -- "
+                          f"SUPERSEDES {card_id} BECAUSE: {_norm(sub.get('reason') or '')[:240]} "
+                          f"(the card says: {sentence[:200]!r})")
+    elif verdict == "cannot-check-offline":
+        row["route"] = "none"
+        row["command"] = "keep -- no file can show it (cannot-check-offline); nothing to correct"
+    else:
+        row["route"] = "re-judge"
+        row["command"] = f"keep; the judge gave no verified answer -- check by hand ({row['reason'][:200]})"
+    return row
+
+
+def _md_cell(text):
+    return str(text if text is not None else "").replace("|", "\\|").replace("\n", " ")
+
+
+def proposal_table(rows):
+    lines = ["| card | verdict | knowhow | value flag | route | sentence / evidence | command or draft |",
+             "|---|---|---|---|---|---|---|"]
+    for r in rows:
+        flag = "yes" if r.get("value_flag") else "no"
+        what = r["sentence"] or r.get("reason") or ""
+        if r.get("evidence"):
+            what = f"{what} -- evidence: {r['evidence']}" if what else f"evidence: {r['evidence']}"
+        lines.append(f"| {r['id']} | {r['verdict']} | {r.get('knowhow') or 'n/a'} | {flag} | {r['route']} | "
+                     f"{_md_cell(what[:600])} | `{_md_cell(r['command'])}` |")
+    return lines
+
+
+def value_flags(cards, index=None):
+    """{id: flag message or None} from the approval repo-value flag (khms_lint.check_repo_values) -- the
+    mechanical rule, no model."""
+    import khms_lint
+    if index is None:
+        import khms_repo_values
+        index = khms_repo_values.load_index()
+    return {c["id"]: khms_lint.check_repo_values(c["id"], c.get("meta") or {}, c["body"], index) for c in cards}
+
+
 # ------------------------------------------------------------------------------------------- CLI
 
 def read_jsonl(path):
@@ -1209,6 +1484,156 @@ def cmd_report(a):
     return 0
 
 
+def _ledger_path(a):
+    return a.ledger or os.path.join(os.path.dirname(os.path.abspath(a.know)), "ledger", "validity.jsonl")
+
+
+def _statuses(a):
+    return tuple(s.strip() for s in a.statuses.split(",") if s.strip())
+
+
+def cmd_backfill(a):
+    n = backfill(_ledger_path(a), a.calib, load_cards(a.know), date=a.date)
+    print(f"BACKFILL {n} line(s) -> {_ledger_path(a)}")
+    return 0
+
+
+def cmd_sample(a):
+    """Draw without judging: the eligible pool after the ledger, and the overlap with an earlier draw."""
+    cards = load_cards(a.know)
+    pool = eligible_cards(cards, read_ledger(_ledger_path(a)), _statuses(a))
+    drawn = select_uniform(pool, a.n, a.seed)
+    print(f"ELIGIBLE {len(pool)} of {sum(1 for c in cards if c['status'] in _statuses(a))} "
+          f"({','.join(_statuses(a))})")
+    print(f"SAMPLED {len(drawn)} seed={a.seed}")
+    if a.against:
+        with open(a.against, encoding="utf-8") as fh:
+            before = set(json.load(fh)["ids"])
+        print(f"OVERLAP {len({c['id'] for c in drawn} & before)} with {a.against}")
+    if a.ids:
+        print(" ".join(c["id"] for c in drawn))
+    return 0
+
+
+def cmd_run(a):
+    """Draw n cards past the ledger, mechanical pass, value flag, judge (paid leg), ledger + report."""
+    os.makedirs(a.out, exist_ok=True)
+    sandbox = os.path.abspath(a.sandbox)
+    ledger = _ledger_path(a)
+    statuses = _statuses(a)
+    cards = load_cards(a.know)
+    by_id = {c["id"]: c for c in cards}
+    sample_path = os.path.join(a.out, "sample.json")
+    if os.path.exists(sample_path):                    # a resumed run keeps its draw
+        with open(sample_path, encoding="utf-8") as fh:
+            meta = json.load(fh)
+        if meta.get("seed") != a.seed:
+            print(f"run: {sample_path} was drawn with seed {meta.get('seed')}, not {a.seed}", file=sys.stderr)
+            return 2
+        sample = [by_id[i] for i in meta["ids"] if i in by_id]
+        print(f"RESUMED {len(sample)} seed={a.seed}", flush=True)
+    else:
+        pool = eligible_cards(cards, read_ledger(ledger), statuses)
+        sample = select_uniform(pool, a.n, a.seed)
+        meta = {"seed": a.seed, "n": a.n, "statuses": list(statuses), "eligible": len(pool),
+                "population": sum(1 for c in cards if c["status"] in statuses),
+                "drawn_at": datetime.datetime.now().isoformat(timespec="seconds"),
+                "ids": [c["id"] for c in sample],
+                "cards": [{"id": c["id"], "type": c["type"], "status": c["status"], "date": c["date"],
+                           "sha256": c["sha256"]} for c in sample]}
+        with open(sample_path, "w", encoding="utf-8") as fh:
+            json.dump(meta, fh, indent=1)
+    print(f"SAMPLED {len(sample)} seed={a.seed}", flush=True)
+    idx = _index_for(sandbox)
+    mrows, msum = mechanical_pass(cards, idx, statuses=statuses)
+    with open(os.path.join(a.out, "mechanical.jsonl"), "w", encoding="utf-8") as fh:
+        for r in mrows:
+            fh.write(json.dumps(r, ensure_ascii=False) + "\n")
+    with open(os.path.join(a.out, "mechanical-summary.json"), "w", encoding="utf-8") as fh:
+        json.dump(msum, fh, indent=2)
+    print(f"mechanical: {json.dumps(msum)}", flush=True)
+    mech = {r["id"]: r["anchors"] for r in mrows}
+    flags_path = os.path.join(a.out, "value-flags.json")
+    if os.path.exists(flags_path):
+        with open(flags_path, encoding="utf-8") as fh:
+            flags = json.load(fh)
+    else:
+        flags = value_flags(sample)
+        with open(flags_path, "w", encoding="utf-8") as fh:
+            json.dump(flags, fh, indent=1, ensure_ascii=False)
+    print(f"value flag: {sum(1 for v in flags.values() if v)} of {len(sample)} sampled cards", flush=True)
+    res_path = os.path.join(a.out, "sonnet.jsonl")
+    done = read_jsonl(res_path)
+    spent = sum(float(r.get("cost_usd") or 0) for r in done.values())
+    todo = [c for c in sample if c["id"] not in done]
+    model = ClaudeModel(a.claude_bin, a.sonnet_model, sandbox, deadline=a.sonnet_deadline,
+                        max_budget_usd=a.sonnet_max_usd)
+    run_tag = f"card-validity {PROMPT_VERSION} seed={a.seed} {os.path.basename(os.path.abspath(a.out))}"
+    today = datetime.date.today().isoformat()
+    total = [spent]
+
+    def on_result(c, r):
+        r = dict(r, id=c["id"], sha256=c["sha256"])
+        append_ledger(res_path, [r])
+        append_ledger(ledger, [ledger_line(c, r, f"claude -p --model {a.sonnet_model}", PROMPT_VERSION, today,
+                                           value_flag=flags.get(c["id"]), run=run_tag)])
+        total[0] += float(r.get("cost_usd") or 0)
+        kh = (r.get("answer") or {}).get("knowhow")
+        print(f"sonnet {c['id']} -> {r['verdict']} knowhow={kh} ({r['attempts']}x, {r['wall_s']}s, "
+              f"${r['cost_usd']}) total=${total[0]:.4f}", flush=True)
+
+    _done, stopped = judge_many(todo, model, sandbox, mech, min(a.workers, 4), a.max_usd, on_result,
+                                max_retries=a.max_retries, deadline_s=a.card_deadline, spent=spent)
+    results = list(read_jsonl(res_path).values())
+    line = verdict_line(results)
+    if stopped:
+        print(f"STOPPED at the ${a.max_usd} cap after {len(results)} of {len(sample)} cards", flush=True)
+    print(line, flush=True)
+    with open(os.path.join(a.out, "summary.json"), "w", encoding="utf-8") as fh:
+        json.dump({"verdicts": line, "judged": len(results), "sampled": len(sample), "stopped_at_cap": stopped,
+                   "seed": a.seed, "prompt_version": PROMPT_VERSION, "ledger": ledger}, fh, indent=2)
+    return 3 if stopped else 0
+
+
+def cmd_proposals(a):
+    """proposals.md from one or more result files (jsonl of judge_card results with `id`). Writes only --out."""
+    cards = {c["id"]: c for c in load_cards(a.know)}
+    rows, results = [], []
+    for spec in a.results:
+        label, _, path = spec.partition("=")
+        res = read_jsonl(path)
+        flags_file = os.path.join(os.path.dirname(path), "value-flags.json")
+        flags = {}
+        if os.path.exists(flags_file):
+            with open(flags_file, encoding="utf-8") as fh:
+                flags = json.load(fh)
+        missing = [c for i, c in cards.items() if i in res and i not in flags]
+        if missing:
+            flags.update(value_flags(missing))
+        if label == a.summary_of:
+            results = list(res.values())
+        for cid, r in res.items():
+            if a.only_verdict and r.get("verdict") not in a.only_verdict:
+                continue
+            row = proposal_row(cid, r, value_flag=flags.get(cid), origin=label)
+            if row:
+                rows.append(row)
+    lines = ["# Card validity proposals -- for the coordinator to review and apply; NOTHING applied", "",
+             "One row per card whose verdict is not `holds` or whose `knowhow` is `no`. Routes follow the three "
+             "kinds of untrue: wrong record -> erratum wrong-record; a moved repo value -> erratum dated-pointer; "
+             "an overtaken mechanism -> a new superseding card (draft) or a status edge; not know-how -> retire "
+             "candidate. Commands are printed, never run; a `--dry-run` first is the reviewer's choice.", ""]
+    if results:
+        lines += [verdict_line(results), ""]
+    lines += proposal_table(rows)
+    with open(a.out, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
+    print(f"PROPOSALS {len(rows)} row(s) -> {a.out}")
+    if results:
+        print(verdict_line(results))
+    return 0
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -1241,13 +1666,45 @@ def main(argv=None):
             p.add_argument("--sonnet-deadline", type=float, default=600)
             p.add_argument("--sonnet-max-usd", type=float, default=1.0)
             p.add_argument("--sonnet-workers", type=int, default=3)
+    bf = sub.add_parser("backfill", help="ledger lines for an earlier calibration's verdicts (idempotent)")
+    bf.add_argument("--know", required=True)
+    bf.add_argument("--ledger", help="default: <know>/../ledger/validity.jsonl")
+    bf.add_argument("--calib", required=True, help="the calibration's sonnet.jsonl")
+    bf.add_argument("--date", required=True, help="the calibration's date (ISO)")
+    sa = sub.add_parser("sample", help="draw past the ledger without judging")
+    ru = sub.add_parser("run", help="draw past the ledger, mechanical pass, value flag, paid judge, ledger")
+    for p in (sa, ru):
+        p.add_argument("--know", required=True)
+        p.add_argument("--ledger", help="default: <know>/../ledger/validity.jsonl")
+        p.add_argument("--n", type=int, default=100)
+        p.add_argument("--seed", type=int, required=True)
+        p.add_argument("--statuses", default=",".join(DRAW_STATUSES))
+    sa.add_argument("--against", help="an earlier run's sample.json: print the overlap")
+    sa.add_argument("--ids", action="store_true")
+    ru.add_argument("--sandbox", required=True)
+    ru.add_argument("--out", required=True)
+    ru.add_argument("--workers", type=int, default=4, choices=range(1, 5))
+    ru.add_argument("--max-usd", type=float, default=15.0, help="stop submitting once the spend passes it")
+    ru.add_argument("--max-retries", type=int, default=2)
+    ru.add_argument("--card-deadline", type=float, default=1200)
+    ru.add_argument("--claude-bin", default=os.environ.get("KHMS_AGENT", "claude"))
+    ru.add_argument("--sonnet-model", default="sonnet")
+    ru.add_argument("--sonnet-deadline", type=float, default=600)
+    ru.add_argument("--sonnet-max-usd", type=float, default=1.0)
+    pr = sub.add_parser("proposals", help="proposal rows (K-05297 routes + commands) from result files")
+    pr.add_argument("--know", required=True)
+    pr.add_argument("--out", required=True)
+    pr.add_argument("--results", action="append", required=True, help="LABEL=path/to/results.jsonl")
+    pr.add_argument("--summary-of", help="the LABEL whose results the VERDICTS line counts")
+    pr.add_argument("--only-verdict", action="append", help="per-file filter, e.g. no-longer-holds")
     a = ap.parse_args(argv)
     if a.cmd in ("calibrate", "report") and not a.population and getattr(a, "know", None):
         a.population = sum(1 for c in load_cards(a.know) if c["status"] == "active" and c["type"] in ACTIVE_TYPES)
     if a.cmd == "calibrate" and a.qwen and not a.copilot_url:
         ap.error("the qwen leg needs --copilot-url or KHMS_COPILOT_URL (an OpenAI-compatible base URL)")
     return {"sandbox": cmd_sandbox, "mechanical": cmd_mechanical, "calibrate": cmd_calibrate,
-            "report": cmd_report}[a.cmd](a)
+            "report": cmd_report, "backfill": cmd_backfill, "sample": cmd_sample, "run": cmd_run,
+            "proposals": cmd_proposals}[a.cmd](a)
 
 
 if __name__ == "__main__":
