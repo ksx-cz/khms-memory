@@ -487,6 +487,10 @@ class RunAndProposals(Fixture):
                                            "1.47, repo says 1.74 (nav/config/params.yaml:1) — stale value?")
         self.assertIn("--kind dated-pointer", moved["command"])
         self.assertIn("--source 'min_turning_radius in nav/config/params.yaml'", moved["command"])
+        moved2 = CV.proposal_row("K-2", res("no-longer-holds", "dated-pointer", sentence="radius 1.47",
+                                            cmd="grep -n min_turning_radius proj/nav/config/params.yaml"),
+                                 repo_trees=("proj",))
+        self.assertIn("--source 'min_turning_radius in nav/config/params.yaml'", moved2["command"])
         sup = CV.proposal_row("K-3", res("no-longer-holds", "supersede", sentence="old mechanism"))
         self.assertIn("SUPERSEDES K-3 BECAUSE", sup["command"])
         self.assertEqual(sup["route"], "supersede")
@@ -498,6 +502,26 @@ class RunAndProposals(Fixture):
         self.assertIn("retire candidate", both["command"])  # not know-how outranks rewriting it
         lines = CV.proposal_table([wrong, moved, sup, nk])
         self.assertEqual(sum(1 for l in lines if l.startswith("| K-")), 4)
+        self.assertIn(wrong["command"], lines)              # the command verbatim, on a line of its own
+        verb = CV.proposal_row("K-7", res("no-longer-holds", "erratum-wrong-record", sentence="The radius is 1.47"),
+                               body="Old.\nThe `radius` is\n**1.47**. More.\n")
+        self.assertEqual(verb["sentence"], "The `radius` is **1.47**")   # the card's characters, not the judge's
+        absent = CV.proposal_row("K-8", res("no-longer-holds", "supersede", sentence="x", cmd="grep -n zz proj"))
+        self.assertFalse(sup["absence_only"])
+        absent_ev = dict(res("no-longer-holds", "supersede", sentence="x"))
+        absent_ev["answer"]["subclaims"][0]["evidence"][0]["exit_code"] = 1
+        self.assertTrue(CV.proposal_row("K-9", absent_ev)["absence_only"])
+        self.assertIsNotNone(absent)
+
+    def test_erratum_rows_are_dry_run_and_the_verdict_shown(self):
+        fake = write(self.tmp, "fake_erratum.py", "import sys\nprint('noise')\n"
+                     "print('DRY ' + ' '.join(a for a in sys.argv[1:] if a.startswith('--')))\n")
+        rows = [{"id": "K-1", "command": "tools/khms_erratum.py declare --card K-1 --was 'a b' --evidence e "
+                                         "--by coordinator --kind wrong-record"},
+                {"id": "K-2", "command": "retire candidate"}]
+        CV.dry_run_errata(rows, erratum_argv=[sys.executable, fake])
+        self.assertEqual(rows[0]["dry_run"], "rc=0: DRY --card --was --evidence --by --kind --dry-run")
+        self.assertNotIn("dry_run", rows[1])
 
     def test_summary_line_counts_verdicts_knowhow_and_cost(self):
         rows = [{"verdict": "holds", "cost_usd": 0.05, "answer": {"knowhow": "yes"}},

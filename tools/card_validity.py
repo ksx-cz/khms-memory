@@ -1227,12 +1227,14 @@ def _retire_label():
         return "retire candidate (a retired status is not designed yet)"
 
 
-def _pointer_source(value_flag, evidence):
+def _pointer_source(value_flag, evidence, repo_trees=()):
     """'<key> in <file>' for a dated-pointer erratum: the repo-value flag's hit first, else the pattern and
-    the file of the first grep evidence."""
+    the file of the first grep evidence (a sandbox path loses its leading git-tree name: the erratum names
+    the file as the repository has it)."""
     m = _FLAG_SOURCE.search(value_flag or "")
     if m:
         return f"{m.group(1)} in {m.group(2) or m.group(3)}"
+    strip = lambda f: next((f[len(t) + 1:] for t in repo_trees if f.startswith(t + "/")), f)
     for e in evidence:
         try:
             argv = evidence_argv(e.get("command") or "")
@@ -1241,13 +1243,25 @@ def _pointer_source(value_flag, evidence):
         if argv[0] == "grep":
             rest = [t for t in argv[1:] if not t.startswith("-")]
             if len(rest) >= 2:
-                return f"{rest[0]} in {rest[-1]}"
+                return f"{rest[0]} in {strip(rest[-1])}"
     return None
 
 
-def proposal_row(card_id, result, value_flag=None, origin=None):
+def verbatim_sentence(body, sentence):
+    """The card's own wording of `sentence` (the judge may drop backticks and asterisks -- check_answer
+    compares without them; an erratum needs the card's characters), whitespace-collapsed; else `sentence`."""
+    toks = _prose(sentence).split()
+    if not body or not toks:
+        return _norm(sentence)
+    tok = lambda t: "[`*]*" + "".join(re.escape(ch) + "[`*]*" for ch in t)
+    m = re.search(r"\s+".join(tok(t) for t in toks), body)
+    return _norm(m.group(0)) if m else _norm(sentence)
+
+
+def proposal_row(card_id, result, value_flag=None, origin=None, body=None, repo_trees=()):
     """One proposal for a card whose verdict is not "holds" or whose knowhow is "no"; None otherwise.
-    {id, verdict, knowhow, route, sentence, evidence, command, origin, value_flag}. Nothing is run."""
+    {id, verdict, knowhow, route, sentence, evidence, absence_only, command, origin, value_flag}. `body`
+    (the card text) recovers the sentence verbatim. Nothing is run."""
     ans = result.get("answer") or {}
     verdict, knowhow = result.get("verdict"), ans.get("knowhow")
     if verdict == "holds" and knowhow != "no":
@@ -1256,12 +1270,14 @@ def proposal_row(card_id, result, value_flag=None, origin=None):
     evs = [e for e in sub.get("evidence") or [] if isinstance(e, dict)]
     ev_text = "; ".join(f"`{e.get('command')}` -> rc={e.get('exit_code')} {_norm(e.get('output_quote'))[:160]!r}"
                         for e in evs[:3])
-    sentence = _norm(ans.get("false_sentence") or "")
+    sentence = verbatim_sentence(body, ans.get("false_sentence") or "")
     path = ans.get("suggested_path") or "none"
     q = shlex.quote
     evidence_arg = f"{ev_text} ({origin or 'card-validity'})"
     row = {"id": card_id, "verdict": verdict, "knowhow": knowhow, "sentence": sentence, "evidence": ev_text,
-           "origin": origin, "value_flag": value_flag, "reason": _norm(sub.get("reason") or "")}
+           "origin": origin, "value_flag": value_flag, "reason": _norm(sub.get("reason") or ""),
+           # a verdict resting only on "not found" (grep rc=1, ls rc=2) needs a broad re-search first
+           "absence_only": bool(evs) and all(e.get("exit_code") not in (0, None) for e in evs)}
     if knowhow == "no":
         row["route"] = "retire-candidate"
         note = f" -- validity: {verdict}" + (f", would be {path}" if verdict == "no-longer-holds" else "")
@@ -1271,7 +1287,7 @@ def proposal_row(card_id, result, value_flag=None, origin=None):
         row["command"] = (f"tools/khms_erratum.py declare --card {card_id} --was {q(sentence)} "
                           f"--evidence {q(evidence_arg)} --by coordinator --kind wrong-record")
     elif verdict == "no-longer-holds" and path == "dated-pointer":
-        src = _pointer_source(value_flag, evs) or "<key> in <repo file>"
+        src = _pointer_source(value_flag, evs, repo_trees) or "<key> in <repo file>"
         row["route"] = "erratum dated-pointer"
         row["command"] = (f"tools/khms_erratum.py declare --card {card_id} --was {q(sentence)} "
                           f"--evidence {q(evidence_arg)} --by coordinator --kind dated-pointer --source {q(src)}")
@@ -1290,20 +1306,47 @@ def proposal_row(card_id, result, value_flag=None, origin=None):
     return row
 
 
+def dry_run_errata(rows, erratum_argv=None, env=None):
+    """Run every erratum row's command with --dry-run (declare writes nothing then: no tombstone id, no
+    ledger, no card) and keep its last line in row["dry_run"] -- a reviewer sees which ones the rails
+    (verbatim match, R1 lint, the classifier) would refuse before deciding."""
+    base = erratum_argv or [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                                          "khms_erratum.py")]
+    for r in rows:
+        if not r["command"].startswith("tools/khms_erratum.py "):
+            continue
+        argv = base + shlex.split(r["command"])[1:] + ["--dry-run"]
+        cp = subprocess.run(argv, capture_output=True, text=True, env=env, timeout=120)
+        out = [x for x in ((cp.stdout or "") + (cp.stderr or "")).splitlines() if x.strip()]
+        r["dry_run"] = f"rc={cp.returncode}: " + (out[-1] if out else "(no output)")
+    return rows
+
+
 def _md_cell(text):
     return str(text if text is not None else "").replace("|", "\\|").replace("\n", " ")
 
 
 def proposal_table(rows):
-    lines = ["| card | verdict | knowhow | value flag | route | sentence / evidence | command or draft |",
-             "|---|---|---|---|---|---|---|"]
+    """A table (one row per card) and, under it, each card's command or draft verbatim in a code block."""
+    lines = ["| card | origin | verdict | knowhow | value flag | route | evidence | sentence / reason |",
+             "|---|---|---|---|---|---|---|---|"]
     for r in rows:
         flag = "yes" if r.get("value_flag") else "no"
+        kind = "absence-only" if r.get("absence_only") else ("positive" if r.get("evidence") else "none")
         what = r["sentence"] or r.get("reason") or ""
+        lines.append(f"| {r['id']} | {r.get('origin') or ''} | {r['verdict']} | {r.get('knowhow') or 'n/a'} | "
+                     f"{flag} | {r['route']} | {kind} | {_md_cell(what[:300])} |")
+    lines += ["", "## Commands and drafts", ""]
+    for r in rows:
+        lines += [f"### {r['id']} -- {r['route']}", ""]
+        if r.get("value_flag"):
+            lines += [f"value flag: {r['value_flag']}", ""]
         if r.get("evidence"):
-            what = f"{what} -- evidence: {r['evidence']}" if what else f"evidence: {r['evidence']}"
-        lines.append(f"| {r['id']} | {r['verdict']} | {r.get('knowhow') or 'n/a'} | {flag} | {r['route']} | "
-                     f"{_md_cell(what[:600])} | `{_md_cell(r['command'])}` |")
+            lines += [f"evidence: {r['evidence']}" + ("  (ABSENCE-ONLY: search broadly before acting)"
+                                                       if r.get("absence_only") else ""), ""]
+        lines += ["```sh" if r["command"].startswith("tools/") else "```text", r["command"], "```", ""]
+        if r.get("dry_run"):
+            lines += [f"dry-run: {r['dry_run']}", ""]
     return lines
 
 
@@ -1599,6 +1642,10 @@ def cmd_proposals(a):
     """proposals.md from one or more result files (jsonl of judge_card results with `id`). Writes only --out."""
     cards = {c["id"]: c for c in load_cards(a.know)}
     rows, results = [], []
+    repo_trees = ()
+    if a.sandbox:
+        with open(os.path.join(a.sandbox, ".trees.json"), encoding="utf-8") as fh:
+            repo_trees = tuple(n for n, d in json.load(fh).items() if d.get("kind") == "git")
     for spec in a.results:
         label, _, path = spec.partition("=")
         res = read_jsonl(path)
@@ -1613,9 +1660,11 @@ def cmd_proposals(a):
         if label == a.summary_of:
             results = list(res.values())
         for cid, r in res.items():
-            if a.only_verdict and r.get("verdict") not in a.only_verdict:
+            keep = [v for lab, _, v in (x.partition(":") for x in a.only_verdict or []) if lab == label]
+            if keep and r.get("verdict") not in keep:
                 continue
-            row = proposal_row(cid, r, value_flag=flags.get(cid), origin=label)
+            row = proposal_row(cid, r, value_flag=flags.get(cid), origin=label,
+                               body=(cards.get(cid) or {}).get("body"), repo_trees=repo_trees)
             if row:
                 rows.append(row)
     lines = ["# Card validity proposals -- for the coordinator to review and apply; NOTHING applied", "",
@@ -1625,6 +1674,8 @@ def cmd_proposals(a):
              "candidate. Commands are printed, never run; a `--dry-run` first is the reviewer's choice.", ""]
     if results:
         lines += [verdict_line(results), ""]
+    if a.dry_run_errata:
+        dry_run_errata(rows)
     lines += proposal_table(rows)
     with open(a.out, "w", encoding="utf-8") as fh:
         fh.write("\n".join(lines) + "\n")
@@ -1695,8 +1746,12 @@ def main(argv=None):
     pr.add_argument("--know", required=True)
     pr.add_argument("--out", required=True)
     pr.add_argument("--results", action="append", required=True, help="LABEL=path/to/results.jsonl")
+    pr.add_argument("--sandbox", help="the run's sandbox: its git trees' names are stripped from --source files")
+    pr.add_argument("--dry-run-errata", action="store_true",
+                    help="run each erratum command with --dry-run and show its verdict line")
     pr.add_argument("--summary-of", help="the LABEL whose results the VERDICTS line counts")
-    pr.add_argument("--only-verdict", action="append", help="per-file filter, e.g. no-longer-holds")
+    pr.add_argument("--only-verdict", action="append", help="LABEL:VERDICT -- keep only that verdict of that "
+                    "file, e.g. calib:no-longer-holds")
     a = ap.parse_args(argv)
     if a.cmd in ("calibrate", "report") and not a.population and getattr(a, "know", None):
         a.population = sum(1 for c in load_cards(a.know) if c["status"] == "active" and c["type"] in ACTIVE_TYPES)
