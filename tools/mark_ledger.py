@@ -794,11 +794,12 @@ def derive(paths, floor, until=None, skipped=None):
     events = read_events(paths)
     cards = read_cards(paths)
     live_ids = {c[0] for c in cards}
-    gone, gone_cards = archived_cards(paths)
-    gone = {cid: why for cid, why in gone.items() if cid not in live_ids}
-    links = structural_links(cards + [c for c in gone_cards if c[0] in gone])
+    # not `gone`: the reopen branch below already names its own set that (#219 review)
+    moved, moved_cards = archived_cards(paths)
+    moved = {cid: why for cid, why in moved.items() if cid not in live_ids}
+    links = structural_links(cards + [c for c in moved_cards if c[0] in moved])
     suggested = suggest_cards(marks, cards, floor)          # a suggestion only ever names a live card
-    known_cards = live_ids | set(gone)
+    known_cards = live_ids | set(moved)
     prop = proposed_ids(paths)
     dups = {}
     for mid, mk in marks.items():
@@ -817,13 +818,13 @@ def derive(paths, floor, until=None, skipped=None):
         elif kind == "card" and ev.get("card") in known_cards:
             state, card, how = "CARDED", ev["card"], "event"
             reason = ev.get("reason") or f"card event by {ev.get('by', '?')} {ev.get('ts', '')}"
-            if card in gone:
-                reason += f" ({gone[card]})"
+            if card in moved:
+                reason += f" ({moved[card]})"
         elif linked:
             state, card, how = "CARDED", linked[0], "marks"
             reason = f"`marks:` frontmatter of {linked[0]}"
-            if card in gone:
-                reason += f" ({gone[card]})"
+            if card in moved:
+                reason += f" ({moved[card]})"
         mk["state"] = state
         if card:
             mk["card"], mk["how"] = card, how

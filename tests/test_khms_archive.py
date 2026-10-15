@@ -258,10 +258,14 @@ def test_a_mark_covered_by_an_archived_card_stays_carded(base):
     import mark_ledger as ml
     paths = ml.Paths(str(root))
     (root / "journal" / "2099-01-01.md").write_text(
+        "- 09:00 MARK[nalez] an earlier unrelated finding that was reopened once (test)\n"
         "- 10:00 MARK[nalez] the flux capacitor relay sits on bench three (test)\n", encoding="utf-8")
     marks = ml.collect_marks(paths, "1970-01-01")
-    assert len(marks) == 1
-    mid = next(iter(marks))
+    assert len(marks) == 2
+    first, mid = list(marks)
+    # a reopen event earlier in the ledger order must not disturb the archived cover (a name clash once did)
+    ml.append_events(paths, [{"ts": "2099-01-01T09:30", "ev": "reopen", "id": first, "by": "test", "cards": [],
+                              "reason": "test"}])
     text = (root / "memory/know/K-91001.md").read_text().replace("M-0000aaaa", mid)
     (root / "memory/know/K-91001.md").write_text(text)
     assert ml.derive(paths, "1970-01-01")[mid]["state"] == "CARDED"
