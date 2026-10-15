@@ -75,6 +75,9 @@ CARDS = {
                 "A refuted successor.\nSUPERSEDES K-91014 BECAUSE: x."),
     "K-91016": ("active", "observation", "links:\n  derived_from: []\n  supports: []\n  contradicts: [K-91015]\n"
                 "  refuted_by: []\n  supersedes: null", "", "The refuter."),
+    # a superseded card whose only successor pointer is its own superseded_by (the target declares nothing)
+    "K-91017": ("superseded", "observation", "links:\n  derived_from: []\n  supports: []\n  contradicts: []\n"
+                "  refuted_by: []\n  supersedes: null\n  superseded_by: K-91016", "", "A one-sided pointer."),
 }
 
 
@@ -225,6 +228,8 @@ def test_all_superseded_follows_chains_and_reports_dead_ends(base):
         assert (root / "memory/know" / f"{cid}.md").exists(), cid
     assert "K-91013" in r.stdout and "no successor" in r.stdout
     assert "K-91014" in r.stdout and "refuted" in r.stdout
+    assert (root / "memory/know/K-91017.md").exists()
+    assert "REPORTED K-91017: no successor edge (only superseded_by K-91016" in r.stdout
     assert links(root, "K-91012")["supports"] == []                   # inbound link taken back
     rec = {x["id"]: x for x in ledger(root)}
     assert "superseded-by K-91011" in rec["K-91010"]["reason"] and "K-91012" in rec["K-91010"]["reason"]
@@ -264,3 +269,19 @@ def test_a_mark_covered_by_an_archived_card_stays_carded(base):
     mk = ml.derive(paths, "1970-01-01")[mid]
     assert mk["state"] == "CARDED" and mk["card"] == "K-91001"
     assert "archived" in mk["reason"] and "state-only" in mk["reason"]
+
+
+def test_keep_links_leaves_every_live_link_as_history_and_the_base_stays_buildable(base):
+    root, env = base
+    r = run(env, "--card", "K-91011", "K-91010", "--allow-chain", "--keep-links", "--reason", "superseded",
+            "--by", "coordinator", "--apply")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "keep   K-91012 links.supports K-91011" in r.stdout
+    assert links(root, "K-91012")["supports"] == ["K-91011"] and links(root, "K-91012")["supersedes"] == "K-91011"
+    assert (root / "memory/archive/know/K-91011.md").exists()
+    rec = {x["id"]: x for x in ledger(root)}
+    assert rec["K-91011"]["unlinked"] == [] and {"card": "K-91012", "field": "supports"} in rec["K-91011"]["kept"]
+    for cmd in ([sys.executable, str(TOOLS / "build_views.py")],
+                [sys.executable, str(TOOLS / "khms_lint.py"), str(root / "memory/know")]):
+        p = subprocess.run(cmd, env=env, text=True, capture_output=True)
+        assert p.returncode == 0, p.stdout + p.stderr

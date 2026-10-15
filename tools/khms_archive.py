@@ -30,15 +30,23 @@ REFUSED, card by card (the rest of the run goes on; exit 2 when anything was ref
     derived card), or a card that is not in memory/know/.
 A card already in the archive is a no-op ("already archived"), so a re-run changes nothing.
 
---all-superseded selects every `status: superseded` card whose successor chain (cards that declare
-`supersedes: K-x`, plus its own `superseded_by`) reaches a live (active|challenged) card; a card with no
-successor edge, or whose chain ends only in refuted / missing cards, is REPORTED and left in place. Chains
-inside the selection are allowed (both ends go). Each card's reason gets `superseded-by K-y (live K-z)`.
+--all-superseded selects every `status: superseded` card whose successor chain (cards that DECLARE
+`supersedes: K-x`; a bare `superseded_by` whose target declares nothing does not count) reaches a live
+(active|challenged) card; a card with no successor edge, or whose chain ends only in refuted / missing
+cards, is REPORTED and left in place. Chains inside the selection are allowed (both ends go). Each card's
+reason gets `superseded-by K-y (live K-z)`.
+
+--keep-links leaves every live link to the card in place, as history into the archive, instead of
+unlinking it — the superseded class: a `derived_from` / `supports` / `refuted_by` into a superseded card is
+provenance that stays true, and taking it back would strip it from ~250 live cards and is refused by the
+writer wherever it is a derived card's last derived_from or a refuted card's last refuted_by (measured on
+the reference base, 2026-10-15). build_views and khms_lint count the archive as known, so such an edge is
+not dangling.
 
 Usage:
   khms_archive.py --card K-x [K-y ...] --reason "<one line>" --by owner|coordinator   (dry run)
   khms_archive.py --all-superseded --reason "<one line>" --by owner|coordinator --apply
-  options: --allow-chain, --backup-dir DIR (copy every file the run will change or move, before the
+  options: --allow-chain, --keep-links, --backup-dir DIR (copy every file the run will change or move, before the
            first write), --brain DIR (default: the resolver's KHMS_ROOT)
 """
 from __future__ import annotations
@@ -106,110 +114,130 @@ def load_live(brain):
     return out
 
 
-def successors(live, cid):
-    """Cards that replace `cid`: live cards declaring `supersedes: cid`, plus cid's own superseded_by."""
-    s = [z for z, c in live.items() if cid in c["links"].get("supersedes", [])]
-    for z in live.get(cid, {}).get("links", {}).get("superseded_by", []):
-        if z not in s:
-            s.append(z)
-    return s
+class Index:
+    """The base's edges, read once: who links to whom, who mentions whom, who replaces whom.
+    (Rescanning every card per candidate made --all-superseded quadratic: > 10 min on ~3k cards.)"""
 
+    def __init__(self, live):
+        import apply_triage as AT
+        self.live = live
+        self.inbound, self.mentions, self.succ = {}, {}, {}
+        for y, c in live.items():
+            for field, ids in c["links"].items():
+                for x in ids:
+                    self.inbound.setdefault(x, []).append((y, field))
+                    if field == "supersedes":
+                        self.succ.setdefault(x, []).append(y)
+            for x in set(re.findall(r"K-\d{5}", c["body"])):
+                self.mentions.setdefault(x, []).append(y)
+        # A successor is a card that DECLARES `supersedes: K-x` (the edge bound to its SUPERSEDES body
+        # line). A bare `superseded_by` back-pointer whose target declares nothing is not one: such a card
+        # is reported, never archived. For the chain guard both directions count (conservative).
+        self.pointer = {}
+        for y, c in live.items():
+            for z in c["links"].get("superseded_by", []):
+                self.pointer.setdefault(y, []).append(z)
+        self.preds = {}
+        for y in set(self.succ) | set(self.pointer):
+            if live.get(y, {}).get("status") == "superseded":
+                for z in set(self.succ.get(y, [])) | set(self.pointer.get(y, [])):
+                    self.preds.setdefault(z, []).append(y)
+        self.unlink_fields = AT.UNLINK_FIELDS
 
-def chain_end(live, cid):
-    """-> (live end id or None, why). Follows successors through superseded cards."""
-    seen, todo, dead = {cid}, list(successors(live, cid)), []
-    if not todo:
-        return None, "no successor edge"
-    while todo:
-        z = todo.pop(0)
-        if z in seen:
-            continue
-        seen.add(z)
-        c = live.get(z)
-        if not c:
-            dead.append(f"{z} not in memory/know/")
-        elif c["status"] in LIVE:
-            return z, ""
-        elif c["status"] == "superseded":
-            todo += successors(live, z)
-        else:
-            dead.append(f"{z} is {c['status']}")
-    return None, "successor chain reaches no live card (" + "; ".join(dead or ["cycle"]) + ")"
+    def successors(self, cid):
+        """Cards that replace `cid`: the cards declaring `supersedes: cid`."""
+        return list(self.succ.get(cid, []))
+
+    def chain_end(self, cid):
+        """-> (live end id or None, why). Follows successors through superseded cards."""
+        seen, todo, dead = {cid}, self.successors(cid), []
+        if not todo:
+            ptr = self.pointer.get(cid)
+            return None, ("no successor edge" + (f" (only superseded_by {', '.join(ptr)}, which does not "
+                                                  f"declare supersedes: {cid})" if ptr else ""))
+        while todo:
+            z = todo.pop(0)
+            if z in seen:
+                continue
+            seen.add(z)
+            c = self.live.get(z)
+            if not c:
+                dead.append(f"{z} not in memory/know/")
+            elif c["status"] in LIVE:
+                return z, ""
+            elif c["status"] == "superseded":
+                todo += self.successors(z)
+            else:
+                dead.append(f"{z} is {c['status']}")
+        return None, "successor chain reaches no live card (" + "; ".join(dead or ["cycle"]) + ")"
+
+    def inspect(self, x, cand, allow_chain, keep_links=False):
+        """What archiving `x` touches, given the set `cand` archived in the same run.
+        -> {'unlink': [(card, field)], 'kept': [(card, field)], 'mentions': [card], 'refuse': str|None}"""
+        out = {"unlink": [], "kept": [], "mentions": [], "refuse": None}
+        for y, field in sorted(set(self.inbound.get(x, []))):
+            if y == x or y in cand:
+                continue
+            (out["unlink"] if field in self.unlink_fields and not keep_links else out["kept"]).append((y, field))
+        out["mentions"] = sorted(y for y in set(self.mentions.get(x, [])) if y != x and y not in cand)
+        # supersede chain: a live superseded card whose successors would all be gone with x
+        for y in sorted(set(self.preds.get(x, []))):
+            if y == x:
+                continue
+            others = [z for z in set(self.successors(y)) | set(self.pointer.get(y, []))
+                      if z != x and z in self.live and z not in cand]
+            if others or (y in cand and allow_chain):
+                continue
+            out["refuse"] = (f"supersede chain: {y} is superseded and {x} is its only live successor; "
+                             + ("pass --allow-chain to archive both" if y in cand else
+                                f"{y} is not named in this run, so both stay (the caller decides)"))
+            break
+        return out
 
 
 # ------------------------------------------------------------------------------- planning
 
-def inspect(live, x, cand, allow_chain):
-    """What archiving `x` touches, given the set `cand` archived in the same run.
-    -> {'unlink': [(card, field)], 'kept': [(card, field)], 'mentions': [card], 'refuse': str|None}"""
-    import apply_triage as AT
-    out = {"unlink": [], "kept": [], "mentions": [], "refuse": None}
-    for y, c in sorted(live.items()):
-        if y == x or y in cand:
-            continue
-        for field, ids in sorted(c["links"].items()):
-            if x not in ids:
-                continue
-            (out["unlink"] if field in AT.UNLINK_FIELDS else out["kept"]).append((y, field))
-        if x in c["body"]:
-            out["mentions"].append(y)
-    # supersede chain: a live superseded card whose successors would all be gone with x
-    for y, c in sorted(live.items()):
-        if y == x or c["status"] != "superseded" or x not in successors(live, y):
-            continue
-        others = [z for z in successors(live, y) if z != x and z in live and z not in cand]
-        if others:
-            continue
-        if y in cand and allow_chain:
-            continue
-        out["refuse"] = (f"supersede chain: {y} is superseded and {x} is its only live successor; "
-                         + ("pass --allow-chain to archive both" if y in cand else
-                            f"{y} is not named in this run, so both stay (the caller decides)"))
-        break
-    return out
-
-
 def unlink_rows(pairs, x, reason):
     """apply_triage `unlink` rows (the shape its plan() takes) for (card, field) pairs that hold `x`."""
-    rows = [{"n": i + 1, "loser": y, "winner": x, "action": "UNLINK", "_class": "unlink", "_field": f,
-             "_target": x, "_reason": reason} for i, (y, f) in enumerate(pairs)]
-    return rows
+    return [{"n": 0, "loser": y, "winner": x, "action": "UNLINK", "_class": "unlink", "_field": f,
+             "_target": x, "_reason": reason} for y, f in pairs]
 
 
-def decide(brain, live, wanted, allow_chain, reason_of):
-    """-> (accepted {x: inspect-result}, refused {x: why}, edits of the final unlink plan)."""
+def decide(brain, idx, wanted, allow_chain, reason_of, keep_links=False):
+    """-> (accepted {x: inspect-result}, refused {x: why}, edits of the final unlink plan).
+    Refusing one card can change what another touches (a link from it, a chain through it), so the
+    checks repeat until nothing more is refused; the final plan is ONE apply_triage.plan over all rows."""
     import apply_triage as AT
-    cand = set(wanted)
-    refused = {}
+    cand, refused, alone = set(wanted), {}, {}
     while True:
-        changed = False
-        info = {x: inspect(live, x, cand, allow_chain) for x in sorted(cand)}
-        for x, r in info.items():
-            if r["refuse"]:
-                refused[x], changed = r["refuse"], True
-                cand.discard(x)
-        if changed:
-            continue
-        # cumulative unlink trial: a card whose rows the writer refuses (on top of the cards before it)
-        rows = []
-        for x in sorted(cand):
-            mine = unlink_rows(info[x]["unlink"], x, reason_of(x))
+        info = {x: idx.inspect(x, cand, allow_chain, keep_links) for x in sorted(cand)}
+        bad = {x: r["refuse"] for x, r in info.items() if r["refuse"]}
+        for x in sorted(cand - set(bad)):
+            rows = unlink_rows(info[x]["unlink"], x, reason_of(x))
+            key = tuple((r["loser"], r["_field"]) for r in rows)
+            if alone.get(x, (None,))[0] != key:          # the writer's own guards, card by card
+                try:
+                    for i, r in enumerate(rows):
+                        r["n"] = i + 1
+                    AT.plan(rows, brain)
+                    alone[x] = (key, None)
+                except AT.Refusal as e:
+                    alone[x] = (key, re.sub(r"^ROW [0-9]+: ", "", str(e)))
+            if alone[x][1]:
+                bad[x] = f"unlink refused by apply_triage: {alone[x][1]}"
+        if not bad:
+            rows = [r for x in sorted(cand) for r in unlink_rows(info[x]["unlink"], x, reason_of(x))]
+            for i, r in enumerate(rows):
+                r["n"] = i + 1
             try:
-                trial = rows + mine
-                for i, r in enumerate(trial):
-                    r["n"] = i + 1
-                AT.plan(trial, brain)
-            except AT.Refusal as e:
-                refused[x] = f"unlink refused by apply_triage: {re.sub(r'^ROW [0-9]+: ', '', str(e))}"
-                cand.discard(x)
-                changed = True
-                break
-            rows = trial
-        if changed:
-            continue
-        for i, r in enumerate(rows):
-            r["n"] = i + 1
-        return {x: info[x] for x in sorted(cand)}, refused, AT.plan(rows, brain)
+                return {x: info[x] for x in sorted(cand)}, refused, AT.plan(rows, brain)
+            except AT.Refusal as e:                      # only the rows together fail: refuse that row's card
+                n = int(re.match(r"ROW ([0-9]+):", str(e)).group(1))
+                x = rows[n - 1]["winner"]
+                bad = {x: f"unlink refused by apply_triage together with the other cards: "
+                          f"{re.sub(r'^ROW [0-9]+: ', '', str(e))}"}
+        refused.update(bad)
+        cand -= set(bad)
 
 
 # ------------------------------------------------------------------------------- main
@@ -223,6 +251,9 @@ def main(argv=None):
     ap.add_argument("--by", required=True, choices=("owner", "coordinator"))
     ap.add_argument("--apply", action="store_true", help="write; the default is a dry run")
     ap.add_argument("--allow-chain", action="store_true")
+    ap.add_argument("--keep-links", action="store_true",
+                    help="leave every live link to the card in place, as history into the archive (the "
+                         "superseded class: a derived_from/supports into a superseded card is provenance)")
     ap.add_argument("--backup-dir", help="copy every file this run changes or moves here before writing")
     ap.add_argument("--brain", default=P.soft("ROOT"))
     a = ap.parse_args(argv)
@@ -253,6 +284,7 @@ def run_locked(a, brain, arch):
     import apply_triage as AT
     khms_health.require_healthy(brain)
     live = load_live(brain)
+    idx = Index(live)
     notes, refused, already, reasons = [], {}, [], {}
     if a.all_superseded:
         wanted = []
@@ -260,11 +292,11 @@ def run_locked(a, brain, arch):
         for x, c in sorted(live.items()):
             if c["status"] != "superseded":
                 continue
-            end, why = chain_end(live, x)
+            end, why = idx.chain_end(x)
             if not end:
                 notes.append(f"REPORTED {x}: {why} — left in place")
                 continue
-            direct = ", ".join(successors(live, x))
+            direct = ", ".join(idx.successors(x))
             reasons[x] = f"{a.reason}; superseded-by {direct}" + (f" (live {end})" if end not in direct else "")
             wanted.append(x)
     else:
@@ -286,7 +318,7 @@ def run_locked(a, brain, arch):
     def reason_of(x):
         return reasons.get(x, a.reason)
 
-    accepted, more, edits = decide(brain, live, wanted, allow_chain, reason_of)
+    accepted, more, edits = decide(brain, idx, wanted, allow_chain, reason_of, a.keep_links)
     refused.update(more)
 
     mode = "APPLY" if a.apply else "DRY RUN"
