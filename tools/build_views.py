@@ -156,6 +156,11 @@ def card_problems(meta, legacy=None):
         problems.append("derived card with empty derived_from")
     if meta["level"] == "observation" and "evidence" not in meta:
         problems.append("observation without evidence")
+    # Every link element is ONE id (#241): `[K-1 K-2]` read as the single id "K-1 K-2"
+    # passed this gate and approve --dry-run until 2026-10-15 (K-96380). Readers split
+    # whitespace-separated lists (khms_lint.split_link_ids); what is still not an id
+    # after that is refused here, for the converter, approve and build_views alike.
+    problems += khms_lint.link_problems(meta.get("links"))
     return problems, grandfathered
 
 def load_cards():

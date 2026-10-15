@@ -47,6 +47,51 @@ BACK_EDGES = ("contradicts", "supersedes", "refuted_by")
 ESCAPE_RE = re.compile(r"^\s*NO-CORRECTION-TARGET:\s*\S", re.M)
 CARD_ID_RE = re.compile(r"\bK-\d{5}\b")
 
+# --- link lists: one element = ONE id (#241) ---------------------------------
+# The link keys a card's `links:` may hold (spec §4.10, plus the back pointer the
+# supersede writer adds).
+LINK_LIST_KEYS = ("derived_from", "supports", "contradicts", "refuted_by", "supersedes",
+                  "superseded_by")
+# A link element is a card id (`K-` and five or more digits) or a temp label of the
+# batch being approved: an upper-case letter, then letters/digits in dash-joined runs,
+# holding at least one digit (`C12`, `M2045`, `C25b`, `TMP-LEG-4`). Prose, a
+# bracketed `[[K-…]]`, a trailing comma and two ids joined by a space match neither.
+LINK_ID_RE = re.compile(r"K-\d{5,}|(?=\S*\d)[A-Z][A-Za-z0-9]*(?:-[A-Za-z0-9]+)*")
+# Whitespace and commas between ids are separators. Commas are YAML's own; whitespace
+# is what the per-mark writer emitted on 2026-10-15 (`supports=[K-a K-b]`), and with
+# only commas splitting, `K-a K-b` was ONE id that passed every check (K-96380).
+LINK_SEP_RE = re.compile(r"[\s,]+")
+
+
+def split_link_ids(val):
+    """-> list of link elements from a list, a scalar or None, split on whitespace and
+    commas, de-duplicated in order. Every reader of a link list goes through this, so
+    `[K-1 K-2]` and `[K-1, K-2]` are the same two edges everywhere."""
+    vals = val if isinstance(val, list) else ([] if val is None else [val])
+    out = []
+    for v in vals:
+        if v is None:
+            continue
+        for part in LINK_SEP_RE.split(str(v).strip()):
+            if part and part not in out:
+                out.append(part)
+    return out
+
+
+def link_problems(links):
+    """-> problems of a card's `links` dict: every element must be ONE id (LINK_ID_RE).
+    Texts carry no card id; the caller prefixes its own label."""
+    if not isinstance(links, dict):
+        return []
+    problems = []
+    for key in LINK_LIST_KEYS:
+        val = links.get(key)
+        for v in (val if isinstance(val, list) else ([] if val is None else [val])):
+            if v is None or not LINK_ID_RE.fullmatch(str(v)):
+                problems.append(f"links.{key}: {str(v)!r} is not a card id (K-NNNNN) or a temp "
+                                f"label -- one id per element, ids separated by commas")
+    return problems
+
 # Correction language, in tiers, because the word list alone does not
 # separate "this card corrects the record" from "we fixed a bolt".  Measured on
 # the 2187-card base of 2026-08-28: the flat word list fires on 476 cards (22 %

@@ -112,7 +112,7 @@ def fold_links_line(meta, body, unknown=None):
     if not isinstance(links, dict):
         links = {}
     for key, vals in LINK_KV_RE.findall(m.group(1)):
-        ids = [v.strip() for v in vals.split(",") if v.strip()]
+        ids = khms_lint.split_link_ids(vals)      # commas and whitespace separate ids (#241)
         if key not in LINK_KEYS:
             if unknown is not None:
                 unknown.append((str(meta.get("id", "?")), key))
@@ -127,6 +127,31 @@ def fold_links_line(meta, body, unknown=None):
         links[key] = cur
     meta["links"] = links
     return (body[:m.start()] + body[m.end():]).strip()
+
+
+def split_link_lists(meta):
+    """Split every whitespace-separated link list of one card into its ids, in place (#241).
+
+    `supports: [K-90001 K-90002]` is YAML for ONE string; read as one id it reached
+    the base as an edge to nothing, with the two real edges gone, and --dry-run passed
+    it (K-96380; until then only a reviewer's eye caught it). Splitting is unambiguous: an
+    id never contains whitespace. What is still not an id after the split is refused by
+    build_views.card_problems before any id is allocated, naming the card and the field.
+    A scalar (`supersedes: K-1`) stays a scalar when it holds one id.
+    """
+    links = meta.get("links")
+    holders = [links] if isinstance(links, dict) else []
+    holders.append(meta)                      # a top-level stray link key, nested later
+    for holder in holders:
+        for key in khms_lint.LINK_LIST_KEYS:
+            val = holder.get(key)
+            if val is None or (holder is meta and key not in LINK_KEYS):
+                continue
+            ids = khms_lint.split_link_ids(val)
+            if isinstance(val, list):
+                holder[key] = ids
+            else:
+                holder[key] = ids[0] if len(ids) == 1 else (ids or None)
 
 
 def cut_trailers(text):
@@ -258,6 +283,7 @@ def parse_cards(text, skipped=None, unknown_links=None):
             # drop trailing markdown commentary lines (e.g. "*(reviewer note)*")
             body = re.sub(r"\n\*\(.*?\)\*\s*$", "", body, flags=re.S).strip()
             body = fold_links_line(meta, body, unknown_links)
+            split_link_lists(meta)
             cards.append((meta, body))
 
     # pass 1: fenced cards (nightly-inbox format): ```yaml front \n---\n body ```

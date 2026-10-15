@@ -92,6 +92,7 @@ import yaml
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import khms_paths as P  # noqa: E402  (the base: tag registry, approve_inbox beside this file)
 import khms_patterns as KP  # noqa: E402  (the base's own tag vocabulary and scope names)
+import khms_lint as LINT  # noqa: E402  (link-list split and id grammar, #241)
 
 # --- card / body structure -------------------------------------------------
 
@@ -662,7 +663,8 @@ def parse_links(prose):
     if not m:
         return links, prose, rejected
     for key, vals in re.findall(r"([a-z_]+)\s*[=:]\s*\[([^\]]*)\]", m.group(1)):
-        ids = [v.strip() for v in vals.split(",") if v.strip()]
+        # commas AND whitespace separate ids (#241): `[K-1 K-2]` is two edges, not one
+        ids = LINT.split_link_ids(vals)
         if key not in LINK_KEYS:
             # Unknown keys are DROPPED LOUDLY.  build_views.py reads only the five
             # of §4.10, so an unknown one is not rejected anywhere downstream — it
@@ -737,7 +739,7 @@ def parse_relation(prose, links):
 def _put(meta, key, val):
     """One place where an incoming meta key lands, links normalised on the way."""
     if key in LINK_KEYS:
-        vals = val if isinstance(val, list) else ([] if val is None else [val])
+        vals = LINT.split_link_ids(val)       # `[K-1 K-2]` in a meta line is two ids (#241)
         cur = meta["links"].setdefault(key, [])
         for v in vals:
             if str(v) not in cur:
@@ -898,6 +900,9 @@ def convert(text, date, registry):
             # verify_relations.py drops those before this point on a nightly
             # file; the flag catches hand-written and legacy inputs.
             "" if relation else "R",
+            # I = a link element that is not ONE id after the split (#241): the
+            # self-check refuses the file on it, this says which row to read.
+            "I" if LINT.link_problems(meta["links"]) else "",
         ])
         rows.append((cid, meta["type"], meta.get("evidence", "—"),
                      ",".join(meta["tags"]), meta["source"], meta["scope"],
@@ -981,8 +986,8 @@ def expected_edges(rest):
     if m:
         for key, vals in re.findall(r"([a-z_]+)\s*[=:]\s*\[([^\]]*)\]", m.group(1)):
             if key in LINK_KEYS:
-                for i in (v.strip() for v in vals.split(",")):
-                    if i and i not in want.setdefault(key, []):
+                for i in LINT.split_link_ids(vals):
+                    if i not in want.setdefault(key, []):
                         want[key].append(i)
     blk = relation_block(rest)
     if blk:
@@ -1300,6 +1305,8 @@ def main(argv=None):
              "project)  L=derived card with", "       no derived_from (WILL fail "
              "build_views)  R=no RELATION line",
              "       T=type NOT resolvable to one of §4.2's nine without guessing",
+             "       I=a link element that is not one card id or temp label (WILL fail "
+             "approve)",
              "",
              f"{'id':6} {'type':19} {'evidence':9} {'flags':6} tags / scope / source"]
     for cid, typ, ev, tags, source, scope, flags, rejected, relation, notes in rows:
