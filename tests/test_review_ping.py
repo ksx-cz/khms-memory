@@ -286,3 +286,36 @@ def test_a_message_that_spells_out_a_configured_path_fails_the_check(tmp_path):
     lit = [ln for ln in r.stdout.splitlines() if ln.startswith("LITERAL-PATH")]
     assert r.returncode == 1 and len(lit) == 2, r.stdout
     assert "PING_SWEEP_FAILED" in lit[0] + lit[1] and "HOOK_NIGHT_RUNNING" in lit[0] + lit[1], lit
+
+
+# --- #243: the MARK stage's dollar cap is said in the morning -------------------------------------------------
+CAPLINE = ("2031-05-06T04:10:00+02:00 permark: MARK stage stopped at the $ cap: $99.96 of $100.00, "
+           "412 mark(s) left OPEN for the next night (reserve $0.1300 = the dearest mark so far)\n")
+
+
+@pytest.mark.parametrize("last_night", [True, False])
+def test_a_mark_stage_stopped_at_its_dollar_cap_is_said_only_for_the_last_night(tmp_path, base, last_night):
+    log = tmp_path / "agent" / "nightly.log"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    older = "2031-05-05T03:30:00+02:00 nightly start (night key 2031-05-05)\n"
+    last = "2031-05-06T03:30:00+02:00 nightly start (night key 2031-05-06)\n"
+    log.write_text(older + (last + CAPLINE if last_night else CAPLINE + last)
+                   + "2031-05-06T06:00:00+02:00 nightly done -> 1 inbox unit(s)\n")
+    p = ping(tmp_path, base, KHMS_PING_DRYRUN="1")
+    if not last_night:
+        assert "$ CAP" not in p.stdout, p.stdout
+        return
+    pend = _pending(p)
+    assert "THE MARK STAGE STOPPED AT ITS $ CAP ($99.96 of $100.00); 412 mark(s) stay OPEN" in pend, pend
+    assert str(log) in pend, pend
+
+
+def test_the_cap_message_takes_the_deployments_wording(tmp_path, base):
+    log = tmp_path / "agent" / "nightly.log"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    log.write_text("2031-05-06T03:30:00+02:00 nightly start (night key 2031-05-06)\n" + CAPLINE)
+    cfg = tmp_path / "cfg"
+    cfg.mkdir()
+    (cfg / "messages.env").write_text("PING_MARK_CAP=cap hit {spent}/{cap}, {n} open, see {KHMS_NIGHT_LOG}\n")
+    pend = _pending(ping(tmp_path, base, KHMS_PING_DRYRUN="1"))
+    assert f"cap hit $99.96/$100.00, 412 open, see {log}" in pend, pend

@@ -240,7 +240,15 @@ if os.environ.get("STUB_SYS"):                      # the rules the run handed t
         fh.write(args[args.index("--system-prompt") + 1])
 if os.environ.get("STUB_SLEEP"):
     import time; time.sleep(float(os.environ["STUB_SLEEP"]))
-print(json.dumps({"type": "result", "result": ans, "is_error": False, "total_cost_usd": 0.002, "num_turns": 1,
+cost = 0.002
+if os.environ.get("STUB_COSTS"):                    # a JSON list: call n costs item n (the last one repeats)
+    with open(os.environ["STUB_LOG"]) as fh:
+        n = sum(1 for _ in fh) - 1
+    seq = json.loads(os.environ["STUB_COSTS"])
+    cost = seq[min(n, len(seq) - 1)]
+    if cost is None:                                # a CLI that printed no JSON result: its cost is unknown
+        print("no json here"); sys.exit(0)
+print(json.dumps({"type": "result", "result": ans, "is_error": False, "total_cost_usd": cost, "num_turns": 1,
                   "modelUsage": {"stub-model": {}}, "usage": {"input_tokens": 10, "output_tokens": 5,
                   "cache_read_input_tokens": 3, "cache_creation_input_tokens": 1}}))
 '''
@@ -309,6 +317,37 @@ def test_no_mark_starts_after_the_deadline(tmp_path):
     n = len(stub_calls(tmp_path))
     assert 1 <= n <= 2, n
     assert f"deadline reached — {5 - n} mark(s) left OPEN" in r.stdout
+
+
+def test_no_mark_starts_once_the_dollar_cap_would_be_passed_and_the_rest_stays_open(tmp_path):
+    # #243: $1.00 per call, a $3.50 cap -> the reserve is the dearest mark so far ($1.00): marks 1-3 run
+    # ($3.00 charged), mark 4 would make it $4.00 > $3.50, so it and mark 5 stay OPEN; a cap stop is rc 0
+    root, q, stub = run_base(tmp_path)
+    r = run_pm(tmp_path, root, q, stub, "--max-usd", "3.5", STUB_COSTS="[1.0]")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert len(stub_calls(tmp_path)) == 3, stub_calls(tmp_path)
+    assert "permark: MARK stage stopped at the $ cap: $3.00 of $3.50, 2 mark(s) left OPEN" in r.stdout, r.stdout
+    out = (tmp_path / "out.md").read_text()
+    assert out.count(":: not know-how") == 3 and "M-00000004" not in out and "M-00000005" not in out, out
+    rows = [json.loads(ln) for ln in (tmp_path / "rows.jsonl").read_text().splitlines()]
+    assert sum(x["total_cost_usd"] for x in rows) <= 3.5
+
+
+def test_without_a_cap_every_mark_runs_whatever_it_costs(tmp_path):
+    root, q, stub = run_base(tmp_path)
+    r = run_pm(tmp_path, root, q, stub, STUB_COSTS="[1.0]")
+    assert r.returncode == 0 and len(stub_calls(tmp_path)) == 5, r.stdout + r.stderr
+    assert "$ cap" not in r.stdout
+
+
+def test_a_call_of_unknown_cost_is_charged_against_the_cap_as_the_dearest_call_not_as_zero(tmp_path):
+    # mark 1 costs $1.00; mark 2's two attempts print no JSON (cost unknown) and are charged $1.00 each, so
+    # $3.00 is charged and mark 3's reserve (the dearest mark, $2.00) would pass the $4.50 cap
+    root, q, stub = run_base(tmp_path)
+    r = run_pm(tmp_path, root, q, stub, "--max-usd", "4.5", STUB_COSTS="[1.0, null, null, 1.0]")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert len(stub_calls(tmp_path)) == 3, stub_calls(tmp_path)
+    assert "MARK stage stopped at the $ cap: $3.00 of $4.50, 3 mark(s) left OPEN" in r.stdout, r.stdout
 
 
 def test_an_unparsable_answer_leaves_the_mark_out_and_counts_it(tmp_path):

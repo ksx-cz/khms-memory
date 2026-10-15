@@ -21,6 +21,8 @@ import shutil
 import subprocess
 import sys
 
+import pytest
+
 from test_night_pipeline import TOOLS, WFAKE, carry_legacy, env_for, journal, log_of, make_base, run_week
 from test_sweep_resume import PART_FAKE, make_parts_base
 
@@ -96,6 +98,46 @@ def test_an_evaluator_call_past_its_own_deadline_stops_the_next_mark(tmp_path):
     assert re.search(r"permark: deadline reached — \d+ mark\(s\) left OPEN", log), log
     assert "marks-1 committed: 1 candidate(s)" in log, log           # what it decided is committed
     assert r.returncode == 0, log
+
+
+def queued_now(tmp_path, root):
+    """-> the ids the NEXT night's MARK stage would queue (the ledger's own queue, read after this night)."""
+    q = tmp_path / "next-queue.md"
+    subprocess.run([sys.executable, os.path.join(TOOLS, "mark_ledger.py"), "--root", str(root), "queue",
+                    "--out", str(q)], capture_output=True, text=True, check=True)
+    return re.findall(r"(?m)^- ([MG]-[0-9a-f]{8}) \|", q.read_text())
+
+
+@pytest.mark.parametrize("how", ["environment", "settings-file"])
+def test_the_mark_stage_stops_at_its_dollar_cap_and_the_rest_stays_open_without_failing_the_night(tmp_path, how):
+    # #243 (owner 2026-10-15: "set the night's cap to $100"): $1.00 per evaluator call under a $2.50 cap -> two marks,
+    # then the reserve (the dearest mark so far) would pass the cap; the rest is OPEN for the next night and the
+    # night ends as it would without the cap. The cap comes from MARK_BUDGET_USD or the settings file's
+    # KHMS_MARK_MAX_USD (the deployment's shared settings, never sourced as shell).
+    root, fake, tr = base(tmp_path, n_marks=6)
+    if how == "environment":
+        cap = {"MARK_BUDGET_USD": "2.5"}
+    else:
+        cfg = tmp_path / "settings.env"
+        cfg.write_text("KHMS_MARK_MAX_USD=2.5\n")
+        cap = {"KHMS_CONFIG_FILE": str(cfg)}
+    r = run(tmp_path, root, fake, tr, FAKE_MARK_COST="1.0", **cap)
+    log = log_of(root)
+    assert r.returncode == 0 and "nightly done" in log and "INCOMPLETE" not in log, log
+    assert len(calls(tmp_path, "permark")) == 2, (calls(tmp_path, "permark"), log)
+    n = int(re.search(r"per-mark evaluator: (\d+) queued id", log).group(1))
+    assert f"MARK stage stopped at the $ cap: $2.00 of $2.50, {n - 2} mark(s) left OPEN" in log, log
+    assert len(queued_now(tmp_path, root)) == n - 2, queued_now(tmp_path, root)
+
+
+def test_the_night_passes_its_dollar_cap_to_the_evaluator_and_defaults_it_to_100(tmp_path):
+    text = open(os.path.join(TOOLS, "nightly_distill.sh")).read()
+    assert re.search(r"(?m)^MARK_BUDGET_USD=\$\{MARK_BUDGET_USD:-100\}$", text)
+    root, fake, tr = base(tmp_path, n_marks=3)
+    r = run(tmp_path, root, fake, tr, FAKE_MARK_COST="1.0")
+    log = log_of(root)
+    assert r.returncode == 0 and "$ cap" not in log.split("=== marks ===", 1)[1].split("=== consolidate", 1)[0]
+    assert re.search(r"=== marks === .*no new mark once \$100(\.00)? would be passed", log), log
 
 
 def test_a_sweep_part_is_still_clipped_to_the_sweeps_own_deadline(tmp_path):

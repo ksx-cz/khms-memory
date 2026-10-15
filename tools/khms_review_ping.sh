@@ -288,6 +288,18 @@ if [ -s "$SFAIL" ]; then
   PENDING="${PENDING:+$PENDING + }$(M "$_skey" n="$_sn" first="$_sfirst" last="$_slast")"
 fi
 
+# THE MARK STAGE'S DOLLAR CAP (#243). permark.py stops taking new marks once the night's MARK_BUDGET_USD would be
+# passed and writes ONE line into the night log; the marks it left stay OPEN, which is not a failure, so nothing
+# else in the morning would say that the queue was cut by money rather than by time. Read from the LAST night
+# only (from its `nightly start` line on), so an older night's stop is never repeated.
+NIGHT_LOG="$(khms_get KHMS_NIGHT_LOG)"
+_cap="$(tac "$NIGHT_LOG" 2>/dev/null | sed -n '/ nightly start\b/q; p' \
+  | grep -m1 -oE 'MARK stage stopped at the \$ cap: \$[0-9.]+ of \$[0-9.]+, [0-9]+ mark' || true)"
+if [ -n "$_cap" ]; then
+  read -r _cspent _ccap _cn <<< "$(printf '%s' "$_cap" | sed -E 's/.*: (\$[0-9.]+) of (\$[0-9.]+), ([0-9]+) mark/\1 \2 \3/')"
+  PENDING="${PENDING:+$PENDING + }$(M PING_MARK_CAP spent="$_cspent" cap="$_ccap" n="$_cn")"
+fi
+
 # Weekly synthesis is due seven calendar dates after completion in the scheduler
 # timezone (inherited TZ, otherwise host timezone). A morning ping can precede
 # that day's completion: alarm only once the whole due date has passed, at +8.

@@ -133,6 +133,7 @@ DEFAULTS = [
     # --- standing-base triage (nightly_triage.sh, khms_contradict.py) -----------------------------------
     ("KHMS_JUDGE", "sonnet"),              # pair judge of record: qwen (local KHMS_LLM_URL) | a KHMS_AGENT model
     ("KHMS_JUDGE_MAX_USD", ""),            # estimated per-night bound of a paid judge ("" = no bound)
+    ("KHMS_MARK_MAX_USD", ""),             # the MARK stage's dollar cap per night (#243; "" = 100, 0 = no cap)
     ("KHMS_LLM_URL", ""),                  # local model endpoint (Ollama /api/generate; "" = no local model)
     ("KHMS_LLM_MODEL", "qwen3-coder-next:latest"),               # the local model's name
     ("KHMS_REPORT_TOOL", ""),                               # regex of the report tool ("" = built-in default)

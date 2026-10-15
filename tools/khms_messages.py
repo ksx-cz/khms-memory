@@ -68,6 +68,9 @@ DEFAULTS = {
     "PING_SWEEP_LIMIT": ("THE NIGHT SWEEP FAILED {n} TIMES IN A ROW (since {first}; last: {last}) -- the last one "
                          "stopped on the account's usage limit, which is transient: the night needs a re-run after "
                          "the limit resets, not a fix ('USAGE LIMIT' lines in {KHMS_NIGHT_LOG})"),
+    # the last night's MARK stage stopped at its dollar cap (#243; permark.py's `MARK stage stopped at the $ cap`)
+    "PING_MARK_CAP": ("THE MARK STAGE STOPPED AT ITS $ CAP ({spent} of {cap}); {n} mark(s) stay OPEN for the next "
+                      "night -- not a failure, the cap is MARK_BUDGET_USD ('MARK stage stopped' in {KHMS_NIGHT_LOG})"),
     "PING_WEEK_MISSED": "THE WEEKLY RUN DID NOT FINISH (last: {last})",
     # KHMS_WEEK_PAUSED is set: the weekly is not failing, it is paused on purpose
     "PING_WEEK_PAUSED": "THE WEEKLY RUN IS PAUSED ({reason}; last: {last})",

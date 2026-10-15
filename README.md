@@ -180,7 +180,9 @@ The night's sources reach the base through one evaluator:
    `origin: generated` in the ledger; they are quoted with their own label (`src=digest`/`src=gitlog`).
 2. **The per-mark evaluator** (`permark.py`, `prompts/nightly-marks.md`) takes the ledger's queue — the OPEN
    journal MARKs (`M-`) and generated lines (`G-`) on one time axis — and handles them one after another
-   until `MARK_BUDGET_MIN` (150 min) from its own start. For each it assembles a packet with 0 tokens (the
+   until `MARK_BUDGET_MIN` (150 min) from its own start, or until its dollar cap per night (`MARK_BUDGET_USD`
+   or the setting `KHMS_MARK_MAX_USD`, default $100, 0 = none) would be passed by the charge so far plus the
+   dearest mark so far; the rest stays OPEN and the morning ping says so. For each it assembles a packet with 0 tokens (the
    journal context, the cards the mark names, the lexical and hybrid top 8 (the top `KHMS_PERMARK_WHOLE_TOP`
    of each, default 3, shown whole, the rest summarised; `KHMS_PERMARK_LINKS_LINE=1` adds each card's type
    and link ids under its heading, default off), the k nearest of tonight's

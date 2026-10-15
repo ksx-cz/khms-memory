@@ -178,7 +178,8 @@ CONSOLIDATE_BATCH=${CONSOLIDATE_BATCH:-25}
 #   * the CARRY QUEUE (memory/ledger/carry/): consolidate runs in batches, every batch
 #     file stays in the carry queue until its output is merged into the inbox, so a batch
 #     the night did not reach (budget, failure, kill) is what the next night does FIRST.
-# The night's TIME is the only bound, and what does not fit is carried, never dropped.
+# The night's TIME bounds every stage (the MARK stage also has a dollar cap, MARK_BUDGET_USD below), and what does
+# not fit is carried, never dropped.
 LEDGER_TOOL=$CODE/mark_ledger.py
 BATCH_TOOL=$CODE/nightly_batch.py
 CARRY=$ROOT/memory/ledger/carry
@@ -206,6 +207,15 @@ PERMARK_TIMEOUT_S=${PERMARK_TIMEOUT_S:-180}
 # evaluator handles marks one after another, so each sees every decision made before it (the in-night
 # duplicate rule) with no locking; 150 min at 12-20 s per mark is ~450-750 marks a night.
 MARK_BUDGET_MIN=${MARK_BUDGET_MIN:-150}
+# MARK_BUDGET_USD 100 (#243, owner 2026-10-15 08:54: "set the night's cap to $100"): the MARK stage's DOLLAR cap per
+# night, next to its time budget. The night of 2026-10-14 ran the stage for 300 min and spent $63.10 in it (the
+# CLI's total_cost_usd), and the account hit its limit soon after. permark.py starts no new mark once what the
+# stage charged + the dearest mark so far would pass it; the rest stays OPEN for the next night exactly as at the
+# time budget, and a cap stop is not a failure (rc 0, the night's verdict unchanged). 0 = no dollar cap.
+# Read like the triage's judge bound (nightly_triage.sh): the environment, else the setting KHMS_MARK_MAX_USD
+# (the deployment's settings file), else 100.
+MARK_BUDGET_USD=${MARK_BUDGET_USD:-$(khms_get KHMS_MARK_MAX_USD)}
+MARK_BUDGET_USD=${MARK_BUDGET_USD:-100}
 CARD_BUDGET_MIN=${CARD_BUDGET_MIN:-280}
 # Attempts per batch/chunk (the sweep keeps nightly_retry.sh's default 3): a batch that
 # fails twice is carried, and the next one is tried rather than spending the night on it.
@@ -881,7 +891,7 @@ if [ "$DRYRUN" = "1" ]; then
   # `|| true`: an EMPTY queue is a normal night; under `set -o pipefail` grep's rc 1 used to end
   # the dry run here with rc 1, before the MARK-stage limits, quote sources and triage were printed.
   { grep -m3 -E '^- [MG]-' "$QUEUE" || true; } | cut -c1-160 | sed 's|^|    |'
-  echo "  MARK stage: the per-mark evaluator (permark.py, #237) AFTER the generator: one packet and ONE call without tools per queued id (journal M- and generated G-, one time axis), timeout ${PERMARK_TIMEOUT_S}s per call, no new mark later than ${MARK_BUDGET_MIN} min after the stage starts"
+  echo "  MARK stage: the per-mark evaluator (permark.py, #237) AFTER the generator: one packet and ONE call without tools per queued id (journal M- and generated G-, one time axis), timeout ${PERMARK_TIMEOUT_S}s per call, no new mark later than ${MARK_BUDGET_MIN} min after the stage starts, no new mark once \$${MARK_BUDGET_USD} would be passed (0 = no dollar cap)"
   echo "  its output is committed once as $CARRY/<night key>-m01/ with every batch's durable output (split-run --ready): published without a consolidate call"
   echo "  grounding journal source (window + every journal from $LFLOOR): $JVERIFY ($(stat -c%s "$JVERIFY") B)"
   echo "  know-how test: consolidate prompt $(grep -c 'not know-how' "$CODE/prompts/nightly-consolidate.md" || true) line(s), MARK prompt $(grep -c 'not know-how' "$CODE/prompts/nightly-marks.md" || true) line(s) name the drop reason; each output's drops are logged as 'know-how (<stage>): …'"
@@ -1172,7 +1182,8 @@ finish_batch() {    # the carry cleanup — repeatable, the batch is already pub
 # every batch's durable output (split-run --ready), so the consolidation below publishes it WITHOUT a model
 # call. A kill before the rename leaves its marks OPEN (they are evaluated again: it costs money, nothing
 # is lost); a kill after it leaves the whole result in carry, where the ledger counts its ids as proposed.
-# A deadline or the usage limit ends the evaluator early: what it decided is committed, the rest stays OPEN.
+# A deadline, the dollar cap (MARK_BUDGET_USD, #243) or the usage limit ends the evaluator early: what it decided
+# is committed, the rest stays OPEN. The cap writes one line `MARK stage stopped at the $ cap: …` (exit 0).
 mark_commit() {   # mark_commit <evaluator output> <run key> <chunk number> -> 0 when committed as $CARRY/<run key>
   local out="$1" key="$2" k="$3" rel="$STAGING/nightly-$2-carry.md"
   local gd="$STAGING/nightly-$NK-ground-digest.txt" gg="$STAGING/nightly-$NK-ground-git.txt"
@@ -1200,12 +1211,12 @@ ledger queue --out "$QUEUE" >> "$LOG" 2>&1 \
   || { echo "$(date -Is) mark ledger queue FAILED (non-fatal) — no MARK stage tonight" >> "$LOG"; : > "$QUEUE"; }
 QUEUE_N=$(grep -cE '^- [MG]-' "$QUEUE" 2>/dev/null) || QUEUE_N=0
 QUEUE_G=$(grep -cE '^- G-' "$QUEUE" 2>/dev/null) || QUEUE_G=0
-echo "$(date -Is) === marks === per-mark evaluator: $QUEUE_N queued id(s) ($QUEUE_G generated line(s)); no new mark after $(date -d @"$MARK_DEADLINE" +%H:%M) (+${MARK_BUDGET_MIN} min from this stage's start)" >> "$LOG"
+echo "$(date -Is) === marks === per-mark evaluator: $QUEUE_N queued id(s) ($QUEUE_G generated line(s)); no new mark after $(date -d @"$MARK_DEADLINE" +%H:%M) (+${MARK_BUDGET_MIN} min from this stage's start); no new mark once \$${MARK_BUDGET_USD} would be passed (0 = no dollar cap)" >> "$LOG"
 MOUT=$STAGING/nightly-$NK-markout.md
 MKEY=$NK-m01
 if [ "$QUEUE_N" -gt 0 ] && [ -n "$AGENT_BIN" ] && ! limit_stop "the MARK stage ($QUEUE_N queued id(s) stay OPEN)"; then
   PRC=0
-  python3 "$CODE/permark.py" --queue "$QUEUE" --out "$MOUT" --deadline "$MARK_DEADLINE" --agent "$AGENT_BIN" \
+  python3 "$CODE/permark.py" --queue "$QUEUE" --out "$MOUT" --deadline "$MARK_DEADLINE" --max-usd "$MARK_BUDGET_USD" --agent "$AGENT_BIN" \
     --model "$MARK_MODEL" --timeout "$PERMARK_TIMEOUT_S" --log "$LOG" --jsonl "$STAGING/nightly-$NK-permark.jsonl" \
     --served-file "$RETRY_SERVED_FILE" --limit-flag "$RETRY_LIMIT_FLAG" > /dev/null 2>>"$LOG" || PRC=$?
   if [ "$PRC" = "75" ]; then limit_stop "the rest of the MARK queue" || true; fi

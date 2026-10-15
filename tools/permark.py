@@ -2,7 +2,7 @@
 """permark.py — the nightly MARK stage as a per-mark evaluator: one packet, one call, one decision (#237).
 
 Usage:
-  permark.py --queue Q --out OUT [--deadline EPOCH] [--limit N] [--agent BIN] [--model sonnet]
+  permark.py --queue Q --out OUT [--deadline EPOCH] [--max-usd X] [--limit N] [--agent BIN] [--model sonnet]
              [--log LOG] [--jsonl J] [--served-file F] [--limit-flag F] [--timeout 180]
              [--packets DIR] [--dry] [--tonight-k 5] [--packet-chars 32000] [--whole-top 3]
              [--links-line 0|1] [--short-answers 0|1] [--covered-rule 0|1] [--effort E] [--format-check 0|1]
@@ -13,10 +13,12 @@ Usage:
         `MARKS:` lines, then `## MARKS NOT CARDED`).  It is rewritten ATOMICALLY after every mark; a run
         with the same OUT skips every id already decided in it (resume by id).
   --deadline  no NEW mark is started at or after this epoch (the stage's budget).
+  --max-usd   no NEW mark is started once what this run charged + the dearest mark so far would pass X
+              dollars (the stage's dollar cap, #243; 0 = no cap).  See THE DOLLAR CAP below.
   --limit     at most N marks this run (a smoke or test run).
   --packets   also write every packet to DIR/<id>.txt (forensics, the hand check).
   --dry       build the packets only (implies --packets when given), no model call, OUT untouched.
-  exit 0 done / deadline / limit; 75 the account's usage limit answered (the flag file is written);
+  exit 0 done / deadline / dollar cap / limit; 75 the account's usage limit answered (the flag file is written);
   2 a setup error (no queue, no agent, no prompt).
 
 WHY.  Until #237 the stage handed the model 60 bare queue lines; the model looked up each mark's journal
@@ -96,6 +98,17 @@ a check failing for its own reason must not cost calls.
 LOGGED, NEVER GATED: `quotes-unproven` (an "already carded" or "covered by" quote mark_ledger.quote_in_card does not find
 in the card) and `unseen-nearest` (a new candidate whose own nearest top 3 hold an id the packet lacked).
 """
+# THE DOLLAR CAP (#243, owner 2026-10-15: "set the night's cap to $100"). Until then the stage had only its time
+# budget, and the night of 2026-10-14 spent $63.10 in it (300 min). Every call is charged its CLI
+# `total_cost_usd`; a call whose cost is UNKNOWN (a timeout, no JSON result) is charged as the dearest call seen
+# so far, never as $0.  Before each NEW mark the RESERVE -- the dearest mark so far, all its calls (attempts and
+# the format retry) -- is added to what is charged; if that would pass --max-usd, the stage stops exactly as at
+# its deadline: what it decided is committed, the rest stays OPEN for the next night, exit 0, and ONE line
+# `MARK stage stopped at the $ cap: $X of $Y, N mark(s) left OPEN` (the morning ping repeats it).  The triage's
+# judge bound (khms_contradict.JudgeBudget) estimates each call's worst case from prices and token caps; here
+# the measured cost of the run's own marks is the estimate (2026-10-14: median $0.0416, max $0.1291 per call),
+# so no price table is read.  Like the judge's, it is an estimated bound, not a guaranteed hard cap: a mark
+# dearer than every mark before it can pass the cap by its own excess, once -- it is the last mark of the run.
 import argparse
 import datetime as dt
 import io
@@ -952,6 +965,7 @@ class Counters:
     def __init__(self):
         self.n = self.turns = self.cands = 0
         self.cost = 0.0
+        self.charged = self.max_call = self.max_mark = 0.0      # the dollar cap's accounts (#243)
         self.dec = {k: 0 for k in DECISIONS}
         self.unparsed = self.failed = self.unproven = self.unseen = self.covered = 0
         self.fretry = self.ffailed = 0
@@ -1109,13 +1123,22 @@ def run(a):
                   f"links line {'on' if links else 'off'}, short answers {'on' if short else 'off'}, "
                   f"covered rule {'on' if covered else 'off'}, effort {effort}, format check {fmt_note}")
     rc = 0
+    mark_start = None                    # what was charged when the previous mark started (its own charge follows)
     for i, mk in enumerate(todo):
+        if mark_start is not None:
+            C.max_mark = max(C.max_mark, C.charged - mark_start)
         if a.limit and C.n >= a.limit:
             log_to(a.log, f"permark: limit of {a.limit} mark(s) reached — {len(todo) - i} left OPEN")
             break
         if a.deadline and time.time() >= a.deadline:
             log_to(a.log, f"permark: deadline reached — {len(todo) - i} mark(s) left OPEN for the next night")
             break
+        if a.max_usd and C.charged + C.max_mark > a.max_usd + 1e-9:
+            log_to(a.log, f"permark: MARK stage stopped at the $ cap: ${C.charged:.2f} of ${a.max_usd:.2f}, "
+                          f"{len(todo) - i} mark(s) left OPEN for the next night (reserve ${C.max_mark:.4f} = the "
+                          f"dearest mark so far)")
+            break
+        mark_start = C.charged
         tp = time.time()
         ps = {}
         packet, shown, _labs = build_packet(mk, root, R, doc, T, k=k, budget=budget, stats=ps,
@@ -1147,6 +1170,9 @@ def run(a):
                 with open(a.served_file, "a", encoding="utf-8") as fh:
                     fh.write(f"permark-{mk['id']}\t{','.join(res['models']) or 'UNKNOWN'}\n")
             C.cost += float(res["cost"] or 0)
+            if res["cost"] is not None:
+                C.max_call = max(C.max_call, float(res["cost"]))
+            C.charged += float(res["cost"]) if res["cost"] is not None else C.max_call   # unknown != $0
             C.turns += int(res["turns"] or 0)
             return res
 
@@ -1247,6 +1273,9 @@ def main(argv=None):
     ap.add_argument("--out", required=True)
     ap.add_argument("--root", default=None)
     ap.add_argument("--deadline", type=float, default=0)
+    ap.add_argument("--max-usd", type=float, default=0,
+                    help="the stage's dollar cap: no new mark once the charge + the dearest mark would pass it "
+                         "(0 = no cap; the night passes MARK_BUDGET_USD)")
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--agent", default=None)
     ap.add_argument("--model", default=os.environ.get("KHMS_MARK_MODEL") or "sonnet")

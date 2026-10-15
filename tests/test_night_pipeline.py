@@ -64,7 +64,7 @@ if permark:
         ans = "DECISION: new\n" + card("M1", text.split(" (src=")[0], f"MARKS: {mid}\n", g.group(1), g.group(2))
     else:
         ans = "DECISION: new\n" + card("M1", text, f"MARKS: {mid}\n")
-    print(json.dumps({"type": "result", "result": ans, "is_error": False, "total_cost_usd": 0.01,
+    print(json.dumps({"type": "result", "result": ans, "is_error": False, "total_cost_usd": float(os.environ.get("FAKE_MARK_COST") or 0.01),
                       "num_turns": 1, "modelUsage": {os.environ.get("FAKE_SERVED") or "fake-model-1": {}},
                       "usage": {"input_tokens": 100, "output_tokens": 50}}))
 elif stage == "consolidate":
