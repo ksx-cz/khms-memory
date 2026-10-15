@@ -7,7 +7,7 @@ Usage: python3 tools/khms_search.py <query ...>   (normally through tools/recall
 
 Extracted 2026-08-04 from recall.sh's embedded python so the hook layer and the
 CLI cannot drift apart. Scoring is IDENTICAL to the original: idf per token,
-first-line x3, tag x1.5, phrase +10, fog x0.6. Additions are structural only:
+first-line x3, tag x1.5, phrase +10, fog x0.6 (no card is fog since #219). Additions are structural only:
 frontmatter links/level are parsed, and a reverse index answers "which card
 corrects this one" (supersedes/contradicts/refuted_by) so a consumer never
 serves a refuted card without its refuter.
@@ -82,9 +82,12 @@ def _parse_links(front):
 def load_cards():
     cards = []
     mem = MEM or P.MEM
-    for path in sorted(glob.glob(f"{mem}/know/K-*.md")) + \
-            sorted(glob.glob(f"{mem}/archive/know/K-*.md")):
-        fog = "/archive/" in path
+    # memory/archive/know/ is NOT read (#219, owner 2026-10-15): a card moved there — superseded, or a
+    # state-only card thrown out by khms_archive.py — has left the base, and recall, the hook and the
+    # dense index (all of which read this function) must not serve it. It used to be read as "fog" at
+    # x0.6; the key stays False so the consumers that test it keep working.
+    for path in sorted(glob.glob(f"{mem}/know/K-*.md")):
+        fog = False
         try:
             text = open(path, encoding="utf-8", errors="replace").read()
         except OSError:

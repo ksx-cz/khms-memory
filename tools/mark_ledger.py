@@ -254,6 +254,7 @@ class Paths:
         self.root = root
         self.journal = os.path.join(root, "journal")
         self.know = os.path.join(root, "memory", "know")
+        self.archive_know = os.path.join(root, "memory", "archive", "know")
         self.inbox = os.path.join(root, "memory", "inbox")
         self.reviewed = reviewed or _review_dir(root)
         self.ledger = os.path.join(root, "memory", "ledger")
@@ -263,6 +264,7 @@ class Paths:
         self.marks = os.path.join(self.ledger, "marks.jsonl")
         self.summary = os.path.join(self.ledger, "summary.json")
         self.floor_file = os.path.join(self.ledger, "FLOOR")
+        self.archived = os.path.join(self.ledger, "archive.jsonl")
 
 
 def norm(s):
@@ -466,10 +468,10 @@ WORD_RE = re.compile(r"[A-Za-z\u00c0-\u017e0-9_./-]{5,}")
 MIN_QUOTE = 30
 
 
-def read_cards(paths):
-    """-> list of (card id, date, text) for every card file."""
+def read_cards(paths, where=None):
+    """-> list of (card id, date, text) for every card file (of memory/know/, or of `where`)."""
     cards = []
-    for f in sorted(glob.glob(os.path.join(paths.know, "K-*.md"))):
+    for f in sorted(glob.glob(os.path.join(where or paths.know, "K-*.md"))):
         try:
             text = open(f, encoding="utf-8", errors="replace").read()
         except OSError:
@@ -697,6 +699,40 @@ def proposed_ids(paths):
 
 
 # --- events ----------------------------------------------------------------------
+def archived_cards(paths):
+    """-> ({id: why} of every card in memory/archive/know/, list of (id, date, text)).
+
+    #219: a card moved out of the base (khms_archive.py — state-only or superseded) still COVERS the
+    marks its `marks:` frontmatter names: the know-how decision for those marks was taken, and an
+    archived cover must not reopen them into the night's queue. `why` is the card's archive.jsonl line
+    (date, by, reason) when it has one."""
+    cards = read_cards(paths, paths.archive_know)
+    recs = {}
+    try:
+        with open(paths.archived, encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    r = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(r, dict) and r.get("id"):
+                    recs[r["id"]] = r
+    except OSError:
+        pass
+    why = {}
+    for cid, _d, _t in cards:
+        r = recs.get(cid)
+        why[cid] = (f"archived {r.get('date', '?')} by {r.get('by', '?')}: {r.get('reason', '')}" if r
+                    else "archived")
+    return why, cards
+
+
+def card_file(paths, cid):
+    """The card's file: memory/know/, else memory/archive/know/."""
+    p = os.path.join(paths.know, cid + ".md")
+    return p if os.path.exists(p) else os.path.join(paths.archive_know, cid + ".md")
+
+
 def read_events(paths):
     last = {}
     try:
@@ -757,9 +793,12 @@ def derive(paths, floor, until=None, skipped=None):
     marks = collect_marks(paths, floor, until, skipped)
     events = read_events(paths)
     cards = read_cards(paths)
-    links = structural_links(cards)
-    suggested = suggest_cards(marks, cards, floor)
-    known_cards = {c[0] for c in cards}
+    live_ids = {c[0] for c in cards}
+    gone, gone_cards = archived_cards(paths)
+    gone = {cid: why for cid, why in gone.items() if cid not in live_ids}
+    links = structural_links(cards + [c for c in gone_cards if c[0] in gone])
+    suggested = suggest_cards(marks, cards, floor)          # a suggestion only ever names a live card
+    known_cards = live_ids | set(gone)
     prop = proposed_ids(paths)
     dups = {}
     for mid, mk in marks.items():
@@ -778,9 +817,13 @@ def derive(paths, floor, until=None, skipped=None):
         elif kind == "card" and ev.get("card") in known_cards:
             state, card, how = "CARDED", ev["card"], "event"
             reason = ev.get("reason") or f"card event by {ev.get('by', '?')} {ev.get('ts', '')}"
+            if card in gone:
+                reason += f" ({gone[card]})"
         elif linked:
             state, card, how = "CARDED", linked[0], "marks"
             reason = f"`marks:` frontmatter of {linked[0]}"
+            if card in gone:
+                reason += f" ({gone[card]})"
         mk["state"] = state
         if card:
             mk["card"], mk["how"] = card, how
@@ -1391,7 +1434,7 @@ def cmd_recheck_carded(a, paths):
         cid = ev["card"]
         if cid not in texts:
             try:
-                texts[cid] = _match_norm(open(os.path.join(paths.know, cid + ".md"),
+                texts[cid] = _match_norm(open(card_file(paths, cid),
                                               encoding="utf-8", errors="replace").read())
             except OSError:
                 texts[cid] = ""
