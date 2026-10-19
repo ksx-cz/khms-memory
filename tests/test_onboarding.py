@@ -57,7 +57,7 @@ def test_clean_clone_init_recall_hook_and_locked_update(tmp_path):
     hook = run('python3', str(tools / 'khms_hook.py'), input=json.dumps(
         {'hook_event_name': 'SessionStart', 'session_id': 'onboarding'}))
     context = json.loads(hook.stdout)['hookSpecificOutput']['additionalContext']
-    assert 'base:' in context and 'verified:' in context and 'if I were wrong:' in context
+    assert 'base:' not in context and 'verified:' in context and 'if I were wrong:' in context
     assert 'mandatory reply lines' not in context and '-->' not in context
     assert 'MARK coverage unavailable' not in context
     assert 'no state' not in context and 'FileNotFoundError' not in context
