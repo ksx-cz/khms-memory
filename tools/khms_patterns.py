@@ -17,7 +17,7 @@ are NOT expanded). Absent file = English only. Keys:
   (LINT_RECORD_CTX — generic record words — is retired since #237: khms_lint.py says so on stderr.)
   HOOK_<NAME>=<value>             a matcher of khms_hook.py that REPLACES its English default
                                   (regex(), value()) or extends it (words()); khms_hook.py names each key:
-                                  HOOK_CLAIM_KEYWORD, HOOK_CLAIM_HONEST, HOOK_DOMAIN, HOOK_PROPOSAL_MARKER,
+                                  HOOK_DOMAIN, HOOK_PROPOSAL_MARKER,
                                   HOOK_PROPOSAL_REF, HOOK_PROPOSAL_CHOICE, HOOK_PROPOSAL_SKIP,
                                   HOOK_PROPOSAL_META, HOOK_PROPOSAL_STOPWORDS, HOOK_PROPOSAL_GENERIC
   OWNERQ_<NAME>=<value>           verify_owner_quotes.py: the principal's name forms and wording, self-test

@@ -105,8 +105,7 @@ DEFAULTS = {
     "JOB_MARKERS": ("# Nightly sweep|# Weekly synthesis|# KHMS consolidation instructions"
                     "|# KHMS history-extraction instructions|[AUTO-PING] KHMS review"),
     # --- khms_hook.py -------------------------------------------------------------------------------
-    "HOOK_DIRECTIVE_LINE": ("REQUIRED: base: <what I searched for -> the cards, or 'did not search - why'>"
-                            " \u00b7 verified: <the command or file:line whose output I read | unverified>"
+    "HOOK_DIRECTIVE_LINE": ("REQUIRED: verified: <the command or file:line whose output I read | unverified>"
                             " \u00b7 if I were wrong: <how that output would have looked different>"
                             "  (definition: tools/prompts/report_directive.md)"),
     "HOOK_LEDGER_NONE": "MARK LEDGER: no state ({exc}) -- run tools/mark_ledger.py sync",
@@ -138,23 +137,8 @@ DEFAULTS = {
     "HOOK_NIGHT_WIP": " Written by the running night (review them after it ends): {files}.",
     "HOOK_PRECHECK_HEAD": "KHMS precheck (risky command: {tags}) -- active policies, gotchas and refuted dead ends:",
     "HOOK_PRECHECK_FOOT": "If any of it applies, open the card whole before running the command.",
-    "HOOK_CLAIM_DENY_CITE": ("base: cites cards without a recall in this turn -- run `tools/recall.sh "
-                             "'<query>'` and send again, or write `base: did not search - <why>`. (reason: {why};"
-                             " checked: the src=cli lines of the recall log since this report turn began)"),
-    "HOOK_CLAIM_DENY_MISSING": ("The report lacks the required `base:` line ({why}). Write `base: <query of "
-                                "tools/recall.sh> -> <cards>`, or honestly `base: did not search - <why>`; both "
-                                "are valid, silence is not. Definition: tools/prompts/report_directive.md"),
-    "HOOK_WHY_NO_LINE": "no claim line ({n} chars)",
-    "HOOK_WHY_SHORT": "short reply",
-    "HOOK_WHY_NOT_A_TURN": "outside a report turn",
-    "HOOK_WHY_HONEST": "honest form ({form})",
-    "HOOK_WHY_NO_IDS": "line without card ids",
     "HOOK_WHY_NO_TURN": "no report turn in this session",
     "HOOK_WHY_NO_DISPATCH_TURN": "no turn in this session",
-    "HOOK_WHY_NO_RECALL": "no src=cli recall in this turn",
-    "HOOK_WHY_NO_QUERY": "no query, but a recall ran in this turn",
-    "HOOK_WHY_MATCH": "{pct}% match with a recall of this turn",
-    "HOOK_WHY_LOW_MATCH": "best match with a recall of this turn only {pct}%",
     "HOOK_WHY_NO_PROPOSAL": "no proposal",
     "HOOK_WHY_UNCOVERED": ("{n} of {total} proposals without a bound recall on their subject (bound recalls "
                            "in this turn: {bound})"),

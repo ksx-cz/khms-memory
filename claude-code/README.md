@@ -34,10 +34,10 @@ the only one in the whole system.
 | Event | Matcher | What the hook does |
 |---|---|---|
 | `SessionStart` | — | Reports an unreviewed inbox ("review it before other work"; silent when the inbox is clean) and puts the full reply directive into the session ONCE. |
-| `UserPromptSubmit` | — | Scores the operator's message against the card base; injects up to two cards plus their correctors, appends the one-line directive pointer, and opens a gated turn for the retrieval-claim gate. |
+| `UserPromptSubmit` | — | Scores the operator's message against the card base; injects up to two cards plus their correctors, and appends the one-line directive pointer. |
 | `PreToolUse` | `Bash` | Runs `precheck.sh` automatically for a named risky-command class (`rm -rf`, `rsync --delete`, `systemctl`, `git push --force`, `kubectl delete`, `terraform apply`, `DROP TABLE`, …). Otherwise scores the command text. |
 | `PreToolUse` | `Edit\|Write` | Scores the file path and the edited text — the moment before a change is when a gotcha card is worth most. |
-| `PreToolUse` | *your report tool* | The retrieval-claim gate: DENIES a report whose `base:` line cites card ids that no explicit recall of this turn backs. Set the matcher and `KHMS_REPORT_TOOL` to the tool your agent reports to its principal through. |
+| `PreToolUse` | *your report tool* | Never refuses a report: it only stamps the reply for the Stop gate. Cards are input to the agent, not output to the principal, so a report carries no `base:` line and no card ids. Set the matcher and `KHMS_REPORT_TOOL` to the tool your agent reports to its principal through. |
 
 **`PostToolUse` and `PostToolUseFailure` are deliberately not wired.** They were, and the
 argument for them was good — "an error string is a near-perfect query" — but the measurement
@@ -48,20 +48,18 @@ measured it is the thing this whole system exists to prevent. Wire them back if 
 in `tools/khms_experiment.json`. See [docs/measuring-injection.md](../docs/measuring-injection.md).
 
 **The reply directive is a file, not a constant.** `tools/prompts/report_directive.md` holds
-the three mandatory lines (`base:` / `verified:` / `if I were wrong:`). It enters the session
+the mandatory lines (`verified:` / `if I were wrong:`). It enters the session
 once at `SessionStart`; every prompt afterwards carries a single pointer line. As a constant it
 was 1813 characters appended to every operator prompt — 46 times on one measured day, the same
 paragraph each time.
 
-**The retrieval-claim gate closes the loop on `base:`.** The mandatory line asks the agent to
-say what it searched for. Until the gate existed, that line was satisfiable from the hook's own
-injection — a check whose passing condition held whether or not a retrieval had happened, which
-is exactly the failure shape the base has a card about. The gate denies two things and nothing
-else: a substantial report with no `base:` line, and a `base:` line that cites card ids while no
-`src=cli` recall since the turn began matches the query it claims to have run. A line that cites
-no card, and every honest form ("did not search", "nothing on record"), always passes — the
-thing being checked is a CITATION, not the wording. Every verdict, including the allows, goes
-into `KHMS_CLAIM_LOG` (default `state/claim_gate.log` in a private base).
+**No gate on the report itself.** Earlier versions refused a report without a `base:` line, a
+report whose `base:` line cited cards without a recall of the same turn, a report carrying a
+proposal with unseen relevant cards, and a report using non-preferred terminology. Every refusal
+cost a full resend of the report; measured over one week in the reference deployment, 113 such
+refusals cost more than the rest of the harness together, and the cards they forced into the
+report are not for the principal. They were removed; retrieval stays on the input side (the
+injection above, `recall.sh`, and the dispatch gate on a brief).
 
 The hook returns `{"hookSpecificOutput": {"hookEventName": …, "additionalContext": …}}` — the
 text lands in the model's context for that turn. Printing nothing means "no injection", which is

@@ -49,7 +49,6 @@ so a week's records say which week they belong to:
   "name": "no-ups",
   "inject": {"UserPromptSubmit": false, "PostToolUse": false,
              "PostToolUseFailure": false, "PreToolUse": true},
-  "claim_gate": true,
   "review_on": "2026-03-08",
   "why": "one line, so that in a week you know what you were asking"
 }

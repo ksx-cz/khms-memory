@@ -4,12 +4,7 @@
      agent's own instructions already carry. It now enters the session ONCE, at
      SessionStart, and each prompt carries one pointer line instead. Edit it here;
      nothing else defines these lines. -->
-REQUIRED in every reply, one line:  base: <what I searched for> -> <the cards it returned, or "nothing on record">
-
-If any card is relevant, open it whole (memory/know/<id>.md) and follow its links. If
-nothing fits, say that too: "nothing on record" is a valid and useful answer.
-
-ALSO REQUIRED whenever you assert anything about the STATE of a system (running or
+REQUIRED whenever you assert anything about the STATE of a system (running or
 stopped, deployed, configured, measured X):  verified: <the command or file:line whose
 OUTPUT I just read>
 

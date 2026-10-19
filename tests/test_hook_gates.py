@@ -4,8 +4,9 @@
 Every case runs tools/khms_hook.py as a subprocess against a temporary base made by khms_init.sh, with
 the shipped English wording and matchers (the conftest strips every KHMS_* variable). Covered here:
 
-  * PROPOSAL GATE: searches relevant cards, shows new results once per author context.
-    An unrelated transcript recall is not a substitute; no-hit is explicitly logged.
+  * NO GATE ON A REPORT (#247): a report carrying a proposal, a glossary term and no `base:` line
+    passes PreToolUse and lets the Stop gate end the turn -- the reply proposal, claim and terminology
+    gates were removed; cards are input to the agent, not output to the principal.
   * DISPATCH GATE on the Agent tool: the same rule for a brief; an unreadable brief fails OPEN, and the
     fail-open is logged and shown at the next SessionStart (a broken gate must not look like an idle one).
   * STOP GATE: the principal's last report-channel message is owed an answer; a terminal prompt, a
@@ -14,7 +15,7 @@ the shipped English wording and matchers (the conftest strips every KHMS_* varia
   * MESSAGE CATALOGUE: every key the code asks for exists in the English defaults, and a deployment's
     messages file replaces the wording (here: the corrector pointer of an injection).
 
-The claim gate (`base:` line) and the directive are covered by test_hook_directive.py.
+The directive is covered by test_hook_directive.py.
 """
 import datetime
 import json
@@ -32,7 +33,6 @@ HOOK = os.path.join(TOOLS, "khms_hook.py")
 INIT = os.path.join(TOOLS, "khms_init.sh")
 REPLY_TOOL = "mcp__plugin_chat_chat__reply"     # matched by KHMS_REPORT_TOOL below
 SERVER = "plugin:chat:chat"                     # matched by KHMS_REPORT_SERVER below
-HONEST = "base: did not search - the question is about wording only"
 
 
 def iso(t):
@@ -98,11 +98,14 @@ class HookCase(unittest.TestCase):
 
 
 # --- the proposal gate on a report ---------------------------------------------------------------------
-PROPOSAL = (HONEST + "\n\nThe harness picks up noise from the motor leads.\n"
+PROPOSAL = ("The harness picks up noise from the motor leads.\n"
             "I recommend we replace the sensor harness with shielded twisted pair wire.\n")
 
 
-class ProposalGate(HookCase):
+class ReportNeverGated(HookCase):
+    """#247 acceptance shape: a report WITHOUT a `base:` line, carrying a proposal with relevant unseen cards
+    and a non-preferred term, passes PreToolUse untouched, and the turn may end. Against the parent commit
+    the PreToolUse was denied (proposal or terminology gate) and the Stop blocked (no stamped reply)."""
     def setUp(self):
         super().setUp()
         path = os.path.join(self.root, 'memory', 'know', 'K-%05d.md' % 90001)
@@ -112,67 +115,30 @@ class ProposalGate(HookCase):
                     '# Sensor harness and gyroscope calibration\n'
                     'Shielded twisted pair sensor harness reduces motor leads noise. '
                     'Rewrite gyroscope calibration routine only after measuring.\n' % 90001)
+        self.glossary = os.path.join(self.root, 'terms.txt')
+        with open(self.glossary, 'w') as f:
+            f.write('smoky ride => smoke test run\n')
 
-    def test_a_recommendation_without_a_recall_on_it_is_denied(self):
+    def test_a_proposal_with_a_glossary_term_and_no_base_line_passes_and_the_turn_ends(self):
         self.prompt()
-        deny, why = self.denied(self.fire(self.report(PROPOSAL)))
-        self.assertTrue(deny)
-        self.assertIn("recall", why)
-        self.assertIn("shielded", why)          # the refusal names the query to run
-        self.assertIn("| DENY |", self.read_log("proposal_gate.log"))
-
-    def test_a_proposal_citing_the_recalled_card_is_known(self):
-        self.prompt()
-        self.recall_in_transcript("shielded twisted pair sensor harness")
-        deny, why = self.denied(self.fire(self.report(PROPOSAL + "\nRead " + ("K-%05d" % 90001))))
+        self.transcript_add({"type": "user", "isMeta": True, "timestamp": iso(time.time() - 5),
+                             "origin": {"kind": "channel", "server": SERVER},
+                             "message": {"content": '<channel source="%s" chat_id="42" message_id="7">'
+                                                    'how is the harness?</channel>' % SERVER}})
+        text = PROPOSAL + "A smoky ride first.\n" + "x" * 300
+        deny, why = self.denied(self.fire(self.report(text), KHMS_TERM_GLOSSARY=self.glossary))
         self.assertFalse(deny, why)
-        self.assertIn("| ALLOW-KNOWN |", self.read_log("proposal_gate.log"))
+        stop = self.fire({"hook_event_name": "Stop", "session_id": "s1", "transcript_path": self.transcript})
+        self.assertIsNone(stop)
+        self.assertNotIn("DENY", self.read_log("proposal_gate.log"))
+        self.assertFalse(os.path.exists(os.path.join(self.state, "claim_gate.log")))
 
-    def test_a_failed_recall_does_not_count(self):
-        self.prompt()
-        self.recall_in_transcript("shielded twisted pair sensor harness", ok=False)
-        deny, _ = self.denied(self.fire(self.report(PROPOSAL)))
-        self.assertTrue(deny)
-
-    def test_a_recall_on_the_symptom_only_does_not_cover_the_remedy(self):
-        self.prompt()
-        self.recall_in_transcript("motor leads noise")
-        deny, _ = self.denied(self.fire(self.report(PROPOSAL)))
-        self.assertTrue(deny)
-
-    def test_a_report_without_a_proposal_is_not_gated(self):
-        self.prompt()
-        deny, _ = self.denied(self.fire(self.report(HONEST + "\n\nThe harness was checked; it is fine.\n")))
-        self.assertFalse(deny)
-
-    def test_same_proposal_is_once_per_author_and_resets_on_session_start(self):
+    def test_the_same_report_twice_and_from_another_author_passes(self):
         self.prompt()
         payload = self.report(PROPOSAL)
-        self.assertTrue(self.denied(self.fire(payload))[0])
         self.assertFalse(self.denied(self.fire(payload))[0])
         payload['agent_id'] = 'other-author'
-        self.assertTrue(self.denied(self.fire(payload))[0])
-        self.fire({'hook_event_name': 'SessionStart', 'session_id': 's1'})
-        self.assertTrue(self.denied(self.fire(payload))[0])
-
-    def test_terminology_gate_requires_edit_not_a_repeated_send(self):
-        glossary = os.path.join(self.root, 'terms.txt')
-        with open(glossary, 'w') as f:
-            f.write('smoky ride => smoke test run\n')
-        for _ in range(2):
-            deny, why = self.denied(self.fire(self.report(HONEST + '\nA smoky ride.'),
-                                            KHMS_TERM_GLOSSARY=glossary))
-            self.assertTrue(deny)
-            self.assertIn('smoke test run', why)
-        self.assertFalse(self.denied(self.fire(self.report(HONEST + '\nA smoke test run.'),
-                                              KHMS_TERM_GLOSSARY=glossary))[0])
-
-    def test_the_gate_can_be_switched_off(self):
-        with open(os.path.join(self.root, "config", "khms_experiment.json"), "w") as f:
-            json.dump({"proposal_gate": False}, f)
-        self.prompt()
-        deny, _ = self.denied(self.fire(self.report(PROPOSAL)))
-        self.assertFalse(deny)
+        self.assertFalse(self.denied(self.fire(payload))[0])
 
 
 # --- the dispatch gate ---------------------------------------------------------------------------------

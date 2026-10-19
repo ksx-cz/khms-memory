@@ -7,7 +7,6 @@
     "PostToolUseFailure": false,
     "PreToolUse": true
   },
-  "claim_gate": true,
   "review_on": "2026-03-08",
   "why": "the retrieval audit measured that hook injections supplied <=16 % of the cards actually cited, at ~50 % relevance; the decisive measurement is one week without per-prompt injection. Delete this file to roll the whole experiment back.",
   "record": "docs/measuring-injection.md"

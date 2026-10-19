@@ -80,7 +80,6 @@ DEFAULTS = [
     ("KHMS_EMBED_PY", ""),
     ("KHMS_DENSE_SOCKET", ""),
     ("KHMS_HF_HOME", ""),
-    ("KHMS_TERM_GLOSSARY", ""),
     ("KHMS_REPO", ""),
     ("KHMS_REPO_INCLUDE", "*"),
     ("KHMS_DAV_URL", ""),

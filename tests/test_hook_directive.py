@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The directive, the injection experiment and the retrieval-claim gate.
+"""The directive, the injection experiment, and a report that is never gated (#247).
 
 Three mechanisms, one hook, one temp base — nothing here reads or writes a real one.
 
@@ -9,13 +9,15 @@ Three mechanisms, one hook, one temp base — nothing here reads or writes a rea
   * THE INJECTION SWITCH. tools/khms_experiment.json turns card injection off per event
     so its value can be MEASURED rather than assumed; a missing or broken file means
     "as before", which is what makes deleting it a complete rollback.
-  * THE RETRIEVAL-CLAIM GATE. The mandatory `base:` line is a check, and a check whose
-    passing condition holds whether or not a retrieval happened is not a check. A report
-    citing card ids with no matching recall in this turn is DENIED.
+  * NO GATE ON A REPORT (#247). The retrieval-claim gate (a mandatory `base:` line, card ids
+    backed by a recall of the same turn) was removed with the `base:` line itself: cards are
+    input to the agent, not output to the principal, and every refusal cost a full resend.
+    A report without the line, or citing cards without a recall, passes untouched.
 
-RED-first record: against the pre-change hook every test in the last two classes failed
-(no experiment switch, no gate), and the directive tests failed because the full text was
-appended to every prompt instead of the pointer line.
+RED-first record: against the pre-change hook every test in ExperimentSwitch failed (no experiment
+switch), and the directive tests failed because the full text was appended to every prompt instead of
+the pointer line. Against the #247 parent commit the ReportNotGated tests and the `base:`-free directive
+assertions failed (the claim gate denied, the directive demanded `base:`).
 """
 import json
 import os
@@ -75,7 +77,7 @@ class Directive(HookCase):
         ctx = self.context({"hook_event_name": "SessionStart", "session_id": "s1"})
         self.assertNotIn("mandatory reply lines", ctx)
         self.assertNotIn("-->", ctx)
-        self.assertIn("base:", ctx)
+        self.assertNotIn("base:", ctx)
         self.assertIn("verified:", ctx)
         self.assertIn("if I were wrong:", ctx)
         self.assertGreater(len(ctx), 800, "the full text should be here, once")
@@ -94,7 +96,8 @@ class Directive(HookCase):
 
     def test_a_prompt_carries_only_the_pointer_line(self):
         ctx = self.context(self.prompt("why do the checksums keep failing on the link"))
-        self.assertIn("base:", ctx)
+        self.assertNotIn("base:", ctx)
+        self.assertIn("verified:", ctx)
         self.assertIn("report_directive.md", ctx)
         self.assertLess(len(ctx), 500,
                         "a prompt must not carry the whole directive again")
@@ -104,7 +107,7 @@ class Directive(HookCase):
         # does not exist must degrade, not crash.
         ctx = self.context({"hook_event_name": "SessionStart", "session_id": "s2"},
                            KHMS_DIRECTIVE=os.path.join(self.root, "no-such-directive.md"))
-        self.assertIn("base:", ctx)
+        self.assertIn("verified:", ctx)
         self.assertIn("report_directive.md", ctx)
 
 
@@ -119,7 +122,7 @@ class ExperimentSwitch(HookCase):
         ctx = self.context(self.prompt("why do the checksums keep failing on the link"))
         self.assertIn("skip (exp:no-inject)", self.log())
         self.assertIn("exp:no-ups", self.log(), "the regime must be stamped into the log")
-        self.assertIn("base:", ctx, "the directive is not part of the experiment")
+        self.assertIn("verified:", ctx, "the directive is not part of the experiment")
 
     def test_a_broken_config_fails_open(self):
         with open(os.path.join(self.root, "config", "khms_experiment.json"),
@@ -134,62 +137,33 @@ class ExperimentSwitch(HookCase):
         self.assertIn("exp:no-ups", self.log())
 
 
-class ClaimGate(HookCase):
+class ReportNotGated(HookCase):
+    """#247: no card gate on the report -- no `base:` line is demanded and cited ids are not checked."""
     def open_turn(self, session="s1"):
         self.context(self.prompt("what is going on with the humidity gaps", session))
 
-    def test_a_substantial_report_without_the_line_is_denied(self):
+    def test_a_substantial_report_without_the_line_passes(self):
         self.open_turn()
-        got = self.fire(self.report("x" * 300))
-        self.assertEqual(got["hookSpecificOutput"]["permissionDecision"], "deny")
-        self.assertIn("base:", got["hookSpecificOutput"]["permissionDecisionReason"])
-
-    def test_a_short_report_is_exempt(self):
-        self.open_turn()
-        self.assertIsNone(self.fire(self.report("done")))
-
-    def test_citing_cards_with_no_recall_in_this_turn_is_denied(self):
-        self.open_turn()
-        got = self.fire(self.report("base: humidity gaps -> K-90001\n" + "y" * 300))
-        self.assertEqual(got["hookSpecificOutput"]["permissionDecision"], "deny")
-
-    def test_an_honest_line_is_always_allowed(self):
-        self.open_turn()
-        self.assertIsNone(
-            self.fire(self.report("base: did not search - orchestration only\n"
-                                  + "y" * 300)))
-
-    def test_a_line_citing_no_card_is_allowed(self):
-        self.open_turn()
-        self.assertIsNone(
-            self.fire(self.report("base: humidity gaps -> nothing useful\n" + "y" * 300)))
-
-    def test_a_matching_recall_in_this_turn_allows_the_citation(self):
-        self.open_turn()
-        subprocess.run([os.path.join(TOOLS, "recall.sh"),
-                        "humidity", "gaps"], capture_output=True, text=True,
-                       env=dict(os.environ, KHMS_ROOT=self.root))
-        self.assertIsNone(
-            self.fire(self.report("base: humidity gaps -> K-90001\n" + "y" * 300)))
-
-    def test_the_gate_can_be_switched_off_in_the_experiment_config(self):
-        self.open_turn()
-        self.experiment({"claim_gate": False})
         self.assertIsNone(self.fire(self.report("x" * 300)))
 
-    def test_every_verdict_is_logged(self):
+    def test_citing_cards_with_no_recall_in_this_turn_passes(self):
+        self.open_turn()
+        self.assertIsNone(self.fire(self.report("base: humidity gaps -> K-90001\n" + "y" * 300)))
+
+    def test_no_claim_log_is_written(self):
         self.open_turn()
         self.fire(self.report("x" * 300))
-        log = open(os.path.join(self.root, "state", "claim_gate.log"),
-                   encoding="utf-8").read()
-        self.assertIn("DENY", log)
+        self.assertFalse(os.path.exists(os.path.join(self.root, "state", "claim_gate.log")))
 
-    def test_a_report_tool_that_does_not_match_is_not_gated(self):
+    def test_a_report_still_stamps_the_reply_for_the_stop_gate(self):
         self.open_turn()
-        self.assertIsNone(self.fire({"hook_event_name": "PreToolUse",
-                                     "tool_name": "Bash",
-                                     "tool_input": {"command": "ls"},
-                                     "session_id": "s1"}))
+        self.fire(self.report("x" * 300))
+        state_dir = os.path.join(self.root, "state", "hook-state")
+        stamped = []
+        for name in os.listdir(state_dir):
+            with open(os.path.join(state_dir, name), encoding="utf-8") as f:
+                stamped.append("discord_reply_t" in f.read())
+        self.assertTrue(any(stamped))
 
 
 if __name__ == "__main__":

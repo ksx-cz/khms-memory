@@ -12,7 +12,8 @@ Wire it (see claude-code/README.md) to:
   PreToolUse  Edit|Write|Bash  the status-MARK gate: a write that adds a `MARK[<status kind>]` line to a
                                journal file of the base is refused -- a status line is a plain line (#236)
   PreToolUse  Agent|Task       the dispatch gate: a proposal inside a brief needs a bound recall
-  PreToolUse  <report tool>    the retrieval-claim gate and the proposal gate on a report to the principal
+  PreToolUse  <report tool>    stamp the reply for the Stop gate (a report itself is never refused: the
+                               claim, proposal and terminology gates on it were removed, #247)
   Stop                         the reply-owed gate: the principal's last channel message gets an answer
   PostToolUse / ...Failure     score the command and its error lines (switched off by the experiment file
                                in the reference deployment; measure before wiring them)
@@ -29,7 +30,7 @@ Design rules:
   * EVERY DECISION IS LOGGED, including the silent ones and the reason a card above the bar stayed out.
   * WORDING AND INPUT VOCABULARY ARE CONFIGURATION. Every message has an English default in
     khms_messages.py and can be overridden by the private KHMS_MESSAGES file; every language-specific
-    matcher (claim keyword, honest forms, proposal markers, stop words, domain words) is a key of the
+    matcher (proposal markers, stop words, domain words) is a key of the
     private KHMS_PATTERNS file. A public deployment works with neither.
 
 Locations come from khms_paths. The legacy per-file overrides KHMS_STATE_DIR, KHMS_LOG, KHMS_BAZE_LOG,
@@ -85,8 +86,6 @@ PRECHECK_TIMEOUT = 8          # s
 LOG_Q = 200                   # chars of the query kept in the inject log
 
 EXPERIMENT = P.soft("EXPERIMENT")
-CLAIM_LOG = _loc("KHMS_BAZE_LOG", "CLAIM_LOG")
-BAZE_LOG = CLAIM_LOG          # legacy name
 DIRECTIVE_FILE = P.soft("DIRECTIVE_FILE", os.path.join(CODE, "prompts", "report_directive.md"))
 INJECT_EVENTS = ("UserPromptSubmit", "PreToolUse", "PostToolUse", "PostToolUseFailure")
 SHORT_EVENT = {"UserPromptSubmit": "ups", "PreToolUse": "pre",
@@ -100,18 +99,9 @@ _CHANNEL = P.soft("KHMS_REPORT_CHANNEL") or ""
 REPORT_CHANNEL_RE = re.compile(_CHANNEL) if _CHANNEL else None
 REPORT_SERVER = P.soft("KHMS_REPORT_SERVER") or "discord"
 
-# --- the retrieval-claim gate (the mandatory `<keyword>:` line of a report) -------------------------------
-CLAIM_MIN_CHARS = 200         # below this a reply need not carry the line
-CLAIM_SHARE = 0.5             # token overlap with a recall of THIS turn
+# --- the recall-binding window of the dispatch gate ------------------------------------------------------
 CLAIM_SLACK = 3.0             # s; the recall log stores whole seconds
-CLAIM_TAIL = 262144           # bytes of the recall log read backwards
-BAZE_TAIL = CLAIM_TAIL        # legacy name
-CLAIM_KEYWORD = PAT.value("HOOK_CLAIM_KEYWORD", "base")
-# The honest forms: a claim line that says it did not search is always allowed -- the gate stops
-# unbacked CITATIONS, and "found nothing" is a valid answer. Matched on the normalised line.
-CLAIM_HONEST = PAT.words("HOOK_CLAIM_HONEST", (
-    "did not search", "not searched", "without search", "from memory", "found nothing",
-    "nothing above the bar", "nothing on record", "base is silent"), sep="|")
+CLAIM_TAIL = 262144           # bytes of a log read backwards
 
 # Which tool events are worth scoring. Text matching neither is not searched, so the hook stays quiet
 # on routine commands. HOOK_DOMAIN is the deployment's own vocabulary; without it only error lines count.
@@ -206,12 +196,6 @@ def save_state(path, st):
 
 def emit(event, text):
     print(json.dumps({"hookSpecificOutput": {"hookEventName": event, "additionalContext": text}}))
-
-
-def deny(event, reason):
-    print(json.dumps({"hookSpecificOutput": {
-        "hookEventName": event, "permissionDecision": "deny",
-        "permissionDecisionReason": reason}}, ensure_ascii=False))
 
 
 # --- SessionStart --------------------------------------------------------------------------------------
@@ -554,133 +538,6 @@ def exp_tag(exp):
         off = [SHORT_EVENT[e] for e in INJECT_EVENTS if not inject_on(exp, e)]
         name = ("no-" + "+".join(off)) if off else "on"
     return f"exp:{name}"
-
-
-# --- the retrieval-claim gate ------------------------------------------------------------------------------
-# A report line that CITES cards must be backed by a src=cli recall inside the current report turn;
-# otherwise the line is satisfiable from the hook's own injection -- a check whose passing condition holds
-# whether or not a retrieval happened. Deliberately narrow, it denies exactly two things:
-#   (i)  a substantial report in a report turn with NO claim line at all;
-#   (ii) a claim line that cites card ids while no recall of this turn matches the query it names.
-# A line that cites no card claims nothing about the base and passes, and so does every honest form.
-def _reply_text(payload):
-    ti = payload.get("tool_input") or {}
-    for k in ("text", "content", "message", "body"):
-        v = ti.get(k)
-        if isinstance(v, str) and v:
-            return v
-    return " ".join(str(v) for v in ti.values() if isinstance(v, str))
-
-
-def _claim_line(text):
-    """The claim line, raw and normalised (diacritics stripped, lowercased), tolerant of bullets and bold."""
-    kw = CLAIM_KEYWORD
-    for ln in (text or "").splitlines():
-        n = ks.norm(ln).strip().lstrip("-*_>•·+ \t")
-        if n.startswith(kw + ":") or n.startswith(kw + " :"):
-            return ln.strip(), n
-    return None, None
-
-
-def _claim_query_tokens(nline):
-    """Tokens of the QUERY part: after the keyword, before the arrow, card ids out."""
-    q = nline.split(":", 1)[1] if ":" in nline else nline
-    q = re.split(r"→|->|=>", q)[0]
-    q = re.sub(r"k-\d+", " ", q)
-    return set(ks.tokens(q))
-
-
-def recall_cli_since(since_t):
-    """Token sets of the src=cli lines of the recall log at or after since_t. Reads the TAIL only; ONLY
-    src=cli counts -- the hook's own lines are what made the line fakeable in the first place."""
-    path = ks.recall_log_path()
-    try:
-        with open(path, "rb") as f:
-            f.seek(0, 2)
-            size = f.tell()
-            f.seek(max(0, size - CLAIM_TAIL))
-            data = f.read().decode("utf-8", "replace")
-    except (OSError, TypeError):
-        return []
-    lines = data.splitlines()
-    if size > CLAIM_TAIL and lines:
-        lines = lines[1:]                      # the seek cut one line in half
-    out = []
-    for ln in lines:
-        parts = ln.split(" | ")
-        if len(parts) < 5 or not parts[-1].startswith("src=cli"):
-            continue
-        try:
-            t = datetime.datetime.fromisoformat(parts[0]).timestamp()
-        except ValueError:
-            continue
-        if t + CLAIM_SLACK < since_t:
-            continue
-        out.append(set(ks.tokens(" | ".join(parts[1:-3]))))
-    return out
-
-
-def claim_verdict(text, st):
-    """(ALLOW|DENY|EXEMPT, reason, query-part, kind). kind is "missing" for a report without the line."""
-    turn_start = st.get("turn_start")
-    pending = bool(st.get("baze_pending")) and turn_start is not None
-    line, nline = _claim_line(text)
-    if line is None:
-        if pending and len(text or "") >= CLAIM_MIN_CHARS:
-            return "DENY", M.msg("HOOK_WHY_NO_LINE", n=len(text)), "", "missing"
-        return ("EXEMPT", M.msg("HOOK_WHY_SHORT") if pending else M.msg("HOOK_WHY_NOT_A_TURN"),
-                "", "")
-    qpart = nline[:120]
-    for h in CLAIM_HONEST:
-        if h in nline:
-            return "ALLOW", M.msg("HOOK_WHY_HONEST", form=h), qpart, ""
-    if not re.search(r"k-\d{4,6}", nline):
-        return "ALLOW", M.msg("HOOK_WHY_NO_IDS"), qpart, ""
-    if turn_start is None:
-        return "EXEMPT", M.msg("HOOK_WHY_NO_TURN"), qpart, ""
-    recalls = recall_cli_since(turn_start)
-    if not recalls:
-        return "DENY", M.msg("HOOK_WHY_NO_RECALL"), qpart, "cite"
-    qtok = _claim_query_tokens(nline)
-    if not qtok:
-        return "ALLOW", M.msg("HOOK_WHY_NO_QUERY"), qpart, ""
-    best = max(len(qtok & r) / float(len(qtok)) for r in recalls)
-    if best >= CLAIM_SHARE:
-        return "ALLOW", M.msg("HOOK_WHY_MATCH", pct="%.0f" % (100 * best)), qpart, ""
-    return "DENY", M.msg("HOOK_WHY_LOW_MATCH", pct="%.0f" % (100 * best)), qpart, "cite"
-
-
-def baze_verdict(text, st):
-    """Legacy three-tuple form of claim_verdict."""
-    return claim_verdict(text, st)[:3]
-
-
-def claim_log(session, verdict, why, qpart):
-    _append(CLAIM_LOG, "%s | %s | %s | %s | %s\n" % (_stamp(), session or "-", verdict, why,
-                                                    (qpart or "")[:120]))
-
-
-def run_claim_gate(payload, event, exp):
-    """True == the report was DENIED (and the deny was already printed)."""
-    if not exp.get("baze_gate", exp.get("claim_gate", True)):
-        return False
-    session = payload.get("session_id", "")
-    path, st = load_state(session)
-    text = _reply_text(payload)
-    verdict, why, qpart, kind = claim_verdict(text, st)
-    claim_log(session, verdict, why, qpart)
-    if verdict == "DENY":
-        deny(event, M.msg("HOOK_CLAIM_DENY_MISSING" if kind == "missing" else "HOOK_CLAIM_DENY_CITE",
-                          why=why))
-        log(event, "report", action="DENY (claim: %s)" % why)
-        return True
-    if verdict == "ALLOW" and st.get("baze_pending"):
-        st["baze_pending"] = False
-        save_state(path, st)
-    return False
-
-
-run_baze_gate = run_claim_gate      # legacy name
 
 
 # --- the proposal gate -----------------------------------------------------------------------------------
@@ -1342,28 +1199,14 @@ def is_report_tool(payload):
 
 
 def handle_report(payload, event, exp):
-    """PreToolUse on the report tool: the claim gate, then the proposal gate. Each fails open; a report
-    that passes both is stamped for the Stop gate, which cannot count on the transcript showing it yet."""
-    try:
-        if run_claim_gate(payload, event, exp):
-            return
-    except Exception as exc:                                       # noqa: BLE001
-        log(event, "report", action="claim-gate error %s" % exc)
-    try:
-        if run_term_gate(payload, event, exp):
-            return
-        if run_proposal_gate(payload, event, exp):
-            return
-    except Exception as exc:                                       # noqa: BLE001
-        log(event, "report", action="proposal-gate error %s" % exc)
-        proposal_log(payload.get("session_id", ""), "ERROR->ALLOW", "bypass: %s" % str(exc)[:80], "")
+    """PreToolUse on the report tool: never refused (#247 removed the claim, proposal and terminology gates
+    on a report); the reply is stamped for the Stop gate, which cannot count on the transcript showing it yet."""
     try:
         _sp, _sst = load_state(payload.get("session_id", ""))
         _sst["discord_reply_t"] = now()
         save_state(_sp, _sst)
     except Exception as exc:                                       # noqa: BLE001
         log(event, "report", action="stop-stamp error %s" % exc)
-
 
 
 _GATE_CARDS = []
@@ -1377,11 +1220,8 @@ PROPOSAL_CZ_LABEL_RE = PAT.regex('HOOK_PROPOSAL_LABEL', r'(?!)')
 PROPOSAL_CZ_NONE = set(PAT.words('HOOK_PROPOSAL_NONE', ['none', 'no', 'unchanged']))
 PROPOSAL_CZ_PAREN_ADJ_RE = PAT.regex('HOOK_PROPOSAL_PAREN_ADJ', r'(?!)')
 PROPOSAL_CZ_PAREN_RE = PAT.regex('HOOK_PROPOSAL_PAREN', r'(?!)')
-TERM_GLOSSARY = P.soft('KHMS_TERM_GLOSSARY', '')
-PROPOSAL_DENY_HEAD = {'reply':'This proposal has relevant recall results:',
-                      'dispatch':'This brief proposes a change (%s); relevant recall results:'}
+PROPOSAL_DENY_HEAD = {'dispatch':'This brief proposes a change (%s); relevant recall results:'}
 PROPOSAL_DENY_TAIL = 'Read the relevant cards, revise the proposal or resend it after reading. The same proposal is shown once per author context.'
-TERM_DENY = 'Preferred terminology: rewrite these expressions before sending:\n%s'
 
 PROPOSAL_EN_MARKER_RE = re.compile(
     r"\b(?:i|we)\s+(?:would\s+|'d\s+|do\s+|strongly\s+)?(?:propose|recommend|suggest)\b"
@@ -1395,10 +1235,6 @@ PROPOSAL_EN_LABEL_RE = re.compile(
 PROPOSAL_LIST_RE = re.compile(r"^\s*(?:[-*•]|\d+(?:[–-]\d+)?[.)])\s")
 
 _QUOTED_RE = re.compile(r"`[^`]*`|\"[^\"\n]*\"|„[^“\n]*“|“[^”\n]*”")
-
-_TERM_EXEMPT = re.compile(r"```.*?(```|\Z)|`[^`\n]*`|„[^“\n]{0,400}“|“[^”\n]{0,400}”"
-                          r"|\"[^\"\n]{0,400}\"", re.S)
-
 
 def _not_listed(m, text, group=0):
     a, b = m.start(group), m.end(group)
@@ -1588,72 +1424,6 @@ def _deny(event, reason):
         "permissionDecision": "deny",
         "permissionDecisionReason": reason}}, ensure_ascii=False))
 
-def _term_rules():
-    'Shared proposal/terminology gate: _term_rules'
-    rules = []
-    try:
-        with open(TERM_GLOSSARY, encoding="utf-8") as fh:
-            for ln in fh:
-                s = ln.strip()
-                if not s or s.startswith("#") or "=>" not in s:
-                    continue
-                rx, term = (p.strip() for p in s.rsplit("=>", 1))
-                try:
-                    rules.append((re.compile(rx, re.I), term))
-                except re.error as exc:
-                    log("PreToolUse", "term-glossary", action="bad regex %r: %s" % (rx, exc))
-    except OSError:
-        return []
-    return rules
-
-def term_hits(text):
-    'Shared proposal/terminology gate: term_hits'
-    rules = _term_rules()
-    if not rules:
-        return []
-    body = _TERM_EXEMPT.sub(" ", text or "")
-    hits, seen = [], set()
-    for rx, term in rules:
-        for m in rx.finditer(body):
-            w = " ".join(m.group(0).split())
-            if w.lower() not in seen:
-                seen.add(w.lower())
-                hits.append((w, term))
-    return hits
-
-def run_term_gate(payload, event, exp):
-    'Shared proposal/terminology gate: run_term_gate'
-    if not exp.get("term_gate", True):
-        return False
-    hits = term_hits(_reply_text(payload))
-    if not hits:
-        return False
-    lines = "\n".join("- %s -> use %s" % (w, t) for w, t in hits)
-    _deny(event, TERM_DENY % lines)
-    log(event, "discord-reply", action="DENY (term: %s)"
-        % ", ".join("%s=>%s" % (w, t) for w, t in hits)[:200])
-    return True
-
-def run_proposal_gate(payload, event, exp):
-    'Shared proposal/terminology gate: run_proposal_gate'
-    if not exp.get("proposal_gate", True):
-        return False
-    session = payload.get("session_id", "")
-    path, st = load_state(session)
-    author = str(payload.get("agent_id") or "main")
-    verdict, spans = proposal_gate([("reply", _reply_text(payload))], author, st,
-                                   turn=("reply", st.get("turn_start")))
-    if verdict == "EXEMPT":
-        return False
-    save_state(path, st)
-    proposal_log_spans(session, "reply", spans)
-    if verdict != "DENY":
-        return False
-    _deny(event, proposal_deny_text(PROPOSAL_DENY_HEAD["reply"], spans))
-    log(event, "discord-reply", action="DENY (proposal: %d open)"
-        % sum(1 for s in spans if s["tag"] == "OPEN"))
-    return True
-
 def dispatch_texts(prompt, cwd=None):
     'Shared proposal/terminology gate: dispatch_texts'
     texts, errors, unresolved = [("prompt", str(prompt or ""))], [], []
@@ -1754,13 +1524,6 @@ def main():
         if "<task-notification>" in raw or raw.lstrip().startswith("[SYSTEM NOTIFICATION"):
             return
         job = sel.is_job_prompt(raw)
-        # A report turn starts here; detected before the tag stripping below removes the channel tag.
-        # Everything until the next such prompt is "this turn" for the claim gate.
-        if REPORT_CHANNEL_RE is None or REPORT_CHANNEL_RE.search(raw):
-            _p, _st = load_state(payload.get("session_id", ""))
-            _st["turn_start"] = now()
-            _st["baze_pending"] = True
-            save_state(_p, _st)
         raw = re.sub(r"<[^>]{1,400}>", " ", raw)
         raw = re.sub(r'\b(chat_id|message_id|user_id|ts|source)="[^"]*"', " ", raw)
         if len(raw.strip()) < MIN_PROMPT_LEN:

@@ -152,8 +152,8 @@ survives a crash before the rebuild. Conflicted copies are reported and excluded
 from retrieval, pending review, allocation and export.
 
 Recall prints matching unreviewed journal findings in a separate evidence section;
-they are not approved cards. Proposal gates show relevant recall results once per
-author context; terminology rules can be supplied with `KHMS_TERM_GLOSSARY`.
+they are not approved cards. The dispatch gate shows relevant recall results for a proposal in a
+subagent brief once per author context; a report to the principal is never gated.
 `khms_review_state.py` supplies the pending census. `khms_review_ping.sh --deputy`
 delegates delivery to the explicitly configured `KHMS_PING_DEPUTY` command.
 

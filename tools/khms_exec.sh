@@ -4,9 +4,16 @@ set -euo pipefail
 TOOLS="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 export PYTHONDONTWRITEBYTECODE=1
 [[ -r "$TOOLS/khms_paths.py" ]] || { echo "khms_exec: missing resolver: $TOOLS" >&2; exit 3; }
-# Validate the explicitly selected base/config before invoking any entrypoint.
-python3 "$TOOLS/khms_paths.py" --root >/dev/null
-STATE="$(python3 "$TOOLS/khms_paths.py" KHMS_STATE)"
+if [[ "${KHMS_EXEC_PRESOLVED:-}" == 1 && -n "${KHMS_STATE:-}" ]]; then
+  # The caller resolved and validated this identity once (a deployment's install step) and exports the
+  # resolved KHMS_CONFIG_FILE and KHMS_STATE: skip the two resolver runs, ~30 ms on every hook call.
+  STATE="$KHMS_STATE"
+else
+  # Validate the explicitly selected base/config before invoking any entrypoint.
+  python3 "$TOOLS/khms_paths.py" --root >/dev/null
+  STATE="$(python3 "$TOOLS/khms_paths.py" KHMS_STATE)"
+fi
+unset KHMS_EXEC_PRESOLVED              # the promise covers this dispatch only, not what the entrypoint starts
 # Both retrieval and claim verification consume the same personal evidence files.
 # An inherited historical log override must not route evidence to another agent.
 export KHMS_RECALL_LOG="$STATE/recall.log"
