@@ -57,12 +57,15 @@ class Prod(unittest.TestCase):
         self.root = base_with_examples()
         self.addCleanup(shutil.rmtree, self.root, True)
 
-    def test_the_shipped_set_passes_and_names_its_open_debt(self):
+    def test_the_shipped_set_passes(self):
+        # G3 (a superseded card and its successor both match) was open debt until #247: recall now returns
+        # the successor in the dead card's place, so the row is gated. An ungated miss is still counted and
+        # named -- test_the_same_row_ungated_does_not_fail_the_run below holds that property.
         r = run(self.root)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        self.assertIn("EVAL recall@3:", r.stdout)
+        self.assertIn("EVAL recall@3: 3/3 (misses: 0)", r.stdout)
         self.assertIn("gated-fail=0", r.stdout)
-        self.assertIn("MISS G3 open:", r.stdout)
+        self.assertNotIn("MISS G3", r.stdout)
 
     def test_a_gated_row_that_misses_fails_the_run(self):
         gold = os.path.join(self.root, "gate.jsonl")

@@ -175,6 +175,9 @@ not you remember it exists. Install it per [claude-code/README.md](claude-code/R
   anything**. Paste the artifact you actually have — the error text, the odd number, the
   parameter name. This is deliberately not tag-based: classifying the situation correctly is
   exactly what fails when you are lost.
+  Recall answers with what holds now: a superseded or refuted card is not returned, its live
+  successor takes its place in the ranking. `recall.sh --history` (or `--all`) shows the dead
+  cards too, flagged, when you need what used to hold.
 - Run `tools/recall.sh "<what you are about to propose>"` **before you state a hypothesis or
   propose a change**. The proposal is the moment when repeating a documented dead end is most
   expensive, and the hook cannot fire on what you have not yet said.

@@ -295,7 +295,8 @@ def correctors_of(c, by_id, rev):
     try:
         for cor in ([by_id[k] for k in (c["links"].get("refuted_by") or []) if k in by_id]
                     + list(rev.get(c["id"], []))):
-            if cor["id"] != c["id"] and cor["id"] not in seen:
+            # a dead corrector no longer holds either: it is not served, not even as a pointer (#247)
+            if cor["id"] != c["id"] and cor["id"] not in seen and not ks.is_dead(cor):
                 seen.add(cor["id"])
                 out.append(cor)
     except Exception:
@@ -475,6 +476,9 @@ def decide(event, query, state, t, cards, p, dense_fn=None, job=None,
     dense = []
     if event in p.dense_events and dense_fn is not None:
         dense, d.dense_err, d.dense_ms = dense_fn(query, p.rrf_cand)
+        # the lexical results already follow the live-ranking rule (ks.search); the dense hits get
+        # the same one, so a dead card is never rescued or slotted — its live successor is (#247)
+        dense = ks.live_pairs(dense, cards)
         d.mode = "lexical" if d.dense_err else "hybrid"
 
     top_score = results[0][0] if results else 0.0
@@ -508,7 +512,7 @@ def decide(event, query, state, t, cards, p, dense_fn=None, job=None,
             if cos < p.dense_min_cos or cid in have:
                 continue
             c = by_id.get(cid)
-            if c is None or c["status"] == "superseded":
+            if c is None or ks.is_dead(c):
                 continue
             if job and p.job_filter and not (JOB_TAGS & set(c["tags"])):
                 continue
@@ -550,7 +554,7 @@ def decide(event, query, state, t, cards, p, dense_fn=None, job=None,
             if cid in have:
                 continue
             c = by_id.get(cid)
-            if c is None or c["status"] == "superseded":
+            if c is None or ks.is_dead(c):
                 continue
             if job and p.job_filter and not (JOB_TAGS & set(c["tags"])):
                 continue

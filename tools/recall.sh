@@ -3,6 +3,7 @@
 # Usage: recall.sh <symptom / error string / identifier ...>
 #        recall.sh Remote I/O error mux channel
 #        recall.sh --lexical <...>      # opt OUT of the dense channel
+#        recall.sh --history <...>      # also the dead (superseded/refuted) cards, flagged (= --all)
 #
 # WHY THIS EXISTS (2026-07-29, approved by the owner for immediate use):
 # precheck.sh is TAG-based, so using it requires first classifying the situation
@@ -39,6 +40,10 @@
 # .recall.log line carries it too (src=cli:hybrid:bge / src=cli:lexical:fallback
 # / src=cli:lexical:optout), so a silent fail-back to the channel that caused
 # the miss is countable instead of invisible.
+# 2026-10-20 (#247, owner: "Recall prece nema vracet karty co uz neplati ne?"):
+# a superseded or refuted card is no longer returned; its live successor takes
+# its place in the ranking (khms_search.live_ranking). `--history` / `--all`
+# brings the dead cards back, flagged, for looking up what used to hold.
 set -euo pipefail
-[ $# -ge 1 ] || { echo "usage: recall.sh [--lexical] <symptom/error/identifier ...>" >&2; exit 2; }
+[ $# -ge 1 ] || { echo "usage: recall.sh [--lexical] [--history|--all] <symptom/error/identifier ...>" >&2; exit 2; }
 exec python3 "$(dirname "$(readlink -f "$0")")/khms_recall_hybrid.py" "$@"

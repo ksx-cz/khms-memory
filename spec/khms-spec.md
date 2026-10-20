@@ -200,7 +200,7 @@ ranking top-down; there is no cutoff (P4).
 | 0 | `MEMORY.md` (already in context) | 0 |
 | 1 | `memory/views/topics/<tag>.md` | 1 read |
 | 2 | `tools/precheck.sh <tags>` — active policies + gotchas + refuted/challenged; a duty before risky actions | 0 model tokens |
-| 3 | `tools/recall.sh <free text>` / grep `memory/know/` | ~0 |
+| 3 | `tools/recall.sh <free text>` / grep `memory/know/` — returns no superseded or refuted card: its live successor takes its place (`--history` shows the dead ones, flagged); the hook's injection follows the same rule | ~0 |
 | 4 | full-text index (optional, when the base outgrows a linear scan) | ~0 |
 | 5 | embedding index (optional) | low |
 | 6 | fog: grep `memory/archive/know/`, zgrep the raw archive | ~0 |

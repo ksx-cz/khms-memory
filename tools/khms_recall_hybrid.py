@@ -24,11 +24,21 @@ WHAT CHANGED (2026-09-04):
     `src=cli:lexical:fallback`, `src=cli:lexical:optout`. It still starts with
     `src=cli`, which is what khms_hook.py's retrieval-claim gate matches on.
   * `--dense` is accepted and ignored (back-compat for scripts and habits).
-  * each of the top hits prints its depth-1 LINKS (`↪ superseded_by K-x: …`),
-    so a card that has been replaced or refuted says so without being opened.
+  * each of the top hits prints its depth-1 LINKS (`↪ contradicted_by K-x: …`),
+    so a card that something corrects says so without being opened.
 
-LIBRARY CONTRACT — UNCHANGED. `dense_query`, `rrf` and `hybrid_rank` keep their
-signatures and behaviour: khms_hook.py (live, every tool call) imports
+DEAD CARDS ARE NOT RETURNED (#247, owner 2026-10-20: "Recall prece nema vracet
+karty co uz neplati ne?"). Until then a superseded or refuted card ranked like
+any other hit and was only flagged, so a query in the old wording filled the top
+with retired claims and pushed the live replacement down ("cuvslam rig4 default":
+two superseded cards first, the live decision 4th). Now a dead card's place in
+the ranking goes to its live successor (khms_search.live_ranking / live_pairs,
+transitive, once, nothing when there is none), and the link lines name no dead
+or archived card. `challenged` cards stay, flagged. `--history` (or `--all`)
+shows the old ranking with the dead cards flagged, for what used to hold.
+
+LIBRARY CONTRACT. `dense_query`, `rrf` and `hybrid_rank` keep their signatures
+(hybrid_rank/lexical_rank gained `history=False`; the default drops dead cards): khms_hook.py (live, every tool call) imports
 `dense_query`, hook_replay.py and nearest_cards.py import this module, and
 tools/eval/run_eval.py imports `rrf`. Only the CLI front end below changed.
 
@@ -66,7 +76,8 @@ SOCKET = P.soft("KHMS_DENSE_SOCKET") or os.path.join(P.soft("SHARED_STATE", ""),
 
 # I5 (owner question 2026-09-04: "are linked cards loaded too, to some depth?"):
 # depth-1 links of the top hits, titles only. Depth 1 and top-N only — the point
-# is to see that a hit has been superseded/refuted, not to walk the graph.
+# is to see what corrects or grounds a hit, not to walk the graph. Without
+# --history a link to a dead or archived card is not printed (#247).
 LINK_TOPN = int(os.environ.get("KHMS_LINK_TOPN", "3"))
 LINK_MAX = int(os.environ.get("KHMS_LINK_MAX", "6"))     # lines per card
 
@@ -118,15 +129,20 @@ def rrf(lex_ids, dense_ids, k=RRF_K):
 
 
 def hybrid_rank(query_raw, cards=None, topn=8, exclude_meta=False,
-                timeout_ms=TIMEOUT_MS, sock_path=SOCKET, rrf_k=RRF_K, cand=CAND):
+                timeout_ms=TIMEOUT_MS, sock_path=SOCKET, rrf_k=RRF_K, cand=CAND,
+                history=False):
     """Returns (ranked, meta). ranked = [(fused_score, matched_tokens, card)],
-    same shape khms_search.search returns, so printers/consumers are unchanged."""
+    same shape khms_search.search returns, so printers/consumers are unchanged.
+    Both channels get the live-ranking rule BEFORE fusion (a dead card's rank in
+    each channel goes to its successor), unless `history`."""
     if cards is None:
         cards = ks.load_cards()
     expanded, added = ks.expand_query(query_raw, ks.load_glossary())
-    lex, _ = ks.search(expanded, cards=cards, exclude_meta=exclude_meta, topn=cand)
+    lex, _ = ks.search(expanded, cards=cards, exclude_meta=exclude_meta, topn=cand,
+                       history=history)
     dense, err, ms = dense_query(query_raw, topn=cand, timeout_ms=timeout_ms,
                                  sock_path=sock_path)
+    dense = ks.live_pairs(dense, cards, history)
     meta = {"glossary": added, "dense_ms": ms, "dense_err": err,
             "dense_n": len(dense), "mode": "lexical" if err else "hybrid"}
     if err or not dense:
@@ -148,12 +164,13 @@ def hybrid_rank(query_raw, cards=None, topn=8, exclude_meta=False,
     return out, meta
 
 
-def lexical_rank(query_raw, cards=None, topn=8, exclude_meta=False):
+def lexical_rank(query_raw, cards=None, topn=8, exclude_meta=False, history=False):
     """The opt-out channel, with the same return shape as hybrid_rank."""
     if cards is None:
         cards = ks.load_cards()
     expanded, added = ks.expand_query(query_raw, ks.load_glossary())
-    lex, _ = ks.search(expanded, cards=cards, exclude_meta=exclude_meta, topn=topn)
+    lex, _ = ks.search(expanded, cards=cards, exclude_meta=exclude_meta, topn=topn,
+                       history=history)
     meta = {"glossary": added, "dense_ms": 0.0, "dense_err": "opt-out",
             "dense_n": 0, "mode": "lexical"}
     return lex, meta
@@ -174,8 +191,10 @@ def link_maps(cards):
     return superseded_by, contradicted_by
 
 
-def link_lines(c, by_id, superseded_by, contradicted_by, limit=LINK_MAX):
-    """Depth-1 links of one card as printable lines, warnings first."""
+def link_lines(c, by_id, superseded_by, contradicted_by, limit=LINK_MAX, history=True):
+    """Depth-1 links of one card as printable lines, warnings first. Without
+    `history` a link naming a dead card, or one no longer in the base (archived,
+    #219), is left out: the default answer names no card that no longer holds."""
     links = c.get("links") or {}
     sup = links.get("supersedes")
     kinds = [
@@ -194,6 +213,8 @@ def link_lines(c, by_id, superseded_by, contradicted_by, limit=LINK_MAX):
                 continue
             seen.add((kind, kid))
             other = by_id.get(kid)
+            if not history and (other is None or ks.is_dead(other)):
+                continue
             title = other["first"][:100] if other else M.msg("NOT_IN_BASE")
             out.append(f"    ↪ {kind} {kid}: {title}")
             if len(out) >= limit:
@@ -250,7 +271,7 @@ def freshness_lines(cards, model=MODEL, max_cards=FRESH_MAX):
 
 
 # ---------------------------------------------------------------- CLI output
-def print_results(results, cards, channel, meta, show_links=True):
+def print_results(results, cards, channel, meta, show_links=True, history=False):
     fused = channel == "hybrid"
     by_id = {c["id"]: c for c in cards}
     superseded_by, contradicted_by = link_maps(cards) if show_links else ({}, {})
@@ -278,14 +299,16 @@ def print_results(results, cards, channel, meta, show_links=True):
                     print(f"    ↳ {line.strip()[:150]}")
                     break
         if show_links and i < LINK_TOPN:
-            for ln in link_lines(c, by_id, superseded_by, contradicted_by):
+            for ln in link_lines(c, by_id, superseded_by, contradicted_by, history=history):
                 print(ln)
 
 
 def parse_argv(argv, env=None):
-    """(query_words, lexical_only). `--dense` is accepted and ignored."""
+    """(query_words, lexical_only, history). `--dense` is accepted and ignored;
+    `--history` / `--all` returns dead cards too (#247)."""
     env = os.environ if env is None else env
     lexical_only = env.get("KHMS_DENSE", "") == "0"
+    history = False
     words = []
     for a in argv:
         if a == "--dense":
@@ -293,30 +316,35 @@ def parse_argv(argv, env=None):
         if a in ("--lexical", "--no-dense"):
             lexical_only = True
             continue
+        if a in ("--history", "--all"):
+            history = True
+            continue
         words.append(a)
-    return words, lexical_only
+    return words, lexical_only, history
+
+
+USAGE = "usage: recall.sh [--lexical] [--history|--all] <symptom/error/identifier ...>"
 
 
 def main(argv):
-    words, lexical_only = parse_argv(argv)
+    words, lexical_only, history = parse_argv(argv)
     query_raw = " ".join(words)
     if not query_raw.strip():
-        print("usage: recall.sh [--lexical] <symptom/error/identifier ...>",
-              file=sys.stderr)
+        print(USAGE, file=sys.stderr)
         return 2
     cards = ks.load_cards()
 
     if lexical_only:
-        results, meta = lexical_rank(query_raw, cards=cards)
+        results, meta = lexical_rank(query_raw, cards=cards, history=history)
         channel, src = "lexical(opt-out)", "cli:lexical:optout"
     else:
         if not (P.get("KHMS_EMBED_PY") or os.path.exists(SOCKET)):
             # Dense retrieval is an optional feature this deployment has not set up: no freshness
             # check (there is no index to be stale), one labelled lexical answer.
-            results, meta = lexical_rank(query_raw, cards=cards)
+            results, meta = lexical_rank(query_raw, cards=cards, history=history)
             meta.update(dense_err="not-configured")
             channel, src = "lexical(dense not configured)", "cli:lexical:nodense"
-            return _finish(query_raw, results, cards, channel, src, meta)
+            return _finish(query_raw, results, cards, channel, src, meta, history)
         # BEFORE the query, never after: a refresh here is what the query then
         # reads (the daemon re-checks the index's mtime on every request).
         stale = freshness_lines(cards)
@@ -325,20 +353,20 @@ def main(argv):
         if P.read_only() and any("a read-only deployment does not refresh it" in s for s in stale):
             # A stale shared index the reader may not refresh: the dense half would answer without
             # the newest cards, so the answer is lexical and says so.
-            results, meta = lexical_rank(query_raw, cards=cards)
+            results, meta = lexical_rank(query_raw, cards=cards, history=history)
             meta.update(dense_err="stale-index-read-only", dense_ms=0.0)
         else:
-            results, meta = hybrid_rank(query_raw, cards=cards)
+            results, meta = hybrid_rank(query_raw, cards=cards, history=history)
         if meta["dense_err"] == "stale-index-read-only":
             channel, src = "lexical(fallback: stale index, read-only)", "cli:lexical:stale-ro"
         elif meta["dense_err"]:
             channel, src = "lexical(fallback: daemon down)", "cli:lexical:fallback"
         else:
             channel, src = "hybrid", f"cli:hybrid:{MODEL}"
-    return _finish(query_raw, results, cards, channel, src, meta)
+    return _finish(query_raw, results, cards, channel, src, meta, history)
 
 
-def _finish(query_raw, results, cards, channel, src, meta):
+def _finish(query_raw, results, cards, channel, src, meta, history=False):
     ks.log_query(query_raw, results, src=src)
 
     if meta["glossary"]:
@@ -354,6 +382,9 @@ def _finish(query_raw, results, cards, channel, src, meta):
     else:
         print("(channel=lexical(opt-out: --lexical / KHMS_DENSE=0))")
 
+    if history:
+        print("(history: superseded / refuted cards are shown, flagged — they no longer hold)")
+
     if not ks.tokens(query_raw):
         print("recall: query has no searchable tokens")
         return 2
@@ -362,7 +393,8 @@ def _finish(query_raw, results, cards, channel, src, meta):
     if not results:
         print(f"recall: nothing on record among approved cards for: {query_raw}")
         return 0 if pending_count else 1
-    print_results(results, cards, "hybrid" if channel == "hybrid" else "lexical", meta)
+    print_results(results, cards, "hybrid" if channel == "hybrid" else "lexical", meta,
+                  history=history)
     return 0
 
 

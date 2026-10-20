@@ -11,6 +11,10 @@ first-line x3, tag x1.5, phrase +10, fog x0.6 (no card is fog since #219). Addit
 frontmatter links/level are parsed, and a reverse index answers "which card
 corrects this one" (supersedes/contradicts/refuted_by) so a consumer never
 serves a refuted card without its refuter.
+
+#247 (owner 2026-10-20): a dead card — status superseded or refuted — is not returned by default; its
+live successor takes its place in the ranking (live_ranking / live_pairs below). `history=True` keeps
+the old behaviour for looking up what used to hold.
 """
 import khms_files as glob
 import math
@@ -143,6 +147,109 @@ def reverse_correctors(cards):
     return rev
 
 
+# ------------------------------------------------------------ live ranking (#247)
+# Owner 2026-10-20: "Recall prece nema vracet karty co uz neplati ne?" A `superseded` or `refuted` card is
+# DEAD: by default no ranking returns it. Where a dead card would have ranked, its LIVE replacement takes
+# its place, once — the successor edges are followed transitively until a card that is not dead is
+# reached (A -> B -> C with C active gives C); a dead card with no live replacement leaves its place
+# empty. `challenged` is not dead (still flagged by the printers); a card with an erratum is corrected,
+# not dead. `history=True` (recall.sh --history / --all) returns the ranking as it is, dead cards
+# included, for looking up what used to hold. ONE implementation: search() applies it to the lexical
+# channel and live_pairs() to the dense channel, so recall (hybrid, --lexical), the hook's injection and
+# the proposal gate all read the same rule.
+DEAD = ("superseded", "refuted")
+
+
+def is_dead(c):
+    return bool(c) and c.get("status") in DEAD
+
+
+class Succession:
+    """Successor edges of one loaded card list: who replaces a dead card. A superseded card is replaced
+    by the cards whose `supersedes` names it and by its own `superseded_by`; a refuted card by its
+    `refuted_by` (both sets are read for either status, so a card re-statused without the matching
+    edge still finds what replaced it)."""
+
+    def __init__(self, cards):
+        self.cards = cards
+        self.n = len(cards)
+        self.by_id = {c["id"]: c for c in cards}
+        self.rev_sup = {}
+        for c in cards:
+            sup = (c.get("links") or {}).get("supersedes")
+            for tgt in (sup if isinstance(sup, list) else [sup] if sup else []):
+                self.rev_sup.setdefault(tgt, []).append(c["id"])
+        self._memo = {}
+
+    def _next(self, c):
+        links = c.get("links") or {}
+        return list(dict.fromkeys(list(c.get("superseded_by") or [])
+                                  + sorted(self.rev_sup.get(c["id"], []))
+                                  + list(links.get("refuted_by") or [])))
+
+    def live(self, cid):
+        """-> ids that stand in for `cid`: [cid] when it is live or not in this list (the caller decides
+        what an unknown id means), else its live successors in breadth-first order, [] when none."""
+        c = self.by_id.get(cid)
+        if not is_dead(c):
+            return [cid]
+        if cid in self._memo:
+            return self._memo[cid]
+        out, seen, todo = [], {cid}, [cid]
+        while todo:
+            nxt = []
+            for k in todo:
+                for s in self._next(self.by_id[k]):
+                    sc = self.by_id.get(s)
+                    if s in seen or sc is None:
+                        continue
+                    seen.add(s)
+                    (nxt if is_dead(sc) else out).append(s)
+            todo = nxt
+        self._memo[cid] = out
+        return out
+
+
+_SUCC = []
+
+
+def succession(cards):
+    """The Succession of this exact list, built once per list (the hook and hybrid recall ask twice)."""
+    if _SUCC and _SUCC[0].cards is cards and _SUCC[0].n == len(cards):
+        return _SUCC[0]
+    _SUCC[:] = [Succession(cards)]
+    return _SUCC[0]
+
+
+def live_ranking(results, cards, history=False):
+    """[(score, matched, card)] -> the same ranking with every dead card replaced by its live
+    successor(s) at its own position, each card once (its first, best place)."""
+    if history:
+        return results
+    succ, out, seen = succession(cards), [], set()
+    for score, matched, c in results:
+        for sid in succ.live(c["id"]):
+            if sid in seen:
+                continue
+            seen.add(sid)
+            r = succ.by_id.get(sid, c)
+            out.append((score, matched if r is c else [t for t in matched if t in r.get("nbody", "")], r))
+    return out
+
+
+def live_pairs(pairs, cards, history=False):
+    """[(card_id, value)] (the dense channel's hits) -> the same rule as live_ranking."""
+    if history:
+        return pairs
+    succ, out, seen = succession(cards), [], set()
+    for cid, v in pairs:
+        for sid in succ.live(cid):
+            if sid not in seen:
+                seen.add(sid)
+                out.append((sid, v))
+    return out
+
+
 def load_glossary(path=None):
     """Lines: '<stem-without-diacritics><TAB><english words>'. '#' comments.
     The glossary is a private resource (KHMS_GLOSSARY); unset or absent means no glossary."""
@@ -176,8 +283,10 @@ def expand_query(query_raw, glossary):
     return (query_raw + " " + " ".join(added)).strip() if added else query_raw, added
 
 
-def search(query_raw, cards=None, exclude_meta=False, topn=TOPN):
-    """Returns (results, cards). results: list of (score, matched_tokens, card)."""
+def search(query_raw, cards=None, exclude_meta=False, topn=TOPN, history=False):
+    """Returns (results, cards). results: list of (score, matched_tokens, card).
+    Dead (superseded / refuted) cards are replaced by their live successors (live_ranking) unless
+    `history`."""
     if cards is None:
         cards = load_cards()
     q_tokens = tokens(query_raw)
@@ -214,7 +323,7 @@ def search(query_raw, cards=None, exclude_meta=False, topn=TOPN):
         if score > 0:
             results.append((score, matched, c))
     results.sort(key=lambda r: -r[0])
-    return results[:topn], cards
+    return live_ranking(results, cards, history)[:topn], cards
 
 
 def recall_log_path():
