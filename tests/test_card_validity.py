@@ -446,7 +446,7 @@ class KnowHowV2(Fixture):
         res = CV.judge_card(self.card(), FakeModel([ans]), self.root, anchors=[], max_retries=0)
         self.assertEqual(res["verdict"], "holds")
         line = CV.ledger_line(dict(self.card(), sha256="0" * 64), res, "sonnet", CV.PROMPT_VERSION, "2026-10-15")
-        self.assertEqual((line["knowhow"], line["prompt_version"]), ("no", "v2"))
+        self.assertEqual((line["knowhow"], line["prompt_version"]), ("no", "v3"))   # v3 since 2026-10-21
 
     def test_the_prompt_asks_the_knowhow_question_in_the_same_call(self):
         model = FakeModel([GOOD])

@@ -17,7 +17,7 @@
 # Why a job of its own and not a night stage: the night has its own budget and finishing window; a 500-card
 # pass is ~30 min and ~$21 of paid judge calls on top of it.
 #
-# Usage: khms_validity_daily.sh [--n 500] [--max-usd 30] [--workers 4] [--parts 4]
+# Usage: khms_validity_daily.sh [--n 500|all] [--max-usd 30] [--workers 4 (1..16)] [--parts 4]
 #                               [--out-root DIR] [--log FILE]
 #   --out-root and --log redirect a trial run away from the daily directory and the night log. The cards a
 #   trial judges DO enter the checked ledger: they were checked.

@@ -43,6 +43,7 @@ Subcommands:
   backfill   --know DIR --calib sonnet.jsonl --date D                  ledger lines for a calibration
   sample     --know DIR --seed S [--n 100 --against sample.json]       draw past the ledger, judge nothing
   run        --know DIR --sandbox DIR --out DIR --seed S [--n 100]     draw, mechanical, value flag, judge
+  knowhow    --know DIR --out DIR --seed S [--n 100|all --ids F]      the v3 know-how question alone
   proposals  --know DIR --out FILE --results LABEL=FILE ... [--parts N] K-05297 routes + commands
 
 THE CHECKED LEDGER (`run`, `sample`, `backfill`; default <know>/../ledger/validity.jsonl): one append-only
@@ -50,8 +51,14 @@ line per judged card -- id, sha256 of the card file as judged, date, judge, prom
 knowhow, reason, evidence, the repo-value flag. A draw (uniform, seeded, statuses active+challenged by
 default) skips every card whose CURRENT hash has a line, so a card that changed since is eligible again.
 Prompt v2 asks, in the same call, whether the card is know-how (would a future agent act differently?)
-or only status/progress. `run` judges with the paid leg only, at most 4 calls in flight, and stops
-submitting once its spend passes --max-usd (exit 3). The base itself (cards, inbox, status) is never
+or only status/progress; v3 (2026-10-21, owner: keep "when it was like this, it did this", drop facts of
+the form "something is somewhere") asks it as KNOWHOW_RULE: a mechanism, a measurement with its
+conditions, a decision with its reason, a mistake with its measure, a rule or a refuted dead end is "yes";
+a card that only records a STATE (where, a value, what is deployed, what a file does, progress) is "no".
+`knowhow` asks that question ALONE (no tools, no evidence) for cards judged under v1/v2 at their current
+hash; its ledger rows carry prompt_version v3-knowhow and verdict not-judged, the old rows stay.
+`run` judges with the paid leg only, --workers calls in flight (default 4; --n all = every eligible card),
+and stops submitting once its spend passes --max-usd (exit 3). The base itself (cards, inbox, status) is never
 written; only the ledger and --out are.
 
 Outputs of `calibrate` (all in --out): mechanical.jsonl, mechanical-summary.json, sample.json,
@@ -84,7 +91,11 @@ import yaml
 ACTIVE_TYPES = ("fact", "action→outcome", "problem→solution")
 VERDICTS = ("holds", "no-longer-holds", "cannot-check-offline")
 KNOWHOW = ("yes", "no")
-PROMPT_VERSION = "v2"           # v1 = the 2026-10-11 calibration prompt; v2 adds the know-how question
+PROMPT_VERSION = "v3"           # v1 = the 2026-10-11 calibration prompt; v2 adds the know-how question;
+                                # v3 (2026-10-21) asks it as "mechanism or state" (KNOWHOW_RULE)
+KNOWHOW_VERSION = "v3-knowhow"  # the know-how question ALONE, for cards judged under v1/v2 (`knowhow`)
+V3_VERSIONS = (PROMPT_VERSION, KNOWHOW_VERSION)   # ledger rows whose knowhow answers the v3 question
+NOT_JUDGED = "not-judged"       # the verdict of a know-how-only row: validity was not asked again
 DRAW_STATUSES = ("active", "challenged")
 PATHS = ("none", "erratum-wrong-record", "dated-pointer", "supersede")
 STATUSES = ("exists", "moved", "gone", "line-gone", "absent", "external", "unchecked")
@@ -513,8 +524,8 @@ ANSWER_EXAMPLE = {
     "verdict": "no-longer-holds",
     "false_sentence": "copy one sentence of the card here, exactly as written",
     "suggested_path": "dated-pointer",
-    "knowhow": "yes",
-    "knowhow_reason": "it names a value a future agent would otherwise get wrong",
+    "knowhow": "no",
+    "knowhow_reason": "it only says where a script lives; the repository holds that",
 }
 MAX_SUBCLAIMS = 8
 MAX_EVIDENCE = 16
@@ -624,6 +635,33 @@ def check_answer(ans, card, root):
 
 # ------------------------------------------------------------------------------------------- prompt
 
+KNOWHOW_RULE = """   Is the card KNOW-HOW or only a STATE? The base keeps know-how only: "when it was like this, it did
+   this". The state of things lives in the repository and the running system, not in the base.
+   "yes" -- the card carries at least one of:
+     - a mechanism: WHEN X THEN Y, a cause and its effect, why something behaves the way it does;
+     - a measurement WITH its conditions (what was measured, how, on what, the number);
+     - a decision WITH its reason (what was chosen and why);
+     - a mistake WITH the measure that stops it happening again;
+     - a rule or a policy to follow;
+     - a refuted idea or a dead end (what was tried, and that it does not work).
+   "no" -- the card's substance is only a STATE, whether it is still true today or not:
+     - where something is (a file, a directory, a host, a branch, a unit);
+     - what a value or a setting is ("the timeout is 30 s", "the topic is /x");
+     - what is deployed, installed, enabled or running;
+     - what a file, a script or a tool does or contains;
+     - task, board, campaign or progress status (launched, finished, passed, merged, the next step).
+   Examples. "yes": "When the ZED driver starts before the USB hub is powered, it opens no camera and
+   exits 0; start it after the hub" (a mechanism with its fix). "yes": "Decoder latency was 41 ms median
+   over 9 000 frames on the Orin at 30 fps" (a measurement with its conditions). "yes": "We record raw
+   images only on request, because a full bag is 40 GB an hour" (a decision with its reason). "no": "The
+   nav parameters live in dumpee_navigation/config/nav2.yaml" (where). "no": "max_speed is 0.8 m/s"
+   (a value). "no": "stack.sh has the verbs up, down and status" (what a script does). "no": "The
+   campaign of 2026-09-03 passed and was merged" (status).
+   A card that mixes both is "yes" when its lesson would still make an agent act differently; a value or a
+   place inside it does not make it know-how by itself, nor does "a future agent would otherwise get
+   the value wrong" -- the agent reads the value from the repository."""
+
+
 PROMPT = """You are checking ONE knowledge card against today's files. Work slowly and exactly. Follow the
 steps in order. Do not skip a step.
 
@@ -673,12 +711,9 @@ STEPS
    - "supersede": the sentence describes a mechanism or behaviour that has since been replaced.
    - "erratum-wrong-record": the sentence was already wrong on the day it was written.
    Otherwise write false_sentence "" and suggested_path "none".
-8. KNOW-HOW (a separate question about the whole card, whatever steps 1-7 found): would a future agent
-   ACT DIFFERENTLY knowing this card? "yes" for a finding that holds beyond its day, a refutation, a
-   measured fact with its number, a decision WITH its reason, a mistake WITH the measure that stops it,
-   a rule or a policy. "no" when the card only records status or progress: something was launched,
-   finished, passed, committed, pushed, tagged, merged, deployed or moved on a board, or what the next
-   step is. Write "yes" or "no" into knowhow and one short sentence into knowhow_reason.
+8. KNOW-HOW (a separate question about the whole card, whatever steps 1-7 found):
+{knowhow_rule}
+   Write "yes" or "no" into knowhow and one short sentence into knowhow_reason.
 
 ANSWER with ONLY this JSON object (same keys, your values), nothing before or after it:
 {example}
@@ -729,7 +764,7 @@ def tree_lines(root):
 
 def build_prompt(card, anchors, root):
     return PROMPT.format(trees=tree_lines(root), card_id=card["id"], date=card["date"] or "unknown",
-                         body=card["body"].strip(), anchors=anchor_lines(anchors),
+                         body=card["body"].strip(), anchors=anchor_lines(anchors), knowhow_rule=KNOWHOW_RULE,
                          example=json.dumps(dict(ANSWER_EXAMPLE, card_id=card["id"]), indent=2,
                                             ensure_ascii=False))
 
@@ -773,6 +808,95 @@ def _result(verdict, attempts, ans, history, metas, t0):
     return {"verdict": verdict, "attempts": attempts, "answer": ans, "errors": history,
             "wall_s": round(time.time() - t0, 1),
             "cost_usd": round(sum(float(m.get("cost_usd") or 0) for m in metas), 6), "meta": metas}
+
+
+# ------------------------------------------------------------------------- know-how-only (v3-knowhow)
+#
+# Cards judged under v1/v2 already have a validity verdict; what changed in v3 is only the know-how
+# question. This asks THAT question alone: the card text and KNOWHOW_RULE, no folder, no tools, no
+# evidence. The answer is a three-key JSON object; a malformed one goes back once with the error. The
+# ledger row carries prompt_version KNOWHOW_VERSION and verdict NOT_JUDGED (validity is not re-asked).
+
+KNOWHOW_PROMPT = """You are sorting ONE knowledge card. Do not check whether it is still true; answer only
+the question below. Use no tools: everything you need is in this message.
+
+THE CARD {card_id} (written on {date}):
+<<<CARD
+{body}
+CARD>>>
+
+THE QUESTION.
+{knowhow_rule}
+
+ANSWER with ONLY this JSON object (same keys, your values), nothing before or after it:
+{example}
+"""
+
+KNOWHOW_EXAMPLE = {"card_id": "K-00000", "knowhow": "yes",
+                   "knowhow_reason": "one short sentence: the lesson it carries, or the state it only records"}
+
+
+def build_knowhow_prompt(card):
+    return KNOWHOW_PROMPT.format(card_id=card["id"], date=card["date"] or "unknown", body=card["body"].strip(),
+                                 knowhow_rule=KNOWHOW_RULE,
+                                 example=json.dumps(dict(KNOWHOW_EXAMPLE, card_id=card["id"]), indent=2,
+                                                    ensure_ascii=False))
+
+
+def check_knowhow_answer(ans, card):
+    if not isinstance(ans, dict):
+        return ["the answer is not a JSON object"]
+    errs = []
+    if ans.get("card_id", card["id"]) != card["id"]:
+        errs.append(f"card_id is {ans.get('card_id')!r}, the card is {card['id']!r}")
+    if ans.get("knowhow") not in KNOWHOW:
+        errs.append(f"knowhow must be \"yes\" or \"no\", got {ans.get('knowhow')!r}")
+    if not isinstance(ans.get("knowhow_reason"), str) or not ans.get("knowhow_reason", "").strip():
+        errs.append("knowhow_reason must be one short sentence")
+    return errs
+
+
+def judge_knowhow(card, model, root=None, anchors=None, max_retries=1, deadline_s=None):
+    """The v3 know-how question alone (same call shape as judge_card, so judge_many runs either).
+    Returns judge_card's result shape; verdict NOT_JUDGED when accepted, 'unverified' when not."""
+    first = build_knowhow_prompt(card)
+    prompt, attempts, history, metas = first, 0, [], []
+    t0 = time.time()
+    while attempts <= max_retries:
+        if attempts and deadline_s and time.time() - t0 >= deadline_s:
+            history.append({"attempt": attempts + 1, "errors": [f"card deadline {deadline_s}s spent"]})
+            break
+        attempts += 1
+        text = ""
+        try:
+            text, meta = model(prompt)
+            metas.append(meta or {})
+            try:
+                ans = parse_answer(text)
+            except ValueError as e:
+                errs, ans = [str(e)], None
+            else:
+                errs = check_knowhow_answer(ans, card)
+        except Exception as e:  # noqa: BLE001 -- a failed call is an attempt, not a crash
+            errs, ans = [f"model call failed: {type(e).__name__}: {e}"], None
+            metas.append({"error": str(e)})
+        if not errs:
+            ans = {"card_id": card["id"], "knowhow": ans["knowhow"], "knowhow_reason": ans["knowhow_reason"]}
+            return _result(NOT_JUDGED, attempts, ans, history, metas, t0)
+        history.append({"attempt": attempts, "errors": errs, "answer_text": (text or "")[:4000]})
+        prompt = first + FEEDBACK.format(answer=(text or "(no answer)")[:3000],
+                                         errors="\n".join(f"- {e}" for e in errs))
+    return _result("unverified", attempts, None, history, metas, t0)
+
+
+def knowhow_targets(cards, ledger_rows, statuses=DRAW_STATUSES):
+    """Cards of `statuses` judged at their CURRENT hash under an earlier prompt (v1/v2) and not yet under
+    v3 (a full v3 row or a know-how-only row) -- the cards the know-how-only mode re-asks."""
+    old, new = set(), set()
+    for r in ledger_rows:
+        key = (r.get("id"), r.get("sha256"))
+        (new if r.get("prompt_version") in V3_VERSIONS else old).add(key)
+    return [c for c in cards if c["status"] in statuses and (c["id"], c.get("sha256")) in old - new]
 
 
 # ------------------------------------------------------------------------------------- model legs
@@ -904,11 +1028,15 @@ class ClaudeModel:
     SYSTEM = ("You are a careful auditor. Follow the instructions in the user message exactly and output "
               "only what it asks for.")
 
-    def __init__(self, bin_path, model, root, deadline=600, max_budget_usd=1.0):
+    def __init__(self, bin_path, model, root, deadline=600, max_budget_usd=1.0, tools=True):
         self.bin, self.model, self.root = bin_path, model, root
-        self.deadline, self.max_budget = deadline, max_budget_usd
+        self.deadline, self.max_budget, self.tools = deadline, max_budget_usd, tools
 
     def argv(self):
+        if not self.tools:                      # the know-how-only question: the card is in the prompt
+            return [self.bin, "-p", "--model", self.model, "--output-format", "json", "--tools", "",
+                    "--permission-mode", "dontAsk", "--system-prompt", self.SYSTEM, "--setting-sources", "",
+                    "--strict-mcp-config", "--no-session-persistence", "--max-budget-usd", str(self.max_budget)]
         allowed = ["Read", "Grep", "Glob"] + [f"Bash({c} *)" for c in ALLOWED_COMMANDS] + \
                   [f"Bash({c})" for c in ("ls",)]
         return [self.bin, "-p", "--model", self.model, "--output-format", "json",
@@ -1148,9 +1276,26 @@ def eligible_cards(cards, ledger_rows, statuses=DRAW_STATUSES):
 
 
 def select_uniform(cards, n, seed):
-    """n cards drawn uniformly at random with `seed` (every card the same chance -- no strata)."""
+    """n cards drawn uniformly at random with `seed` (every card the same chance -- no strata);
+    n None = every card (in the seeded order)."""
     pool = sorted(cards, key=lambda c: c["id"])
-    return random.Random(seed).sample(pool, min(n, len(pool)))
+    return random.Random(seed).sample(pool, len(pool) if n is None else min(n, len(pool)))
+
+
+def n_arg(text):
+    """--n: a count, or `all` (every eligible card)."""
+    if str(text).strip().lower() == "all":
+        return None
+    n = int(text)
+    if n < 0:
+        raise argparse.ArgumentTypeError("--n must be >= 0 or 'all'")
+    return n
+
+
+def ids_arg(text):
+    """--ids: a file of card ids (any separators), or a comma list."""
+    src = open(text, encoding="utf-8").read() if os.path.exists(text) else text
+    return list(dict.fromkeys(re.findall(r"K-\d+", src)))
 
 
 def backfill(ledger_path, calib_path, cards, date, judge="sonnet", prompt_version="v1-calib"):
@@ -1172,7 +1317,7 @@ def backfill(ledger_path, calib_path, cards, date, judge="sonnet", prompt_versio
 
 
 def judge_many(cards, model, root, mech, workers, max_usd, on_result, max_retries=2, deadline_s=None,
-               spent=0.0):
+               spent=0.0, judge=None):
     """Judge `cards` with at most `workers` calls in flight; stop SUBMITTING once the spend passes
     `max_usd` (calls in flight finish). on_result(card, result) runs in the caller's thread.
     Returns ({id: result}, stopped_at_cap)."""
@@ -1186,7 +1331,7 @@ def judge_many(cards, model, root, mech, workers, max_usd, on_result, max_retrie
                     stopped = True
                     break
                 c = todo.pop(0)
-                futs[ex.submit(judge_card, c, model, root, mech.get(c["id"], []), max_retries,
+                futs[ex.submit(judge or judge_card, c, model, root, mech.get(c["id"], []), max_retries,
                                deadline_s)] = c
             if stopped and todo:
                 todo = []
@@ -1208,8 +1353,9 @@ def verdict_line(results):
     v = Counter(r.get("verdict") for r in results)
     kn = sum(1 for r in results if (r.get("answer") or {}).get("knowhow") == "no")
     cost = sum(float(r.get("cost_usd") or 0) for r in results)
+    nj = f" not-judged={v[NOT_JUDGED]}" if v[NOT_JUDGED] else ""
     return (f"VERDICTS holds={v['holds']} no-longer-holds={v['no-longer-holds']} "
-            f"cannot-check={v['cannot-check-offline']} unverified={v['unverified']} knowhow-no={kn} "
+            f"cannot-check={v['cannot-check-offline']} unverified={v['unverified']}{nj} knowhow-no={kn} "
             f"cost=${cost:.4f}")
 
 
@@ -1264,7 +1410,7 @@ def proposal_row(card_id, result, value_flag=None, origin=None, body=None, repo_
     (the card text) recovers the sentence verbatim. Nothing is run."""
     ans = result.get("answer") or {}
     verdict, knowhow = result.get("verdict"), ans.get("knowhow")
-    if verdict == "holds" and knowhow != "no":
+    if verdict in ("holds", NOT_JUDGED) and knowhow != "no":
         return None
     sub = _decisive(ans, verdict)
     evs = [e for e in sub.get("evidence") or [] if isinstance(e, dict)]
@@ -1280,7 +1426,8 @@ def proposal_row(card_id, result, value_flag=None, origin=None, body=None, repo_
            "absence_only": bool(evs) and all(e.get("exit_code") not in (0, None) for e in evs)}
     if knowhow == "no":
         row["route"] = "retire-candidate"
-        note = f" -- validity: {verdict}" + (f", would be {path}" if verdict == "no-longer-holds" else "")
+        note = (" -- validity not re-judged (know-how-only)" if verdict == NOT_JUDGED else
+                f" -- validity: {verdict}" + (f", would be {path}" if verdict == "no-longer-holds" else ""))
         row["command"] = f"{_retire_label()}{note}; reason: {_norm(ans.get('knowhow_reason') or '')[:200]}"
     elif verdict == "no-longer-holds" and path == "erratum-wrong-record":
         row["route"] = "erratum wrong-record"
@@ -1576,9 +1723,13 @@ def cmd_run(a):
         sample = [by_id[i] for i in meta["ids"] if i in by_id]
         print(f"RESUMED {len(sample)} seed={a.seed}", flush=True)
     else:
-        pool = eligible_cards(cards, read_ledger(ledger), statuses)
-        sample = select_uniform(pool, a.n, a.seed)
-        meta = {"seed": a.seed, "n": a.n, "statuses": list(statuses), "eligible": len(pool),
+        if a.ids:                                      # named cards, judged whatever the ledger says
+            pool = [by_id[i] for i in a.ids if i in by_id]
+            sample = pool
+        else:
+            pool = eligible_cards(cards, read_ledger(ledger), statuses)
+            sample = select_uniform(pool, a.n, a.seed)
+        meta = {"seed": a.seed, "n": a.n, "ids_given": bool(a.ids), "statuses": list(statuses), "eligible": len(pool),
                 "population": sum(1 for c in cards if c["status"] in statuses),
                 "drawn_at": datetime.datetime.now().isoformat(timespec="seconds"),
                 "ids": [c["id"] for c in sample],
@@ -1625,7 +1776,7 @@ def cmd_run(a):
         print(f"sonnet {c['id']} -> {r['verdict']} knowhow={kh} ({r['attempts']}x, {r['wall_s']}s, "
               f"${r['cost_usd']}) total=${total[0]:.4f}", flush=True)
 
-    _done, stopped = judge_many(todo, model, sandbox, mech, min(a.workers, 4), a.max_usd, on_result,
+    _done, stopped = judge_many(todo, model, sandbox, mech, a.workers, a.max_usd, on_result,
                                 max_retries=a.max_retries, deadline_s=a.card_deadline, spent=spent)
     results = list(read_jsonl(res_path).values())
     line = verdict_line(results)
@@ -1635,6 +1786,83 @@ def cmd_run(a):
     with open(os.path.join(a.out, "summary.json"), "w", encoding="utf-8") as fh:
         json.dump({"verdicts": line, "judged": len(results), "sampled": len(sample), "stopped_at_cap": stopped,
                    "seed": a.seed, "prompt_version": PROMPT_VERSION, "ledger": ledger}, fh, indent=2)
+    return 3 if stopped else 0
+
+
+def knowhow_line(results):
+    k = Counter((r.get("answer") or {}).get("knowhow") for r in results if r.get("verdict") == NOT_JUDGED)
+    unv = sum(1 for r in results if r.get("verdict") == "unverified")
+    cost = sum(float(r.get("cost_usd") or 0) for r in results)
+    per = cost / len(results) if results else 0.0
+    return (f"KNOWHOW judged={len(results)} yes={k['yes']} no={k['no']} unverified={unv} cost=${cost:.4f} "
+            f"per-card=${per:.4f}")
+
+
+def cmd_knowhow(a):
+    """The v3 know-how question alone for cards judged under v1/v2 (or --ids): ledger rows KNOWHOW_VERSION."""
+    os.makedirs(a.out, exist_ok=True)
+    ledger = _ledger_path(a)
+    statuses = _statuses(a)
+    cards = load_cards(a.know)
+    by_id = {c["id"]: c for c in cards}
+    sample_path = os.path.join(a.out, "knowhow-sample.json")
+    if os.path.exists(sample_path):
+        with open(sample_path, encoding="utf-8") as fh:
+            meta = json.load(fh)
+        if meta.get("seed") != a.seed:
+            print(f"knowhow: {sample_path} was drawn with seed {meta.get('seed')}, not {a.seed}", file=sys.stderr)
+            return 2
+        sample = [by_id[i] for i in meta["ids"] if i in by_id]
+        print(f"RESUMED {len(sample)} seed={a.seed}", flush=True)
+    else:
+        if a.ids:
+            pool = [by_id[i] for i in a.ids if i in by_id]
+            sample = pool
+        else:
+            pool = knowhow_targets(cards, read_ledger(ledger), statuses)
+            sample = select_uniform(pool, a.n, a.seed)
+        meta = {"seed": a.seed, "n": a.n, "ids_given": bool(a.ids), "statuses": list(statuses),
+                "eligible": len(pool), "drawn_at": datetime.datetime.now().isoformat(timespec="seconds"),
+                "ids": [c["id"] for c in sample]}
+        with open(sample_path, "w", encoding="utf-8") as fh:
+            json.dump(meta, fh, indent=1)
+        print(f"ELIGIBLE {len(pool)} (judged under v1/v2 at the current hash, not under v3)", flush=True)
+    print(f"SAMPLED {len(sample)} seed={a.seed}", flush=True)
+    res_path = os.path.join(a.out, "knowhow.jsonl")
+    done = read_jsonl(res_path)
+    spent = sum(float(r.get("cost_usd") or 0) for r in done.values())
+    todo = [c for c in sample if c["id"] not in done]
+    cwd = os.path.join(a.out, "cwd")                 # an empty folder: the call has no tools anyway
+    os.makedirs(cwd, exist_ok=True)
+    model = ClaudeModel(a.claude_bin, a.model, cwd, deadline=a.deadline, max_budget_usd=a.per_card_max_usd,
+                        tools=False)
+    judge = f"claude -p --model {a.model}"
+    run_tag = f"card-validity {KNOWHOW_VERSION} seed={a.seed} {os.path.basename(os.path.abspath(a.out))}"
+    today = datetime.date.today().isoformat()
+    total = [spent]
+
+    def on_result(c, r):
+        r = dict(r, id=c["id"], sha256=c["sha256"])
+        append_ledger(res_path, [r])
+        append_ledger(ledger, [ledger_line(c, r, judge, KNOWHOW_VERSION, today, run=run_tag)])
+        total[0] += float(r.get("cost_usd") or 0)
+        ans = r.get("answer") or {}
+        print(f"knowhow {c['id']} -> {ans.get('knowhow') or r['verdict']} ({r['attempts']}x, {r['wall_s']}s, "
+              f"${r['cost_usd']}) total=${total[0]:.4f} :: {_norm(ans.get('knowhow_reason') or '')[:160]}",
+              flush=True)
+
+    _done, stopped = judge_many(todo, model, None, {}, a.workers, a.max_usd, on_result,
+                                max_retries=a.max_retries, deadline_s=a.card_deadline, spent=spent,
+                                judge=judge_knowhow)
+    results = list(read_jsonl(res_path).values())
+    line = knowhow_line(results)
+    if stopped:
+        print(f"STOPPED at the ${a.max_usd} cap after {len(results)} of {len(sample)} cards", flush=True)
+    print(line, flush=True)
+    with open(os.path.join(a.out, "summary.json"), "w", encoding="utf-8") as fh:
+        json.dump({"knowhow": line, "judged": len(results), "sampled": len(sample), "stopped_at_cap": stopped,
+                   "seed": a.seed, "prompt_version": KNOWHOW_VERSION, "model": a.model, "ledger": ledger},
+                  fh, indent=2)
     return 3 if stopped else 0
 
 
@@ -1732,21 +1960,32 @@ def main(argv=None):
     bf.add_argument("--date", required=True, help="the calibration's date (ISO)")
     sa = sub.add_parser("sample", help="draw past the ledger without judging")
     ru = sub.add_parser("run", help="draw past the ledger, mechanical pass, value flag, paid judge, ledger")
-    for p in (sa, ru):
+    kh = sub.add_parser("knowhow", help="the v3 know-how question alone, for cards judged under v1/v2")
+    for p in (sa, ru, kh):
         p.add_argument("--know", required=True)
         p.add_argument("--ledger", help="default: <know>/../ledger/validity.jsonl")
-        p.add_argument("--n", type=int, default=100)
+        p.add_argument("--n", type=n_arg, default=100, help="a count, or `all` (every eligible card)")
         p.add_argument("--seed", type=int, required=True)
         p.add_argument("--statuses", default=",".join(DRAW_STATUSES))
     sa.add_argument("--against", help="an earlier run's sample.json: print the overlap")
     sa.add_argument("--ids", action="store_true")
+    for p in (ru, kh):
+        p.add_argument("--out", required=True)
+        p.add_argument("--workers", type=int, default=4, choices=range(1, 17), metavar="1..16",
+                       help="calls in flight (default 4)")
+        p.add_argument("--ids", type=ids_arg, help="judge exactly these cards (a file of ids or K-1,K-2), "
+                       "whatever the ledger says, instead of a draw")
+        p.add_argument("--claude-bin", default=os.environ.get("KHMS_AGENT", "claude"))
+    kh.add_argument("--max-usd", type=float, default=15.0, help="stop submitting once the spend passes it")
+    kh.add_argument("--max-retries", type=int, default=1)
+    kh.add_argument("--card-deadline", type=float, default=300)
+    kh.add_argument("--model", default="sonnet", help="model alias of the know-how call (default: the judge's)")
+    kh.add_argument("--deadline", type=float, default=180)
+    kh.add_argument("--per-card-max-usd", type=float, default=0.25)
     ru.add_argument("--sandbox", required=True)
-    ru.add_argument("--out", required=True)
-    ru.add_argument("--workers", type=int, default=4, choices=range(1, 5))
     ru.add_argument("--max-usd", type=float, default=15.0, help="stop submitting once the spend passes it")
     ru.add_argument("--max-retries", type=int, default=2)
     ru.add_argument("--card-deadline", type=float, default=1200)
-    ru.add_argument("--claude-bin", default=os.environ.get("KHMS_AGENT", "claude"))
     ru.add_argument("--sonnet-model", default="sonnet")
     ru.add_argument("--sonnet-deadline", type=float, default=600)
     ru.add_argument("--sonnet-max-usd", type=float, default=1.0)
@@ -1769,7 +2008,7 @@ def main(argv=None):
         ap.error("the qwen leg needs --copilot-url or KHMS_COPILOT_URL (an OpenAI-compatible base URL)")
     return {"sandbox": cmd_sandbox, "mechanical": cmd_mechanical, "calibrate": cmd_calibrate,
             "report": cmd_report, "backfill": cmd_backfill, "sample": cmd_sample, "run": cmd_run,
-            "proposals": cmd_proposals}[a.cmd](a)
+            "knowhow": cmd_knowhow, "proposals": cmd_proposals}[a.cmd](a)
 
 
 if __name__ == "__main__":

@@ -266,3 +266,15 @@ into `KHMS_VALIDITY_DIR/<date>/`, and writes one line into the night log: `VALID
 It only judges and proposes: verifying the part files and applying them is the reviewer's work, who then
 writes `<date>/APPLIED`. Until that marker exists no new batch is judged, and the morning ping names every
 waiting batch (`validity batch <date>: 4 parts ready for verification`) and repeats the last status line.
+
+`--n all` judges every eligible card in one batch; `--workers` (1..16, default 4) sets the calls in flight
+and `--max-usd` still stops submitting at the cap. Since prompt v3 (2026-10-21) the know-how question is
+"mechanism or state": the base keeps when-X-then-Y, measurements with their conditions, decisions with
+their reason, mistakes with their measure, rules and refuted dead ends; a card that only records a state
+(where something is, a value, what is deployed, what a file does, progress) is `knowhow: no`. Cards judged
+under v1/v2 get that question alone, without re-judging validity: `card_validity.py knowhow --know … --out
+… --seed S [--n all] [--workers N] [--max-usd X] [--model sonnet]` appends ledger rows with prompt version
+`v3-knowhow` and verdict `not-judged`. `khms_archive_candidates.py --out FILE --git REPO@REF … --path
+FILE_OR_DIR …` turns the v3 "no" rows into one table: a card cited by id from a tree, a file, a live card's
+body or links (or the only live successor of a superseded card) is kept with the citing place, the rest is
+listed as `archive` with the `khms_archive.py` dry-run command. Nothing is moved by either tool.
