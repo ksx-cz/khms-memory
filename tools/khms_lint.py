@@ -220,6 +220,31 @@ def backward_targets(meta_or_links):
     return out
 
 
+def one_sided_contradicts(links_by_id):
+    """-> sorted [(source, target)] for every `contradicts` edge whose back half is missing.
+
+    `contradicts` is symmetric (spec §4.10), but only apply_triage ever wrote both halves: a card
+    approved or written by hand with `contradicts: [K-old]` left K-old silent, so a reader of the OLD
+    card never saw its correction (219 such edges in the reference deployment on 2026-10-27, issue
+    #265). `links_by_id` is {id: links dict} of the cards in know/. The edge source -> target is
+    CLOSED when the target lists the source in `contradicts` -- or in `refuted_by`, which is the loser's
+    half of a refute (apply_triage `refute`: winner.contradicts += loser, loser.refuted_by += winner).
+    A target outside `links_by_id` (moved to the archive, a temp label, no card) and a self-link are not
+    know/ edges and are not this check's business. build_views fails on what this returns and
+    `apply_triage.py --mirror-contradicts` closes it -- one definition for both."""
+    out = []
+    for src in sorted(links_by_id):
+        links = links_by_id[src] if isinstance(links_by_id[src], dict) else {}
+        for tgt in split_link_ids(links.get("contradicts")):
+            if tgt == src or tgt not in links_by_id:
+                continue
+            back = links_by_id[tgt] if isinstance(links_by_id[tgt], dict) else {}
+            if src in split_link_ids(back.get("contradicts")) or src in split_link_ids(back.get("refuted_by")):
+                continue
+            out.append((src, tgt))
+    return out
+
+
 def known_card_ids(know_dir):
     try:
         return {f[:-3] for f in khms_files.listdir(know_dir)

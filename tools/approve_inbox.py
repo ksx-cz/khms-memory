@@ -262,6 +262,29 @@ def mark_superseded(edges):
     return changed, notes
 
 
+def mirror_contradicts(new_ids):
+    """Close the back half of every `contradicts` edge an approved card brought in (#265).
+
+    `contradicts` is symmetric (spec §4.10) and build_views fails on a half the target does not carry;
+    before this, a card approved with `contradicts: [K-old]` left K-old unaware of the conflict (153
+    such edges in the reference deployment on 2026-10-27). The edit is apply_triage's mirror — only the
+    target's links.contradicts line moves — limited to edges that touch the cards of this run. A target
+    whose list layout the writer cannot edit is reported, not guessed; the build then names it."""
+    import apply_triage as AT          # late: only a writing approve needs the triage writer
+    edges, edits, refusals = AT.mirror_plan(BRAIN, sources=new_ids)
+    if refusals:
+        print(f"\ncontradicts mirror: NOT written ({len(refusals)} refusal(s)) — "
+              f"apply_triage.py --mirror-contradicts names them:")
+        for r in refusals:
+            print(f"   {r}")
+        return
+    n = AT.write_mirror(BRAIN, edits, "approve cards")
+    if edges:
+        print(f"\ncontradicts mirror: {len(edges)} back half(s) written on {n} card(s)")
+        for src, tgt in edges:
+            print(f"   {tgt}: links.contradicts += {src}")
+
+
 def parse_cards(text, skipped=None, unknown_links=None):
     cards = []
     if skipped is None:
@@ -516,6 +539,7 @@ def _main_locked():
                   f"superseded")
             for n in notes:
                 print(n)
+        mirror_contradicts(set(mapping.values()))
         # THE MARKER IS THE RECORD OF THE FACT, and there are two facts per date, not one:
         # the card batch (this) and the contradiction triage (apply_triage.py writes
         # `-triage`). They shared `.reviewed-DATE` until 2026-09-03, so approving cards

@@ -26,6 +26,11 @@ this tool never writes it), `derived_from`, `supports`. There is no `challenged_
   retire      refute + move the loser to memory/archive/know/ (only with --archive)
   unlink      card: links.<field> -= target · target: contradicts -= card (contradicts only)
 
+MIRROR (#265, 2026-10-27): `apply_triage.py --mirror-contradicts [--apply]` takes no triage file. It adds
+the missing back half of every one-sided `contradicts` edge in know/ — the target gains the source in
+links.contradicts, nothing else moves (build_views fails on such an edge and names this command). The
+edge is closed already when the target lists the source in `refuted_by` (the loser's half of a refute).
+
 UNLINK (#242, 2026-10-15) IS THE ONE WAY A LINK LEAVES A CARD. Until it existed this tool could only
 add links, so a link written by hand against the spec (13 `challenged` cards carried a `refuted_by`,
 which the spec fills only when status→refuted) could not be taken back by any sanctioned tool. The
@@ -47,6 +52,7 @@ when the edit would move anything but that one list — a missing link is never 
 Usage:
   apply_triage.py memory/inbox/2026-09-03-triage.md --dry-run
   apply_triage.py memory/inbox/2026-09-03-triage.md --apply [--archive]
+  apply_triage.py --mirror-contradicts [--apply]
 
 The REVIEW VERDICT section is the canonical record of the decision, one line per row:
 
@@ -60,6 +66,7 @@ from __future__ import annotations
 import argparse
 import datetime
 import difflib
+import glob
 import hashlib
 import os
 import re
@@ -177,34 +184,77 @@ def set_status(front, new):
 
 
 def add_link_id(front, key, cid):
-    """Add `cid` to links.<key>, in whichever of the two frontmatter styles the card uses.
-    Returns (front, changed). Only the one line that holds the list is rewritten."""
+    """Add `cid` (one id or a list of ids) to links.<key>, in whichever of the two frontmatter styles
+    the card uses. Returns (front, changed). Only the one line that holds the list is rewritten (a card
+    with no `links:` at all gets a `links:` block with that one list), and the result is re-read: if
+    anything but that one list would differ, it raises ValueError instead of writing a guess.
+
+    A block that holds the key TWICE (YAML reads the last one; the reference base had one such card,
+    whose first line carried the edges the parser never saw) is collapsed onto the last line when every
+    id of the earlier line(s) is in the result, and refused otherwise."""
     meta = yaml.safe_load(front) or {}
     links = meta.get("links") or {}
-    cur = links.get(key) or []
-    if isinstance(cur, str):
-        cur = [cur]
-    if cid in cur:
+    cur = KL.split_link_ids(links.get(key))
+    add = [c for c in ([cid] if isinstance(cid, str) else list(cid)) if c not in cur]
+    add = [c for i, c in enumerate(add) if c not in add[:i]]
+    if not add:
         return front, False
-    rendered = "[" + ", ".join(list(cur) + [cid]) + "]"
+    rendered = "[" + ", ".join(cur + add) + "]"
     inline = re.search(r"^links:\s*(\{.*\})\s*$", front, re.M)
     if inline:
         inner = inline.group(1)
         km = re.search(rf"(?<![\w-]){key}:\s*(?:\[[^\]]*\]|null|[^,}}]*)", inner)
-        new_inner = (inner[:km.start()] + f"{key}: {rendered}" + inner[km.end():] if km
-                     else inner.rstrip()[:-1].rstrip().rstrip(",") + f", {key}: {rendered}}}")
-        return front[:inline.start(1)] + new_inner + front[inline.end(1):], True
-    bm = re.search(r"^links:\s*$", front, re.M)
-    if not bm:
-        raise ValueError("no links: mapping")
-    tail = front[bm.end():]
-    km = re.search(rf"^(\s+){key}:\s*.*$", tail, re.M)
-    if km:
-        return (front[:bm.end()] + tail[:km.start()] + f"{km.group(1)}{key}: {rendered}"
-                + tail[km.end():], True)
-    sib = re.search(r"^(\s+)\w+:", tail, re.M)
-    ind = sib.group(1) if sib else "  "
-    return front[:bm.end()] + f"\n{ind}{key}: {rendered}" + tail, True
+        if km:
+            new_inner = inner[:km.start()] + f"{key}: {rendered}" + inner[km.end():]
+        else:
+            head = inner.rstrip()[:-1].rstrip().rstrip(",")
+            new_inner = head + ("" if head.strip() == "{" else ", ") + f"{key}: {rendered}}}"
+        new = front[:inline.start(1)] + new_inner + front[inline.end(1):]
+    else:
+        bm = re.search(r"^links:\s*$", front, re.M)
+        if not bm and re.search(r"^links:", front, re.M):
+            raise ValueError("links: is neither a one-line mapping nor a block this tool can edit")
+        if not bm:      # a card with no links at all gets the one list it needs, as a block at the end
+            front += "\nlinks:"
+            bm = re.search(r"^links:\s*$", front, re.M)
+        tail = front[bm.end():]
+        occ = list(re.finditer(rf"^([ \t]+){key}:[ \t]*(.*)$", tail, re.M))
+        if occ:
+            km = occ[-1]
+            for dup in occ[:-1]:
+                try:
+                    lost = [x for x in KL.split_link_ids(yaml.safe_load(dup.group(2) or "null"))
+                            if x not in cur + add]
+                except yaml.YAMLError:
+                    lost = [dup.group(2)]
+                if lost:
+                    raise ValueError(f"links.{key} appears {len(occ)} times and an earlier line holds "
+                                     f"{', '.join(map(str, lost))}, which the result would drop")
+            out, pos = [], 0
+            for dup in occ[:-1]:                       # drop the earlier lines with their newline
+                out.append(tail[pos:dup.start() - 1] if dup.start() > 0 else "")
+                pos = dup.end()
+            new = (front[:bm.end()] + "".join(out) + tail[pos:km.start()]
+                   + f"{km.group(1)}{key}: {rendered}" + tail[km.end():])
+        else:
+            sib = re.search(r"^([ \t]+)\w+:", tail, re.M)     # [ \t], not \s: a newline is no indent
+            ind = sib.group(1) if sib else "  "
+            new = front[:bm.end()] + f"\n{ind}{key}: {rendered}" + tail
+    # Re-read what would be written (#265): a multi-line YAML list or an odd layout must raise, never
+    # leave the old `- K-x` lines dangling under a rewritten one-line list.
+    want = yaml.safe_load(front)
+    if not isinstance(want.get("links"), dict):
+        want["links"] = {}
+    want["links"][key] = cur + add
+    cid = ", ".join(add)
+    try:
+        got = yaml.safe_load(new)
+    except yaml.YAMLError as e:
+        raise ValueError(f"adding {cid} to links.{key} would break the frontmatter: {e}")
+    if got != want:
+        raise ValueError(f"adding {cid} to links.{key} would change more than that one list "
+                         f"(a multi-line list or a layout this tool does not edit)")
+    return new, True
 
 
 def remove_link_id(front, key, cid):
@@ -381,7 +431,10 @@ def plan(rows, brain):
                 else:
                     c["ops"].append(f"status: {cur} kept ({arg} is not stronger)")
             else:
-                new, changed = add_link_id(c["front"], kind, arg)
+                try:
+                    new, changed = add_link_id(c["front"], kind, arg)
+                except ValueError as e:
+                    raise Refusal(f"ROW {row['n']}: {cid}: {e}")
                 c["front"] = new
                 c["ops"].append(f"links.{kind} += {arg}" if changed
                                 else f"links.{kind} already has {arg}")
@@ -432,6 +485,98 @@ def unlink(row, get):
         c["ops"].append(f"mirror half: {target} links.contradicts had no {cid}")
 
 
+# ------------------------------------------------------------------- mirror contradicts (#265)
+
+def load_links(brain):
+    """{id: links dict} of every card in memory/know/ — the same file set build_views reads."""
+    out = {}
+    for path in sorted(glob.glob(os.path.join(brain, "memory", "know", "K-*.md"))):
+        cid = os.path.basename(path)[:-3]
+        out[cid] = load(brain, cid)["meta"].get("links") or {}
+    return out
+
+
+def mirror_plan(brain, sources=None):
+    """-> (edges, edits, refusals) for the missing back halves of `contradicts` edges.
+
+    `edges` are khms_lint.one_sided_contradicts over know/ (the build gate's own definition), limited to
+    edges that touch `sources` when it is given (approve_inbox passes the ids it just wrote). `edits` is
+    {target id: planned frontmatter}: the target gains the source in links.contradicts and NOTHING else —
+    add_link_id re-reads the result and raises on any other difference; such a target is a refusal and
+    the caller writes nothing. Status is never touched: a mirror is a link, not a verdict."""
+    edges = KL.one_sided_contradicts(load_links(brain))
+    if sources is not None:
+        edges = [(a, b) for a, b in edges if a in sources or b in sources]
+    by_target = {}
+    for src, tgt in edges:
+        by_target.setdefault(tgt, []).append(src)
+    edits, refusals = {}, []
+    for tgt, srcs in sorted(by_target.items()):      # one edit per target: all its halves at once
+        card = load(brain, tgt)
+        try:
+            front, _ = add_link_id(card["front"], "contradicts", srcs)
+        except ValueError as e:
+            refusals.append(f"{tgt} (mirror of {', '.join(srcs)}): {e}")
+            continue
+        edits[tgt] = {"path": card["path"], "body": card["body"], "front0": card["front"],
+                      "front": front, "ops": [f"links.contradicts += {s}" for s in srcs]}
+    return edges, edits, refusals
+
+
+def write_mirror(brain, edits, what="mirror contradicts edges"):
+    """Write planned mirror edits; every output is checked before the first write and a body that would
+    move refuses the whole set (ValueError). Returns the number of files written."""
+    out = []
+    for cid, c in sorted(edits.items()):
+        after = f"---\n{c['front']}\n---\n{c['body']}"
+        if split_card(after)[1] != c["body"]:
+            raise ValueError(f"the body of {cid} would change — this tool only edits frontmatter")
+        if c["front"] != c["front0"]:
+            out.append((c["path"], after))
+    if not out:
+        return 0
+    P.require_may_write([p for p, _ in out], what)
+    L.dirty(brain)
+    for path, after in out:
+        L.atomic_text(path, after)
+    return len(out)
+
+
+def mirror_main(args, write, selected):
+    """`--mirror-contradicts`: close every one-sided `contradicts` edge in the base. Dry run by default;
+    every edge it adds is printed; a second run finds nothing (idempotent)."""
+    know = os.path.join(args.brain, "memory", "know")
+    if write:
+        if selected:
+            P.require_writable("mirror contradicts edges")
+        P.require_may_write([know], "mirror contradicts edges")
+    with L.lock('cards', args.brain):
+        import khms_health
+        khms_health.require_healthy(args.brain)
+        edges, edits, refusals = mirror_plan(args.brain)
+        for src, tgt in edges:
+            print(f"MIRROR {tgt} links.contradicts += {src}   ({src} contradicts {tgt})")
+        if refusals:
+            for r in refusals:
+                print(f"REFUSED {r}", file=sys.stderr)
+            print("REFUSED: nothing was written — edit those link lists into one-line lists (or unlink "
+                  "the edge) and run again", file=sys.stderr)
+            sys.exit(2)
+        n = 0
+        if write:
+            try:
+                n = write_mirror(args.brain, edits)
+            except ValueError as e:
+                print(f"REFUSED: {e}; nothing was written", file=sys.stderr)
+                sys.exit(2)
+        print(f"mirror-contradicts: {len(edges)} missing half(s) on {len(edits)} card(s) — "
+              + (f"APPLIED, {n} card file(s) written" if write
+                 else "DRY RUN, nothing written (add --apply to write)"))
+    if write and selected and n:
+        sys.stdout.flush()                 # the summary before the build's own lines
+        subprocess.run([sys.executable, os.path.join(P.CODE, 'build_views.py')], check=True)
+
+
 def render_diff(cid, before, after):
     # "\n" closes the last frontmatter line, so a change there renders as two lines, not one glued line
     return "".join(difflib.unified_diff((before + "\n").splitlines(True), (after + "\n").splitlines(True),
@@ -441,7 +586,10 @@ def render_diff(cid, before, after):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("triage_file")
+    ap.add_argument("triage_file", nargs="?")
+    ap.add_argument("--mirror-contradicts", action="store_true",
+                    help="no triage file: add the missing back half of every one-sided `contradicts` "
+                         "edge in know/ (links.contradicts only); dry run unless --apply")
     ap.add_argument("--brain", default=DEFAULT_BRAIN,
                     help="the base (default: the resolver's KHMS_ROOT)")
     ap.add_argument("--apply", action="store_true", help="write; default is a dry run")
@@ -456,6 +604,12 @@ def main():
         print("REFUSED: no base selected (KHMS_ROOT) and no --brain", file=sys.stderr)
         sys.exit(2)
     write = args.apply and not args.dry_run
+    if args.mirror_contradicts:
+        if args.triage_file or args.archive or args.assume_apply:
+            ap.error("--mirror-contradicts takes no triage file, --archive or --assume-apply")
+        return mirror_main(args, write, P.same_path(args.brain, DEFAULT_BRAIN))
+    if not args.triage_file:
+        ap.error("a triage file is required (or --mirror-contradicts)")
     # THE WRITE POLICY, BEFORE ANYTHING IS READ OR WRITTEN. `--brain` is compared with the selected base
     # by what it names (real path), never as text: `<base>/.` or a symlink to the base IS the selected base
     # and gets its policy and its shared review marker. Every output of the run is checked,

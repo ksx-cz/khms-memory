@@ -147,7 +147,7 @@ When the knowledge was established — not when the card was written. ISO date.
 |---|---|
 | `derived_from: [K-*]` | Evidence this card is induced from. Feeds its belief support. Required non-empty for `derived`. |
 | `supports: [K-*]` | This card adds support to the listed cards' belief. |
-| `contradicts: [K-*]` | Mutual conflict (symmetric). Feeds the oppose side of belief on both ends. |
+| `contradicts: [K-*]` | Mutual conflict (symmetric). Feeds the oppose side of belief on both ends. Both halves are written: `build_views.py` fails on an edge whose target lists the source in neither `contradicts` nor `refuted_by`; `apply_triage.py --mirror-contradicts` adds the missing halves, and `approve_inbox.py` writes them for the cards it approves. |
 | `supersedes: K-*` | This card replaces an older one. The body must contain `SUPERSEDES K-x BECAUSE: <reason>`. |
 | `refuted_by: [K-*]` | Evidence that killed this card. Filled when status → refuted. |
 

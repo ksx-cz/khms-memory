@@ -236,6 +236,16 @@ def load_cards():
              + "\n  Close each with approve_inbox.mark_superseded([(NEW, [OLD])]) — never by "
                "hand; a target that is wrong only in one claim takes an erratum "
                "(tools/khms_erratum.py), one retired whole takes apply_triage refute.")
+    # `contradicts` is symmetric (spec §4.10): a half the target does not carry leaves the older card
+    # unaware of its correction, and nothing but this gate notices (#265, 2026-10-27: 153 such edges).
+    one = khms_lint.one_sided_contradicts({cid: c["links"] for cid, c in cards.items()})
+    if one:
+        fail(f"{len(one)} one-sided `contradicts` edge(s) — the target does not list the source in "
+             f"contradicts or refuted_by, so a reader of the target never sees the conflict:\n  "
+             + "\n  ".join(f"{a} contradicts {b}, but {b} does not list {a}" for a, b in one)
+             + f"\n  Close them with: {os.path.join(P.CODE, 'apply_triage.py')} --mirror-contradicts "
+               "--apply (dry run without --apply) — it writes only the missing link-list halves; a "
+               "wrong edge is taken back with an apply_triage `unlink` row instead.")
     return cards
 
 
