@@ -131,22 +131,36 @@ def prefilter_line(pre):
             f"`meta.selection.gated_before_model.refused_pairs`)")
 
 
-def match_claim(claims, quote):
-    """Best claim for a verdict quote, by token overlap. None when nothing overlaps."""
+# How much of the verdict quote a claim must hold to be the claim the verdict is about (§7 configuration).
+MATCH_MIN_COVER = 0.6
+
+
+def match_claim(claims, quote, min_cover=None):
+    """The claim that holds a verdict quote, or None when no claim holds enough of it.
+
+    A claim is a whole sentence (khms_triage.split_claims) and the judge quotes a stretch of one, so the share
+    of the QUOTE's tokens that occur in the claim decides; of two claims that hold it equally, the one the
+    quote fills more is taken. Until #268 the score was the share of the CLAIM covered by the quote, which
+    only works when claims are line fragments: it picked the shortest text sharing the quote's words — on
+    2026-10-30 a wrapped line of an ERRATUM block over the live sentence it repeats."""
     if not quote:
         return None
+    min_cover = MATCH_MIN_COVER if min_cover is None else min_cover
     qt = set(re.findall(r"[a-z0-9]+", quote.lower()))
-    best, score = None, 0.0
+    if not qt:
+        return None
+    best, key = None, (0.0, 0.0)
     for c in claims:
         if c.kind != "claim":
             continue
         ct = set(re.findall(r"[a-z0-9]+", c.text.lower()))
         if not ct:
             continue
-        s = len(qt & ct) / len(ct)
-        if s > score:
-            best, score = c, s
-    return best if score >= 0.45 else None
+        shared = len(qt & ct)
+        k = (shared / len(qt), shared / len(ct))
+        if k > key:
+            best, key = c, k
+    return best if key[0] >= min_cover else None
 
 
 # ------------------------------------------------- role coherence and per-side withholding
@@ -714,7 +728,7 @@ def main():
         if res.action == "AMEND":
             n_amend += 1
             L += [f"- **claims judged false ({len(res.false_claims)}):**"]
-            L += [f"    - {c.text[:200]}" for c in res.false_claims]
+            L += [f"    - {c.text}" for c in res.false_claims]     # whole: a cut sentence is a fragment
             L += [f"- **claims that must survive into the superseding card "
                   f"({len(res.surviving_claims)}):**"]
             L += [f"    - {c.text[:160]}" for c in res.surviving_claims[:20]]
@@ -742,7 +756,7 @@ def main():
             # calls after them. Before 2026-09-05 it did not, and this loop published seven
             # tombstones all numbered TS-00001.
             line, is_rec, ts = T.propose_tombstone(
-                card, claim=c.text[:200],
+                card, claim=c.text,
                 wrong=(v.get("why") or "")[:200], truth=other,
                 keys=(r.get("keys") or [])[:6], today=today, ledger=ledger,
                 counter=args.tomb_counter)

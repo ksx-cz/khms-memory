@@ -1409,17 +1409,27 @@ JUDGE_CARD_CHARS = 1600
 
 
 def judge_prompt_id():
-    """A short fingerprint of what the judge is asked and shown (the instructions plus the card
-    cut). The evaluator stores it with every recorded answer, so a measurement can never be
-    reported for a prompt it was not made with."""
+    """A short fingerprint of what the judge is asked and shown (the instructions, the card
+    cut, and since #268 the live text without ERRATUM blocks and markers). The evaluator
+    stores it with every recorded answer, so a measurement can never be reported for a
+    prompt it was not made with."""
     import hashlib
-    h = hashlib.sha256(f"{adj_system()}\n#card_chars={JUDGE_CARD_CHARS}".encode()).hexdigest()
+    h = hashlib.sha256(f"{adj_system()}\n#card_chars={JUDGE_CARD_CHARS}\n#card_text=live".encode()).hexdigest()
     return f"adj-{h[:10]}"
+
+
+def live_body(text: str) -> str:
+    """The card text the judge is shown and its quotes are checked against: without the card's ERRATUM blocks
+    and inline `[ERRATUM TS-nnnnn]` markers (#268). A block quotes the RETRACTED wording and repeats the
+    corrected one, which already stands in the body; neither is the card asserting anything, and a quote that
+    only the block holds is not in the card. One definition with khms_lint and khms_triage.split_claims."""
+    import khms_lint
+    return khms_lint.strip_errata(text or "")[0].strip()
 
 
 def card_blob(c, maxlen=None):
     maxlen = JUDGE_CARD_CHARS if maxlen is None else maxlen
-    body = c["body"]
+    body = live_body(c["body"])
     if len(body) > maxlen:
         body = body[:maxlen] + " …[truncated by the caller]"
     return (f"id={c['id']} type={c.get('type','?')} status={c['status']} "
@@ -1626,7 +1636,7 @@ def _qtokens(s: str) -> set[str]:
 
 
 def card_text(c) -> str:
-    return _norm_text((c.get("first") or "") + "\n" + (c.get("body") or ""))
+    return _norm_text(live_body((c.get("first") or "") + "\n" + (c.get("body") or "")))
 
 
 def quote_coverage(quote: str, card_text_norm: str) -> float:

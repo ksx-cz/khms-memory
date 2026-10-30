@@ -206,7 +206,33 @@ def classify(card: dict, refuted_by_evidence: bool = False) -> Triage:
 # card is retired whole only when every claim in it is false.
 
 _CZ = re.compile(r"^\s*CZ\s*:", re.I)
-_SPEC_LIST = re.compile(r":\s")
+# A line that opens a new unit even without a blank line before it: a field label (WHAT:, HOW TO APPLY:, CZ:),
+# a list item, a heading, a bold lead (**QUOTES:**), a table row or a quote. Every other non-blank line
+# continues the unit above it: cards are hard-wrapped, and a line break is not a sentence boundary.
+_UNIT_START = re.compile(r"^\s*(?:[-*]\s|\d+[.)]\s|#{1,6}\s|\*\*|\|\s|>\s|[A-Z][A-Z0-9 /+&'()-]{0,40}:(?:\s|$))")
+_FENCE = re.compile(r"^\s*(?:```|~~~)")
+# A sentence ends at . ! ? (optionally inside a closing quote or bracket) followed by whitespace — but not
+# before a lower-case word, so "e.g. the" or "approx. the" do not cut a sentence in two.
+_SENT_END = re.compile(r"(?:(?<=[.!?])|(?<=[.!?][\"'\u201d)\]]))\s+(?![a-z\u00df-\u017f])")
+_SPEC_ITEM = re.compile(r"(?:[^,]|,(?!\s))+")
+_FIELD_LABEL = re.compile(r"[A-Z][A-Z0-9 /+&'()-]{0,40}:\s+")
+# A spec LIST is a short head and at least four short items ("Vendor-page specs: 100 N.m, 48 V, 600 W, gear
+# ratio 5, ..."). A field label (WHAT:, FIX:) is not its head, and a sentence of long clauses is prose: cut
+# on its commas it yields fragments, which a reviewer can only reject (#268).
+SPEC_HEAD_MAX_WORDS = 6
+SPEC_ITEM_MAX_WORDS = 8
+
+
+def _spec_list_head(sent: str):
+    """-> the index of the ": " that heads a spec list in `sent`, or None when `sent` is not one."""
+    lab = _FIELD_LABEL.match(sent)
+    h = sent.find(": ", lab.end() if lab else 0)
+    if h < 0 or len(sent[lab.end() if lab else 0:h].split()) > SPEC_HEAD_MAX_WORDS:
+        return None
+    items = [x for x in re.split(r",\s+", sent[h + 2:]) if x.strip()]
+    if len(items) < 4 or max(len(x.split()) for x in items) > SPEC_ITEM_MAX_WORDS:
+        return None
+    return h
 
 
 @dataclass
@@ -217,38 +243,116 @@ class Claim:
     span: tuple = (0, 0)
 
 
-def split_claims(body: str) -> list[Claim]:
-    """Cut a card body into independently-checkable assertions.
+_QUOTES_TAIL = re.compile(r"^\*\*QUOTES:?\*\*.*\Z", re.S | re.M)
+_MARK_BOUNDARY = "\ue000"      # private-use: where an inline erratum marker stood
 
-    Sentences first; then, inside a sentence that is a spec LIST ("Vendor-page specs: a, b,
-    c, ..."), on the commas as well — the motor card above puts fourteen separate vendor claims in one
-    sentence and only one of them is wrong.
+
+def mask_non_claims(body: str) -> str:
+    """The body with everything that is not the card's own assertion blanked out, same length and same line
+    breaks, so offsets into the result are offsets into the card:
+
+      * every ERRATUM block and inline `[ERRATUM TS-nnnnn]` marker — the block (khms_erratum.py apply) quotes
+        the RETRACTED wording and repeats the corrected one, which already stands in the body where the
+        marker is; the marker is a pointer (regexes: khms_lint's, the one definition the erratum tool and
+        the lint share);
+      * the `**QUOTES:**` tail — evidence quoted from a source with its `src=`; the card's claim is the body.
+
+    The same reading as khms_lint._statements.
+    An inline marker becomes `_MARK_BOUNDARY`: the corrected wording ends where its marker stands, with or
+    without a full stop, so the marker is a sentence boundary for anything that reads the card's sentences.
     """
-    claims: list[Claim] = []
-    pos = 0
-    for line in body.splitlines(keepends=True):
+    import khms_lint as KL
+
+    def blank(m):
+        return re.sub(r"[^\n]", " ", m.group(0))
+
+    def boundary(m):
+        return _MARK_BOUNDARY + blank(m)[1:]
+    body = KL.ERRATUM_MARK_RE.sub(boundary, KL.ERRATUM_BLOCK_RE.sub(blank, body or ""))
+    return _QUOTES_TAIL.sub(blank, body, count=1)
+
+
+def _units(text: str):
+    """-> [(unit, offsets)]: the logical paragraphs of `text`, each wrapped line joined to the one before it
+    by a single space; `offsets[i]` is the position in `text` of `unit[i]`. Inside a code fence every line
+    is its own unit (code is not prose and is not re-flowed)."""
+    units, cur, offs = [], [], []
+    in_fence, pos = False, 0
+
+    def flush():
+        if cur:
+            units.append(("".join(cur), offs[:]))
+            cur.clear()
+            offs.clear()
+    for line in text.splitlines(keepends=True):
         start = pos
         pos += len(line)
-        s = line.strip()
-        if not s:
+        raw = line.rstrip("\r\n")
+        if _FENCE.match(raw):
+            flush()
+            in_fence = not in_fence
             continue
-        if _CZ.match(s):
-            claims.append(Claim(len(claims), s, "cz", (start, start + len(line))))
+        if not raw.strip():
+            flush()
             continue
-        off = start + (len(line) - len(line.lstrip()))
-        for sent in re.split(r"(?<=[.!?])\s+", s):
+        if in_fence or _UNIT_START.match(raw):
+            flush()
+        lead = len(raw) - len(raw.lstrip())
+        body = raw.strip()
+        if cur:
+            cur.append(" ")
+            offs.append(start + lead - 1 if lead else max(start - 1, 0))
+        cur.extend(body)
+        offs.extend(range(start + lead, start + lead + len(body)))
+        if in_fence:
+            flush()
+    flush()
+    return units
+
+
+def split_claims(body: str) -> list[Claim]:
+    """Cut a card body into independently-checkable assertions: the whole sentences of its LIVE text.
+
+    The live text is the body without its ERRATUM blocks, inline erratum markers and `**QUOTES:**` evidence
+    tail (`mask_non_claims`).
+    Lines are joined into paragraphs first — a card is hard-wrapped, and splitting per line made a claim of
+    whatever piece of a sentence sat on one line (#268: a line starting "since abc1234), so a ..." was
+    proposed as a tombstone). Then sentences; then, inside a sentence that is a spec LIST ("Vendor-page specs: a, b, c, ..."),
+    on the commas as well — the motor card above puts fourteen separate vendor claims in one sentence and
+    only one of them is wrong. A `CZ:` paragraph is one mirror claim, corrected with its source.
+    `span` is the claim's (start, end) in `body`.
+    """
+    claims: list[Claim] = []
+
+    def add(unit, offs, i, j, kind):
+        while i < j and unit[i].isspace():
+            i += 1
+        while j > i and unit[j - 1].isspace():
+            j -= 1
+        text = " ".join(unit[i:j].split())
+        if len(text) >= 8:
+            claims.append(Claim(len(claims), text, kind, (offs[i], offs[j - 1] + 1)))
+
+    for unit, offs in _units(mask_non_claims(body)):
+        if _CZ.match(unit):
+            add(unit, offs, 0, len(unit), "cz")
+            continue
+        cuts = sorted([m.span() for m in _SENT_END.finditer(unit)]
+                      + [(i, i + 1) for i, ch in enumerate(unit) if ch == _MARK_BOUNDARY])
+        starts = [0] + [e for _, e in cuts]
+        ends = [s for s, _ in cuts] + [len(unit)]
+        for a, b in zip(starts, ends):
+            sent = unit[a:b]
             if len(sent.strip()) < 8:
-                off += len(sent) + 1
                 continue
-            parts = [sent]
-            if _SPEC_LIST.search(sent) and sent.count(",") >= 3:
-                head, _, tail = sent.partition(": ")
-                parts = [head + ":"] + [p for p in re.split(r",\s+", tail) if p.strip()]
-            for p in parts:
-                p = p.strip()
-                if len(p) >= 8:
-                    claims.append(Claim(len(claims), p, "claim", (off, off + len(p))))
-            off += len(sent) + 1
+            h = _spec_list_head(sent)
+            if h is not None:
+                add(unit, offs, a, a + h + 1, "claim")
+                tail = a + h + 2
+                for m in _SPEC_ITEM.finditer(unit, tail, b):
+                    add(unit, offs, m.start(), m.end(), "claim")
+                continue
+            add(unit, offs, a, b, "claim")
     return claims
 
 

@@ -378,7 +378,7 @@ def decide(rows, verdicts, brain, cov_min=kc.QUOTE_COV_MIN, assume_apply=False):
         # came within one hand edit of being archived on 2026-09-03.
         for who, quote, card in ((row["loser"], row["quote"], lc),
                                  (row["winner"], row["winner_quote"], wc)):
-            cov = kc.quote_coverage(quote, kc._norm_text(card["body"]))
+            cov = kc.quote_coverage(quote, kc._norm_text(kc.live_body(card["body"])))
             if cov < cov_min:
                 outcomes[n] = ("REJECT", f"quote-not-in-card: the quote attributed to {who} "
                                          f"scores {cov:.2f} against its body")
