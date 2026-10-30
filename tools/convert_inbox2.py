@@ -774,6 +774,56 @@ def _protect_hash(ln):
     return _yaml_line(m.group(1), raw)
 
 
+def _text_value(raw):
+    """The value of a free-text key (khms_lint.TEXT_KEYS) exactly as the author wrote it.
+
+    A value written as ONE YAML quoted scalar (`'a: b'`, `"a: b"`) is unquoted; anything
+    else is the raw text, never re-parsed: `journal/D.md:12 — "tool, D: 5 of 22"` read as
+    YAML is the one-entry mapping {'journal/D.md:12 — "tool, D': '5 of 22"'} (#267), and a
+    value that merely STARTS with a quote (`"tool": D.md:4`) is a mapping too.
+    """
+    if raw[:1] in ("'", '"'):
+        try:
+            val = yaml.safe_load(raw)
+        except yaml.YAMLError:
+            val = None
+        if isinstance(val, str):
+            return val
+    return raw
+
+
+def _quote_text_lines(meta_lines):
+    """-> meta_lines with every free-text key re-emitted as one quoted YAML string.
+
+    Free text is the cause, not one input: the night writes `source:` (and could write
+    `scope:` or any other TEXT_KEYS value) with its own `: `, `#` or quotes, and a plain
+    YAML scalar cannot hold `: ` at all -- the block parse fails and the per-line
+    fallback reads a mapping (a landmine recorded in the base on 2026-10-05; #267 is it
+    going off).
+    Re-quoting HERE makes the block parse and the per-line fallback read the same
+    exact string. Indented continuation lines of such a key are folded into its value
+    with one space, as YAML folds a plain multi-line scalar; a block scalar (`|`, `>`)
+    and an empty value (a list below it) stay YAML's own and meet the gate as they are.
+    Every other key keeps the #239 `#` protection.
+    """
+    out, i = [], 0
+    while i < len(meta_lines):
+        ln = meta_lines[i]
+        m = META_LINE_RE.match(ln)
+        raw = m.group(2).strip() if m else ""
+        if not m or m.group(1) not in LINT.TEXT_KEYS or not raw or raw[0] in "|>":
+            out.append(_protect_hash(ln))
+            i += 1
+            continue
+        parts = [raw]
+        i += 1
+        while i < len(meta_lines) and meta_lines[i][:1] in (" ", "\t") and meta_lines[i].strip():
+            parts.append(meta_lines[i].strip())
+            i += 1
+        out.append(_yaml_line(m.group(1), _text_value(" ".join(parts))))
+    return out
+
+
 def merge_legacy_meta(meta_lines, meta):
     """Fold an existing meta block (fenced ```yaml or bare lines) into the dict.
 
@@ -796,9 +846,10 @@ def merge_legacy_meta(meta_lines, meta):
     ends at ` #` — the card got `source: journal/D.md:585 (agent` (#239,
     measured on a real unit: 45 rows in one morning). Such a line is re-quoted
     first (`_protect_hash`), so both the block parse and the per-line fallback
-    read the whole value.
+    read the whole value. A free-text key (`source`, `scope`, ...) is re-quoted
+    whole (`_quote_text_lines`, #267): its own `: ` is content too.
     """
-    meta_lines = [_protect_hash(ln) for ln in meta_lines]
+    meta_lines = _quote_text_lines(meta_lines)
     block = "\n".join(meta_lines)
     try:
         parsed = yaml.safe_load(block)

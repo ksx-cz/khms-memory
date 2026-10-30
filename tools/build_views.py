@@ -130,6 +130,10 @@ def card_problems(meta, legacy=None):
     caller prefixes its own label.
     """
     problems = [f"missing '{k}'" for k in REQUIRED_KEYS if k not in meta]
+    # A free-text key that is not a string (#267): a `source` read as a YAML mapping
+    # passed every gate until 2026-10-30, and a mapping `level` would not even reach
+    # the set lookups below without a TypeError. Refused first, by name.
+    problems += khms_lint.text_problems(meta)
     if problems:
         return problems, False
     if meta["level"] not in LEVELS:

@@ -92,6 +92,24 @@ def link_problems(links):
                                 f"label -- one id per element, ids separated by commas")
     return problems
 
+
+# --- free-text front-matter keys: one value = ONE string (#267) ---------------
+# The scalar keys whose value is text, never YAML structure: `tags` is a list, `links`
+# a mapping, `date` a date. A night writer's `source: journal/D.md:12 — "tool, D: 5 of 22"`
+# is not one YAML scalar (its second `: ` makes YAML read `X: Y` as a mapping), so the
+# converter reads these keys as the raw line text, and the per-card gate refuses any
+# that still arrives as something else -- a mapping `source` is valid YAML, and on
+# 2026-10-30 it passed the converter, approve --dry-run and build_views.
+TEXT_KEYS = ("type", "level", "status", "scope", "evidence", "source")
+
+
+def text_problems(meta):
+    """-> problems of a card's front matter: every TEXT_KEYS value present is a string.
+    Texts carry no card id; the caller prefixes its own label."""
+    return [f"'{key}' is a {type(meta[key]).__name__}, not a string: {meta[key]!r:.120} -- "
+            f"a free-text value is written as ONE quoted YAML string"
+            for key in TEXT_KEYS if key in meta and not isinstance(meta[key], str)]
+
 # Correction language, in tiers, because the word list alone does not
 # separate "this card corrects the record" from "we fixed a bolt".  Measured on
 # the 2187-card base of 2026-08-28: the flat word list fires on 476 cards (22 %

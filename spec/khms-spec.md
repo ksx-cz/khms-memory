@@ -137,7 +137,10 @@ Observation cards only; the input weight for belief (§5).
 
 ### 4.8 source
 Provenance: file / journal reference / session id / URL, **plus a locating quote**. Required
-for observations. A source you cannot locate the claim in is not a source.
+for observations. A source you cannot locate the claim in is not a source. The value is ONE
+string, written as a quoted YAML scalar when it holds `: `, `#` or quotes; `build_views.py`
+refuses a card whose `source` (or `type`, `level`, `status`, `scope`, `evidence`) is anything
+else, and `convert_inbox2.py` reads these keys off a unit's meta lines as their raw text.
 
 ### 4.9 date
 When the knowledge was established — not when the card was written. ISO date.
